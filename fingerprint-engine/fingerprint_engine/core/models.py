@@ -46,6 +46,10 @@ class FingerprintConfig:
             raise ValueError("min_window_size must be at least 8")
         if self.min_window_size > self.window_size:
             raise ValueError("min_window_size must be <= window_size")
+        if not 0.0 <= self.peak_percentile <= 100.0:
+            raise ValueError("peak_percentile must be between 0.0 and 100.0")
+        if self.peak_threshold < 0.0:
+            raise ValueError("peak_threshold must be non-negative")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

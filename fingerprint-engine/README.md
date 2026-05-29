@@ -267,10 +267,17 @@ Keep `query(hash_code)` returning postings with `file_id`, `hash_code`, and
 
 ## Tests
 
+Install the dev extra (handlers, backends, and the test/lint/type-check tools —
+this is the single source of truth for dev dependencies; there is no
+`requirements.txt`), then run the suite from the repo root:
+
 ```bash
-cd /Users/auto/Desktop/Claude/fingerprint-engine
+pip install -e ".[dev]"
 pytest
 ```
+
+`ruff check .` and `mypy fingerprint_engine` are also part of the dev toolchain
+and are installed by the `[dev]` extra.
 
 ## Benchmark
 

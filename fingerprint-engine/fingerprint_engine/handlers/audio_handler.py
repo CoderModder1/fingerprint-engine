@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+from fingerprint_engine.core.exceptions import MissingDependencyError
+
 from .base import FileHandler
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -73,7 +78,17 @@ class AudioFileHandler(FileHandler):
         try:
             from scipy.io import wavfile
         except ImportError as exc:
-            raise RuntimeError("scipy is required for WAV fingerprinting") from exc
+            logger.warning(
+                "missing optional dependency %s (extra %s) for WAV fingerprinting",
+                "scipy",
+                "audio",
+            )
+            raise MissingDependencyError(
+                "scipy is required for WAV fingerprinting; install with "
+                "'pip install fingerprint_engine[audio]'",
+                package="scipy",
+                extra="audio",
+            ) from exc
 
         sample_rate, data = wavfile.read(path)
         array = np.asarray(data)
@@ -104,8 +119,16 @@ class AudioFileHandler(FileHandler):
         try:
             from pydub import AudioSegment
         except ImportError as exc:
-            raise RuntimeError(
-                "pydub plus ffmpeg is required for MP3 fingerprinting"
+            logger.warning(
+                "missing optional dependency %s (extra %s) for MP3 fingerprinting",
+                "pydub",
+                "audio",
+            )
+            raise MissingDependencyError(
+                "pydub plus ffmpeg is required for MP3 fingerprinting; install with "
+                "'pip install fingerprint_engine[audio]'",
+                package="pydub",
+                extra="audio",
             ) from exc
 
         segment = AudioSegment.from_file(path, format="mp3")

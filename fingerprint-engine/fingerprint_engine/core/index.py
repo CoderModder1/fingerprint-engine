@@ -3,13 +3,57 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shutil
 import sqlite3
+import threading
+import time
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from pathlib import Path
 
+from .exceptions import InvalidSnapshotError
 from .models import Calibration, ConstellationHash, Fingerprint, IndexPosting, SearchResult
+
+logger = logging.getLogger(__name__)
+
+# Schema version stamped into every snapshot written by :meth:`HashIndex.save`.
+# A snapshot whose top-level ``schema_version`` is present but not in
+# ``_SUPPORTED_SCHEMA_VERSIONS`` is rejected on load; an ABSENT version is
+# treated as version 1 for backward compatibility with already-written files.
+SNAPSHOT_SCHEMA_VERSION = 1
+_SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
+
+# Hash codes are unsigned 64-bit; reject snapshot postings outside this range
+# before they reach a SQL backend's signed-offset encode (which would raise
+# OverflowError deep in the load and abort the whole cross-backend import).
+_HASH_CODE_MIN = 0
+_HASH_CODE_MAX = (1 << 64) - 1
+
+
+def _validate_schema_version(data: dict[str, object]) -> None:
+    """Raise :class:`InvalidSnapshotError` for an unsupported snapshot version.
+
+    An absent ``schema_version`` is treated as version 1 (legacy snapshots
+    written before versioning was introduced remain loadable).
+    """
+
+    if "schema_version" not in data:
+        return
+    version = data["schema_version"]
+    if version not in _SUPPORTED_SCHEMA_VERSIONS:
+        raise InvalidSnapshotError(
+            f"unsupported snapshot schema_version {version!r}; "
+            f"this build supports {sorted(_SUPPORTED_SCHEMA_VERSIONS)}"
+        )
+
+
+def _in_hash_range(hash_code: int) -> bool:
+    """Whether ``hash_code`` fits the unsigned 64-bit posting range."""
+
+    return _HASH_CODE_MIN <= hash_code <= _HASH_CODE_MAX
 
 
 class HashIndex(ABC):
@@ -73,7 +117,17 @@ class HashIndex(ABC):
         per-handler threshold are dropped.
         """
 
-        return self._finalize(fingerprint, self._aggregate(fingerprint), top_k, calibration)
+        started = time.perf_counter()
+        aggregates = self._aggregate(fingerprint)
+        results = self._finalize(fingerprint, aggregates, top_k, calibration)
+        logger.debug(
+            "search: %d query hashes -> %d candidates -> %d results in %.3f ms",
+            fingerprint.hash_count,
+            len(aggregates),
+            len(results),
+            (time.perf_counter() - started) * 1000.0,
+        )
+        return results
 
     def _aggregate(self, fingerprint: Fingerprint) -> dict[str, tuple[int, int, int, int]]:
         """Per-file ``(offset, aligned_votes, total_votes, unique_hashes)``.
@@ -151,25 +205,101 @@ class HashIndex(ABC):
         return results[:top_k]
 
     def save(self, path: str | Path) -> None:
-        """Write a portable JSON snapshot (same schema for every backend)."""
+        """Write a portable JSON snapshot durably (same schema for every backend).
+
+        Crash-safe: the snapshot is written to a temp file in the SAME directory
+        (so :func:`os.replace` is atomic on the same filesystem), flushed and
+        ``fsync``-ed, then atomically renamed over the destination. After the
+        rename the parent directory is ``fsync``-ed (best-effort) so the rename
+        itself is durable across power loss. The prior contents (if any) are
+        preserved at ``<dest>.bak`` first, so a corrupt or truncated primary can
+        fall back on load. A failed write never leaves a partial primary file
+        behind. The written JSON carries a ``schema_version`` for forward
+        compatibility (see :data:`SNAPSHOT_SCHEMA_VERSION`).
+        """
 
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("w", encoding="utf-8") as handle:
-            json.dump(self.to_dict(), handle, sort_keys=True, separators=(",", ":"))
+        payload = self.to_dict()
+        payload["schema_version"] = SNAPSHOT_SCHEMA_VERSION
+        tmp = destination.with_name(f"{destination.name}.{os.getpid()}.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Keep a backup of the existing good snapshot before overwriting it.
+            if destination.exists():
+                backup = destination.with_name(f"{destination.name}.bak")
+                shutil.copy2(destination, backup)
+            os.replace(tmp, destination)
+            # fsync the parent directory so the rename (the directory entry) is
+            # durable too. Best-effort: not all platforms/filesystems support
+            # opening or fsyncing a directory, so never let this break the save.
+            try:
+                dir_fd = os.open(str(destination.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _read_snapshot(path: str | Path) -> dict | None:
+        """Parse a JSON snapshot, falling back to ``<path>.bak`` if corrupt.
+
+        Returns ``None`` when no primary and no backup exist (a fresh index).
+        If the primary is present but unparseable (truncated/corrupt JSON from
+        an interrupted write), a valid ``<path>.bak`` is used instead. Raising
+        rather than silently returning an empty index here is deliberate: an
+        empty index would overwrite the good ``.bak`` on the next save.
+        """
+
+        source = Path(path)
+        backup = source.with_name(f"{source.name}.bak")
+        if not source.exists():
+            if not backup.exists():
+                return None
+            # Primary is gone but a backup exists; a corrupt backup here must not
+            # surface as a raw JSONDecodeError -- mirror the corrupt-primary path.
+            try:
+                with backup.open("r", encoding="utf-8") as handle:
+                    return json.load(handle)
+            except (json.JSONDecodeError, UnicodeDecodeError) as backup_error:
+                raise InvalidSnapshotError(
+                    f"index snapshot primary {source} is missing and its backup "
+                    f"({backup}) is corrupt"
+                ) from backup_error
+        try:
+            with source.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (json.JSONDecodeError, UnicodeDecodeError) as primary_error:
+            if backup.exists():
+                try:
+                    with backup.open("r", encoding="utf-8") as handle:
+                        return json.load(handle)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass
+            raise InvalidSnapshotError(
+                f"index snapshot at {source} is corrupt and no valid backup "
+                f"({backup}) was found"
+            ) from primary_error
 
     def load_snapshot(self, path: str | Path) -> HashIndex:
         """Bulk-load a JSON snapshot (from any backend's ``save``) via ``add``."""
 
-        source = Path(path)
-        if not source.exists():
+        data = self._read_snapshot(path)
+        if data is None:
             return self
-        with source.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        if isinstance(data, dict):
+            _validate_schema_version(data)
         files = data.get("files", {}) if isinstance(data, dict) else {}
         metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
         if not isinstance(files, dict):
-            raise ValueError("invalid index snapshot: files must be a mapping")
+            raise InvalidSnapshotError("invalid index snapshot: files must be a mapping")
         for file_id, entries in files.items():
             if not isinstance(entries, list):
                 continue
@@ -185,6 +315,7 @@ class HashIndex(ABC):
                 )
                 for entry in entries
                 if isinstance(entry, (list, tuple)) and len(entry) == 2
+                and _in_hash_range(int(entry[0]))
             ]
             meta = metadata.get(file_id, {}) if isinstance(metadata, dict) else {}
             meta = meta if isinstance(meta, dict) else {}
@@ -228,12 +359,24 @@ class HashIndex(ABC):
 
 
 class InMemoryHashIndex(HashIndex):
-    """Dict-backed hash index with Shazam-style offset alignment scoring."""
+    """Dict-backed hash index with Shazam-style offset alignment scoring.
+
+    Concurrency contract: reads (:meth:`query`, :meth:`query_many`,
+    :meth:`search`, :meth:`_metadata_for`) are GIL-safe and lock-free. The
+    mutating methods (:meth:`add`, :meth:`remove`, :meth:`prune_stop_hashes`)
+    are serialized by a single re-entrant lock, so concurrent writers do not
+    interleave and a concurrent reader can never observe a half-applied
+    add/remove. This is a single logical writer model: parallel writes are
+    safe but run one at a time.
+    """
 
     def __init__(self) -> None:
         self._postings: defaultdict[int, list[IndexPosting]] = defaultdict(list)
         self._file_entries: dict[str, list[tuple[int, int]]] = {}
         self._metadata: dict[str, dict[str, object]] = {}
+        # Re-entrant so remove() called from within add() under the same lock
+        # does not deadlock.
+        self._write_lock = threading.RLock()
 
     @property
     def file_count(self) -> int:
@@ -244,67 +387,70 @@ class InMemoryHashIndex(HashIndex):
         return sum(len(postings) for postings in self._postings.values())
 
     def add(self, fingerprint: Fingerprint) -> None:
-        self.remove(fingerprint.file_id)
-        entries = [(item.hash_code, item.time_offset) for item in fingerprint.hashes]
-        self._file_entries[fingerprint.file_id] = entries
-        self._metadata[fingerprint.file_id] = {
-            "file_id": fingerprint.file_id,
-            "path": fingerprint.path,
-            "handler": fingerprint.handler,
-            "size_bytes": fingerprint.size_bytes,
-            "content_sha256": fingerprint.content_sha256,
-            "hash_count": fingerprint.hash_count,
-            "landmark_count": fingerprint.landmark_count,
-            **fingerprint.metadata,
-        }
-        for hash_code, time_offset in entries:
-            self._postings[hash_code].append(
-                IndexPosting(
-                    file_id=fingerprint.file_id,
-                    hash_code=hash_code,
-                    time_offset=time_offset,
+        with self._write_lock:
+            self.remove(fingerprint.file_id)
+            entries = [(item.hash_code, item.time_offset) for item in fingerprint.hashes]
+            self._file_entries[fingerprint.file_id] = entries
+            self._metadata[fingerprint.file_id] = {
+                "file_id": fingerprint.file_id,
+                "path": fingerprint.path,
+                "handler": fingerprint.handler,
+                "size_bytes": fingerprint.size_bytes,
+                "content_sha256": fingerprint.content_sha256,
+                "hash_count": fingerprint.hash_count,
+                "landmark_count": fingerprint.landmark_count,
+                **fingerprint.metadata,
+            }
+            for hash_code, time_offset in entries:
+                self._postings[hash_code].append(
+                    IndexPosting(
+                        file_id=fingerprint.file_id,
+                        hash_code=hash_code,
+                        time_offset=time_offset,
+                    )
                 )
-            )
 
     def remove(self, file_id: str) -> None:
-        if file_id not in self._file_entries:
-            return
+        with self._write_lock:
+            if file_id not in self._file_entries:
+                return
 
-        for hash_code, _time_offset in self._file_entries[file_id]:
-            self._postings[hash_code] = [
-                posting
-                for posting in self._postings[hash_code]
-                if posting.file_id != file_id
-            ]
-            if not self._postings[hash_code]:
-                del self._postings[hash_code]
+            for hash_code, _time_offset in self._file_entries[file_id]:
+                self._postings[hash_code] = [
+                    posting
+                    for posting in self._postings[hash_code]
+                    if posting.file_id != file_id
+                ]
+                if not self._postings[hash_code]:
+                    del self._postings[hash_code]
 
-        del self._file_entries[file_id]
-        self._metadata.pop(file_id, None)
+            del self._file_entries[file_id]
+            self._metadata.pop(file_id, None)
 
     def query(self, hash_code: int) -> list[IndexPosting]:
         return list(self._postings.get(int(hash_code), []))
 
     def prune_stop_hashes(self, max_df_ratio: float = 0.1) -> int:
-        file_total = len(self._file_entries)
-        if file_total == 0:
-            return 0
-        threshold = max_df_ratio * file_total
-        stop = {
-            code
-            for code, postings in self._postings.items()
-            if len({posting.file_id for posting in postings}) > threshold
-        }
-        if not stop:
-            return 0
-        removed = sum(len(self._postings.pop(code)) for code in stop)
-        for file_id, entries in self._file_entries.items():
-            kept = [(h, t) for (h, t) in entries if h not in stop]
-            if len(kept) != len(entries):
-                self._file_entries[file_id] = kept
-                if file_id in self._metadata:
-                    self._metadata[file_id]["hash_count"] = len(kept)
-        return removed
+        with self._write_lock:
+            file_total = len(self._file_entries)
+            if file_total == 0:
+                return 0
+            threshold = max_df_ratio * file_total
+            stop = {
+                code
+                for code, postings in self._postings.items()
+                if len({posting.file_id for posting in postings}) > threshold
+            }
+            if not stop:
+                return 0
+            removed = sum(len(self._postings.pop(code)) for code in stop)
+            for file_id, entries in self._file_entries.items():
+                kept = [(h, t) for (h, t) in entries if h not in stop]
+                if len(kept) != len(entries):
+                    self._file_entries[file_id] = kept
+                    if file_id in self._metadata:
+                        self._metadata[file_id]["hash_count"] = len(kept)
+            return removed
 
     def _metadata_for(self, file_id: str) -> dict:
         return dict(self._metadata.get(file_id, {}))
@@ -319,9 +465,10 @@ class InMemoryHashIndex(HashIndex):
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> InMemoryHashIndex:
         index = cls()
+        _validate_schema_version(data)
         files = data.get("files", {})
         if not isinstance(files, dict):
-            raise ValueError("invalid index: files must be a mapping")
+            raise InvalidSnapshotError("invalid index: files must be a mapping")
         metadata = data.get("metadata", {})
         if isinstance(metadata, dict):
             index._metadata = {
@@ -338,6 +485,8 @@ class InMemoryHashIndex(HashIndex):
                     continue
                 hash_code = int(entry[0])
                 time_offset = int(entry[1])
+                if not _in_hash_range(hash_code):
+                    continue
                 normalized_entries.append((hash_code, time_offset))
                 index._postings[hash_code].append(
                     IndexPosting(
@@ -351,13 +500,12 @@ class InMemoryHashIndex(HashIndex):
 
     @classmethod
     def load(cls, path: str | Path) -> InMemoryHashIndex:
-        source = Path(path)
-        if not source.exists():
+        data = cls._read_snapshot(path)
+        if data is None:
             return cls()
-        with source.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
         if not isinstance(data, dict):
-            raise ValueError("invalid index file")
+            raise InvalidSnapshotError("invalid index file")
+        # from_dict validates schema_version and the files mapping.
         return cls.from_dict(data)
 
 
@@ -525,6 +673,12 @@ class SQLiteHashIndex(HashIndex):
     indexed on ``hash_code`` (fast ``query``) and ``file_id`` (fast ``remove``).
     Pass ``":memory:"`` for an ephemeral in-process database (used by tests) or a
     file path for persistence; or inject an existing ``sqlite3.Connection``.
+
+    Concurrency contract: file-backed databases run in WAL journal mode, which
+    allows many concurrent readers alongside a single writer; a 5s
+    ``busy_timeout`` lets a blocked writer wait instead of failing immediately
+    with "database is locked". This is a single-writer model -- SQLite still
+    serializes writes. WAL is a harmless no-op for a ``":memory:"`` database.
     """
 
     # Hash codes are unsigned 64-bit (0 .. 2**64-1) but SQLite INTEGER is signed
@@ -544,6 +698,11 @@ class SQLiteHashIndex(HashIndex):
         self._init_schema()
 
     def _init_schema(self) -> None:
+        # WAL enables concurrent readers + one writer and is a no-op for
+        # ":memory:"; busy_timeout avoids immediate "database is locked" errors
+        # when a writer briefly contends with another connection.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS files (
@@ -649,31 +808,37 @@ class SQLiteHashIndex(HashIndex):
         pairs = [(self._encode(h.hash_code), int(h.time_offset)) for h in fingerprint.hashes]
         if not pairs:
             return {}
-        self._conn.execute("CREATE TEMP TABLE IF NOT EXISTS _query (hash_code INTEGER, qoff INTEGER)")
-        self._conn.execute("DELETE FROM _query")
-        self._conn.executemany("INSERT INTO _query (hash_code, qoff) VALUES (?, ?)", pairs)
-        rows = self._conn.execute(
-            """
-            WITH matches AS (
-                SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
-                FROM postings p JOIN _query q ON p.hash_code = q.hash_code
-            ),
-            bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
-            ranked AS (
-                SELECT file_id, delta, votes,
-                       ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY votes DESC, delta ASC) AS rn
-                FROM bins
-            ),
-            totals AS (
-                SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
-                FROM matches GROUP BY file_id
-            )
-            SELECT r.file_id, r.delta, r.votes, t.total_votes, t.uniq
-            FROM ranked r JOIN totals t ON r.file_id = t.file_id
-            WHERE r.rn = 1
-            """
-        ).fetchall()
-        self._conn.execute("DELETE FROM _query")
+        try:
+            self._conn.execute("CREATE TEMP TABLE IF NOT EXISTS _query (hash_code INTEGER, qoff INTEGER)")
+            self._conn.execute("DELETE FROM _query")
+            self._conn.executemany("INSERT INTO _query (hash_code, qoff) VALUES (?, ?)", pairs)
+            rows = self._conn.execute(
+                """
+                WITH matches AS (
+                    SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
+                    FROM postings p JOIN _query q ON p.hash_code = q.hash_code
+                ),
+                bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
+                ranked AS (
+                    SELECT file_id, delta, votes,
+                           ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY votes DESC, delta ASC) AS rn
+                    FROM bins
+                ),
+                totals AS (
+                    SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
+                    FROM matches GROUP BY file_id
+                )
+                SELECT r.file_id, r.delta, r.votes, t.total_votes, t.uniq
+                FROM ranked r JOIN totals t ON r.file_id = t.file_id
+                WHERE r.rn = 1
+                """
+            ).fetchall()
+            self._conn.execute("DELETE FROM _query")
+        finally:
+            # The DML above (CREATE TEMP/DELETE/INSERT) opens an implicit write
+            # transaction; commit so this read-only path never leaves the
+            # connection holding a write lock for the rest of its lifetime.
+            self._conn.commit()
         return {
             file_id: (int(delta), int(votes), int(total), int(uniq))
             for file_id, delta, votes, total, uniq in rows
@@ -737,6 +902,12 @@ class SQLiteHashIndex(HashIndex):
 
     def close(self) -> None:
         self._conn.close()
+
+    def __enter__(self) -> SQLiteHashIndex:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
 
 class PostgresHashIndex(HashIndex):
@@ -808,15 +979,23 @@ class PostgresHashIndex(HashIndex):
 
     @property
     def file_count(self) -> int:
-        with self._conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM {self._files_table}")
-            return int(cur.fetchone()[0])
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {self._files_table}")
+                count = int(cur.fetchone()[0])
+        finally:
+            self._conn.rollback()  # release the implicit read transaction even on error
+        return count
 
     @property
     def posting_count(self) -> int:
-        with self._conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM {self._postings_table}")
-            return int(cur.fetchone()[0])
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {self._postings_table}")
+                count = int(cur.fetchone()[0])
+        finally:
+            self._conn.rollback()  # release the implicit read transaction even on error
+        return count
 
     def add(self, fingerprint: Fingerprint) -> None:
         self.remove(fingerprint.file_id)
@@ -853,12 +1032,15 @@ class PostgresHashIndex(HashIndex):
 
     def query(self, hash_code: int) -> list[IndexPosting]:
         code = int(hash_code)
-        with self._conn.cursor() as cur:
-            cur.execute(
-                f"SELECT file_id, time_offset FROM {self._postings_table} WHERE hash_code = %s",
-                (self._encode(code),),
-            )
-            rows = cur.fetchall()
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT file_id, time_offset FROM {self._postings_table} WHERE hash_code = %s",
+                    (self._encode(code),),
+                )
+                rows = cur.fetchall()
+        finally:
+            self._conn.rollback()  # release the implicit read transaction even on error
         return [
             IndexPosting(file_id=row[0], hash_code=code, time_offset=int(row[1]))
             for row in rows
@@ -870,17 +1052,20 @@ class PostgresHashIndex(HashIndex):
         if not codes:
             return results
         encoded = [self._encode(code) for code in codes]
-        with self._conn.cursor() as cur:  # single round-trip via array membership
-            cur.execute(
-                f"SELECT hash_code, file_id, time_offset FROM {self._postings_table} "
-                "WHERE hash_code = ANY(%s)",
-                (encoded,),
-            )
-            for stored, file_id, time_offset in cur.fetchall():
-                code = self._decode(stored)
-                results[code].append(
-                    IndexPosting(file_id=file_id, hash_code=code, time_offset=int(time_offset))
+        try:
+            with self._conn.cursor() as cur:  # single round-trip via array membership
+                cur.execute(
+                    f"SELECT hash_code, file_id, time_offset FROM {self._postings_table} "
+                    "WHERE hash_code = ANY(%s)",
+                    (encoded,),
                 )
+                for stored, file_id, time_offset in cur.fetchall():
+                    code = self._decode(stored)
+                    results[code].append(
+                        IndexPosting(file_id=file_id, hash_code=code, time_offset=int(time_offset))
+                    )
+        finally:
+            self._conn.rollback()  # release the implicit read transaction even on error
         return results
 
     def _aggregate(self, fingerprint: Fingerprint) -> dict[str, tuple[int, int, int, int]]:
@@ -896,31 +1081,34 @@ class PostgresHashIndex(HashIndex):
             return {}
         codes = [self._encode(h.hash_code) for h in fingerprint.hashes]
         offsets = [int(h.time_offset) for h in fingerprint.hashes]
-        with self._conn.cursor() as cur:
-            cur.execute(
-                f"""
-                WITH q(hash_code, qoff) AS (SELECT * FROM unnest(%s::bigint[], %s::int[])),
-                matches AS (
-                    SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
-                    FROM {self._postings_table} p JOIN q ON p.hash_code = q.hash_code
-                ),
-                bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
-                ranked AS (
-                    SELECT file_id, delta, votes,
-                           ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY votes DESC, delta ASC) AS rn
-                    FROM bins
-                ),
-                totals AS (
-                    SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
-                    FROM matches GROUP BY file_id
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    WITH q(hash_code, qoff) AS (SELECT * FROM unnest(%s::bigint[], %s::int[])),
+                    matches AS (
+                        SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
+                        FROM {self._postings_table} p JOIN q ON p.hash_code = q.hash_code
+                    ),
+                    bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
+                    ranked AS (
+                        SELECT file_id, delta, votes,
+                               ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY votes DESC, delta ASC) AS rn
+                        FROM bins
+                    ),
+                    totals AS (
+                        SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
+                        FROM matches GROUP BY file_id
+                    )
+                    SELECT r.file_id, r.delta, r.votes, t.total_votes, t.uniq
+                    FROM ranked r JOIN totals t ON r.file_id = t.file_id
+                    WHERE r.rn = 1
+                    """,
+                    (codes, offsets),
                 )
-                SELECT r.file_id, r.delta, r.votes, t.total_votes, t.uniq
-                FROM ranked r JOIN totals t ON r.file_id = t.file_id
-                WHERE r.rn = 1
-                """,
-                (codes, offsets),
-            )
-            rows = cur.fetchall()
+                rows = cur.fetchall()
+        finally:
+            self._conn.rollback()  # release the implicit read transaction even on error
         return {
             file_id: (int(delta), int(votes), int(total), int(uniq))
             for file_id, delta, votes, total, uniq in rows
@@ -956,11 +1144,14 @@ class PostgresHashIndex(HashIndex):
         return removed
 
     def _metadata_for(self, file_id: str) -> dict:
-        with self._conn.cursor() as cur:
-            cur.execute(
-                f"SELECT metadata FROM {self._files_table} WHERE file_id = %s", (file_id,)
-            )
-            row = cur.fetchone()
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT metadata FROM {self._files_table} WHERE file_id = %s", (file_id,)
+                )
+                row = cur.fetchone()
+        finally:
+            self._conn.rollback()  # release the implicit read transaction even on error
         if not row:
             return {}
         data = row[0]
@@ -972,24 +1163,36 @@ class PostgresHashIndex(HashIndex):
         return data if isinstance(data, dict) else {}
 
     def to_dict(self) -> dict[str, object]:
-        with self._conn.cursor() as cur:
-            cur.execute(f"SELECT file_id FROM {self._files_table}")
-            file_ids = [row[0] for row in cur.fetchall()]
         files: dict[str, list[list[int]]] = {}
         metadata: dict[str, dict] = {}
-        for file_id in file_ids:
+        try:
             with self._conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT hash_code, time_offset FROM {self._postings_table} "
-                    "WHERE file_id = %s ORDER BY hash_code, time_offset",
-                    (file_id,),
-                )
-                files[file_id] = [
-                    [self._decode(hash_code), int(time_offset)]
-                    for hash_code, time_offset in cur.fetchall()
-                ]
-            metadata[file_id] = self._metadata_for(file_id)
+                cur.execute(f"SELECT file_id FROM {self._files_table}")
+                file_ids = [row[0] for row in cur.fetchall()]
+            for file_id in file_ids:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT hash_code, time_offset FROM {self._postings_table} "
+                        "WHERE file_id = %s ORDER BY hash_code, time_offset",
+                        (file_id,),
+                    )
+                    files[file_id] = [
+                        [self._decode(hash_code), int(time_offset)]
+                        for hash_code, time_offset in cur.fetchall()
+                    ]
+                metadata[file_id] = self._metadata_for(file_id)
+        finally:
+            # Even an EMPTY index (only the file_id SELECT runs, no per-file
+            # reads that would roll back) must not leave the connection
+            # idle-in-transaction holding a snapshot.
+            self._conn.rollback()
         return {"backend": "postgres", "files": files, "metadata": metadata}
 
     def close(self) -> None:
         self._conn.close()
+
+    def __enter__(self) -> PostgresHashIndex:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()

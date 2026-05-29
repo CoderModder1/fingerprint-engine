@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
+from fingerprint_engine.core.exceptions import (
+    FingerprintError,
+    MissingDependencyError,
+    NoHandlerError,
+)
 from fingerprint_engine.core.fingerprinter import Fingerprinter
 from fingerprint_engine.core.index import (
     HashIndex,
@@ -128,9 +134,10 @@ def summarize_fingerprint(fingerprint: Fingerprint, full: bool = False) -> dict[
     }
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Run the selected command. Raises library exceptions to ``main`` to be
+    mapped onto clean stderr messages and distinct exit codes."""
+
     fingerprinter = Fingerprinter(config_from_args(args))
     index_path = Path(args.index_path)
 
@@ -141,7 +148,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "add":
         index = open_index(args)
-        fingerprints = fingerprinter.fingerprint_many(args.files, max_workers=args.workers)
+        # Fail-soft batch: per-file errors are reported, not fatal, so a partial
+        # batch still indexes (and saves) its successes. fingerprint_many collects
+        # each failure as a structured (path, exc) tuple, so a path containing
+        # ": " can never mis-split (unlike parsing the warning text).
+        collector: list[tuple[str, Exception]] = []
+        fingerprints = fingerprinter.fingerprint_many(
+            args.files, max_workers=args.workers, errors=collector
+        )
+        skipped = [
+            {"path": path, "reason": f"{type(exc).__name__}: {exc}"} for path, exc in collector
+        ]
         for fingerprint in fingerprints:
             index.add(fingerprint)
         if args.backend == "memory":
@@ -152,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
             "indexed_files": [
                 summarize_fingerprint(fingerprint, full=False) for fingerprint in fingerprints
             ],
+            "skipped": skipped,
             "file_count": index.file_count,
             "posting_count": index.posting_count,
         }
@@ -194,6 +212,43 @@ def main(argv: list[str] | None = None) -> int:
 
     parser.error(f"unknown command: {args.command}")
     return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Parse argv and dispatch, mapping library exceptions onto clean one-line
+    stderr messages and distinct exit codes (instead of tracebacks):
+
+    * ``2``  -- argparse usage errors (handled by argparse itself).
+    * ``3``  -- :class:`MissingDependencyError` (optional dependency not installed).
+    * ``4``  -- backend/connection errors (Redis/Postgres connect, missing index,
+      or other operational ``RuntimeError``/``OSError`` from the index layer).
+    * ``1``  -- input errors on the query/fingerprint path (no handler, missing
+      file, or a directory passed where a file was expected).
+    * ``0``  -- success.
+
+    ``SystemExit``/``KeyboardInterrupt`` are never caught here.
+    """
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return _dispatch(parser, args)
+    except MissingDependencyError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+    except (NoHandlerError, FileNotFoundError, IsADirectoryError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except FingerprintError as exc:
+        # Any other library error (e.g. an invalid/corrupt index snapshot) is a
+        # backend/operational failure rather than a usage error.
+        print(f"error: {exc}", file=sys.stderr)
+        return 4
+    except (RuntimeError, OSError) as exc:
+        # Backend connection/operation errors: Redis/psycopg connect failures, a
+        # missing or unreadable index store, etc.
+        print(f"error: {exc}", file=sys.stderr)
+        return 4
 
 
 if __name__ == "__main__":

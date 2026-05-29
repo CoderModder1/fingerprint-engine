@@ -9,7 +9,23 @@ description = "Universal file fingerprinting engine (Shazam-style) with pluggabl
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Casey Sinclair", email = "csinclair1778@proton.me" }]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 keywords = ["fingerprinting", "similarity", "fft", "shazam", "deduplication", "search"]
+# NOTE: the license is declared via the PEP 639 SPDX `license` expression above.
+# Modern setuptools rejects the legacy "License :: OSI Approved :: ..." trove
+# classifier when a SPDX expression is present (they are mutually exclusive), so
+# it is intentionally omitted here.
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering",
+    "Operating System :: OS Independent",
+]
 
 # numpy is the only hard runtime dependency (the FFT pipeline). Everything else
 # is lazily imported by a specific handler/backend and lives behind an extra.

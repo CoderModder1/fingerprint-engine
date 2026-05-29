@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from fingerprint_engine.core.exceptions import MissingDependencyError, NoHandlerError
 from fingerprint_engine.core.fingerprinter import Fingerprinter
 from fingerprint_engine.core.index import InMemoryHashIndex
 from fingerprint_engine.core.models import FingerprintConfig
@@ -85,6 +87,87 @@ def test_batch_processing_preserves_order(tmp_path: Path) -> None:
     assert all(item.handler == "text" for item in fingerprints)
 
 
+def test_batch_skips_bad_paths_by_default_and_warns(tmp_path: Path) -> None:
+    # Fail-soft default: a missing path between two good ones is skipped (with a
+    # RuntimeWarning naming it) and the good fingerprints come back in input order.
+    good_a = tmp_path / "a.txt"
+    good_a.write_text("alpha alpha alpha\n" * 40, encoding="utf-8")
+    missing = tmp_path / "does-not-exist.txt"
+    good_b = tmp_path / "b.txt"
+    good_b.write_text("bravo bravo bravo\n" * 40, encoding="utf-8")
+
+    fingerprinter = Fingerprinter(
+        FingerprintConfig(
+            window_size=32,
+            hop_size=8,
+            peak_threshold=0.25,
+            peak_percentile=70.0,
+            max_delta_t=16,
+        )
+    )
+
+    with pytest.warns(RuntimeWarning, match=r"skipping .*does-not-exist\.txt"):
+        fingerprints = fingerprinter.fingerprint_many([good_a, missing, good_b])
+
+    assert [Path(item.path).name for item in fingerprints] == ["a.txt", "b.txt"]
+
+
+def test_batch_collects_structured_errors(tmp_path: Path) -> None:
+    # With an `errors` collector and skip_errors=True, each failure appends a
+    # (str(path), exc) tuple (in input order) instead of emitting a warning, so
+    # callers get the real exception type/message without parsing text.
+    good_a = tmp_path / "a.txt"
+    good_a.write_text("alpha alpha alpha\n" * 40, encoding="utf-8")
+    missing = tmp_path / "does-not-exist.txt"
+    good_b = tmp_path / "b.txt"
+    good_b.write_text("bravo bravo bravo\n" * 40, encoding="utf-8")
+
+    fingerprinter = Fingerprinter(
+        FingerprintConfig(
+            window_size=32,
+            hop_size=8,
+            peak_threshold=0.25,
+            peak_percentile=70.0,
+            max_delta_t=16,
+        )
+    )
+
+    collector: list[tuple[str, Exception]] = []
+    # No RuntimeWarning is emitted when a collector is supplied.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        fingerprints = fingerprinter.fingerprint_many(
+            [good_a, missing, good_b], errors=collector
+        )
+
+    assert [Path(item.path).name for item in fingerprints] == ["a.txt", "b.txt"]
+    assert len(collector) == 1
+    failed_path, failed_exc = collector[0]
+    assert failed_path == str(missing)
+    assert isinstance(failed_exc, FileNotFoundError)
+
+
+def test_batch_raises_on_first_error_when_skip_errors_false(tmp_path: Path) -> None:
+    # Legacy behavior is preserved with skip_errors=False: the first failure
+    # (here a missing file) propagates instead of being swallowed.
+    good = tmp_path / "a.txt"
+    good.write_text("alpha alpha alpha\n" * 40, encoding="utf-8")
+    missing = tmp_path / "does-not-exist.txt"
+
+    fingerprinter = Fingerprinter(
+        FingerprintConfig(
+            window_size=32,
+            hop_size=8,
+            peak_threshold=0.25,
+            peak_percentile=70.0,
+            max_delta_t=16,
+        )
+    )
+
+    with pytest.raises(FileNotFoundError):
+        fingerprinter.fingerprint_many([good, missing, good], skip_errors=False)
+
+
 def test_text_prefix_matches_full_file(tmp_path: Path) -> None:
     # Scale-invariance regression: a truncated copy must still match its parent.
     # Sequence handlers use a fixed window, so the prefix's hashes are a subset
@@ -159,3 +242,75 @@ def test_empty_file_warns_about_unsearchable_fingerprint(tmp_path: Path) -> None
         fingerprint = fingerprinter.fingerprint_file(path)
 
     assert fingerprint.hash_count == 0
+
+
+def test_missing_dependency_does_not_fall_back_to_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A missing optional dependency in the correct handler must fail loud
+    # instead of silently demoting to the binary handler, which would produce
+    # raw-byte hashes that are incomparable to those made with the dependency
+    # installed (silent index corruption).
+    path = tmp_path / "image.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 256)
+
+    fingerprinter = Fingerprinter(FingerprintConfig())
+
+    image_handler = next(h for h in fingerprinter.handlers if h.name == "image")
+
+    def _raise_missing(_path: Path) -> object:
+        raise MissingDependencyError(
+            "Pillow is required for image fingerprinting",
+            package="Pillow",
+            extra="image",
+        )
+
+    monkeypatch.setattr(image_handler, "load", _raise_missing)
+
+    with pytest.raises(MissingDependencyError) as excinfo:
+        fingerprinter.fingerprint_file(path)
+
+    assert excinfo.value.package == "Pillow"
+    assert excinfo.value.extra == "image"
+
+
+def test_decode_error_falls_through_to_other_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A genuine "this handler cannot decode this content" error must still fall
+    # through to the next candidate (unlike a missing dependency).
+    path = tmp_path / "image.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 4096)
+
+    fingerprinter = Fingerprinter(FingerprintConfig())
+    image_handler = next(h for h in fingerprinter.handlers if h.name == "image")
+
+    def _raise_decode(_path: Path) -> object:
+        raise ValueError("cannot decode image content")
+
+    monkeypatch.setattr(image_handler, "load", _raise_decode)
+
+    fingerprint = fingerprinter.fingerprint_file(path)
+
+    # Image handler failed to decode -> demoted to the binary fallback.
+    assert fingerprint.handler == "binary"
+
+
+def test_no_handler_error_when_all_candidates_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # When every candidate handler raises a non-dependency error, the engine
+    # raises NoHandlerError with the aggregated messages.
+    path = tmp_path / "payload.unknown"
+    path.write_bytes(bytes(range(256)) * 8)
+
+    fingerprinter = Fingerprinter(FingerprintConfig())
+
+    def _raise_decode(_self: object, _path: Path) -> object:
+        raise ValueError("cannot decode")
+
+    for handler in fingerprinter.handlers:
+        monkeypatch.setattr(handler, "load", _raise_decode.__get__(handler))
+
+    with pytest.raises(NoHandlerError, match="no handler could fingerprint"):
+        fingerprinter.fingerprint_file(path)

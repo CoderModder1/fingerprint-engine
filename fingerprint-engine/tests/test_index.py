@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -9,7 +12,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from fingerprint_engine.core.exceptions import FingerprintError, InvalidSnapshotError
 from fingerprint_engine.core.index import (
+    SNAPSHOT_SCHEMA_VERSION,
     InMemoryHashIndex,
     PostgresHashIndex,
     RedisHashIndex,
@@ -157,6 +162,61 @@ def test_index_save_and_load_round_trips(tmp_path: Path) -> None:
     assert loaded.file_count == 1
     assert loaded.posting_count == 3
     assert results[0].file_id == "file-a"
+
+
+def test_save_is_atomic_and_recovers_from_corrupt_primary(tmp_path: Path) -> None:
+    # A durable save must leave no partial temp file in the directory, and a
+    # corrupt primary with a valid .bak must transparently load from the backup.
+    index_path = tmp_path / "index.json"
+    index = InMemoryHashIndex()
+    index.add(make_fingerprint("file-a", [1, 2, 3]))
+    index.save(index_path)
+
+    # No stray temp file left behind by the atomic write.
+    assert [p.name for p in tmp_path.iterdir()] == ["index.json"]
+
+    # Simulate a good backup next to a primary that was truncated mid-write.
+    backup = index_path.with_name("index.json.bak")
+    backup.write_text(index_path.read_text(encoding="utf-8"), encoding="utf-8")
+    index_path.write_text('{"backend": "in_memory", "files": {"file-a": [[100', encoding="utf-8")
+
+    loaded = InMemoryHashIndex.load(index_path)
+
+    assert loaded.file_count == 1
+    assert loaded.posting_count == 3
+
+
+def test_save_keeps_backup_of_prior_contents(tmp_path: Path) -> None:
+    # The second save must preserve the first save's snapshot at <dest>.bak so a
+    # later corrupt primary can fall back to the previous good state.
+    index_path = tmp_path / "index.json"
+    backup = index_path.with_name("index.json.bak")
+
+    first = InMemoryHashIndex()
+    first.add(make_fingerprint("file-a", [1, 2, 3]))
+    first.save(index_path)
+    first_contents = index_path.read_text(encoding="utf-8")
+    assert not backup.exists()  # nothing to back up on the first save
+
+    second = InMemoryHashIndex()
+    second.add(make_fingerprint("file-b", [4, 5]))
+    second.save(index_path)
+
+    # The .bak now holds the prior (file-a) snapshot, the primary the new one.
+    assert backup.read_text(encoding="utf-8") == first_contents
+    assert InMemoryHashIndex.load(backup).file_count == 1
+    assert InMemoryHashIndex.load(index_path).file_count == 1
+    assert InMemoryHashIndex.load(index_path).search(make_fingerprint("file-b", [4, 5]))[0].file_id == "file-b"
+
+
+def test_load_raises_when_primary_corrupt_and_no_backup(tmp_path: Path) -> None:
+    # A corrupt primary with no .bak must raise (not silently return an empty
+    # index, which would then overwrite a good backup on the next save).
+    index_path = tmp_path / "index.json"
+    index_path.write_text('{"backend": "in_memory", "files": {"file-a"', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="corrupt"):
+        InMemoryHashIndex.load(index_path)
 
 
 def test_redis_backend_search_matches_in_memory() -> None:
@@ -382,6 +442,47 @@ def test_postgres_snapshot_interops_with_in_memory(pg_index, tmp_path: Path) -> 
     assert loaded.search(fingerprint)[0].file_id == "file-a"
 
 
+@requires_pg
+def test_postgres_read_paths_do_not_leave_idle_in_transaction(pg_index) -> None:
+    # psycopg opens a transaction on the first execute; a pure read that never
+    # commits/rolls back leaves the connection idle-in-transaction, holding
+    # locks. After each read path the connection must be back to IDLE.
+    import psycopg
+
+    pg_index.add(make_fingerprint("aligned", [10, 20, 30, 40]))
+
+    def assert_idle() -> None:
+        assert pg_index._conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+
+    assert pg_index.file_count == 1
+    assert_idle()
+    assert pg_index.posting_count == 4
+    assert_idle()
+    pg_index.query(1000)
+    assert_idle()
+    pg_index.query_many([1000, 1001])
+    assert_idle()
+    pg_index._metadata_for("aligned")
+    assert_idle()
+    results = pg_index.search(make_fingerprint("query", [3, 13, 23, 33]), top_k=1)
+    assert results[0].file_id == "aligned"  # scoring/tie-break unchanged
+    assert_idle()
+
+
+@requires_pg
+def test_postgres_context_manager_closes_connection() -> None:
+    # Own index (not the shared pg_index fixture) so closing the connection here
+    # does not break fixture teardown.
+    import psycopg
+
+    index = PostgresHashIndex(dsn=PG_DSN, table_prefix="fp_pytest_cm")
+    with index as entered:
+        assert entered is index  # __enter__ returns self
+    assert index._conn.closed  # __exit__ closed the connection
+    with pytest.raises(psycopg.OperationalError):
+        index.query(1000)
+
+
 def _stop_hash_corpus(index):
     # Code 7 appears in all 4 files (a "stop" hash); other codes are file-unique.
     index.add(fp_with_hashes("a", [(7, 0), (100, 1), (101, 2)]))
@@ -428,3 +529,169 @@ def test_sqlite_file_backend_persists(tmp_path: Path) -> None:
     assert reopened.file_count == 1
     assert reopened.posting_count == 3
     assert reopened.search(fingerprint)[0].file_id == "persisted"
+
+
+def test_sqlite_search_does_not_leave_open_write_transaction() -> None:
+    # Regression: _aggregate stages query pairs with CREATE TEMP/DELETE/INSERT
+    # (DML), which opens an implicit write transaction. Without a commit the
+    # connection stays in a transaction holding a write lock for its lifetime,
+    # blocking other writers cross-process. A read-only search must commit/close
+    # that transaction so in_transaction is False on return.
+    index = SQLiteHashIndex(":memory:")
+    index.add(make_fingerprint("aligned", [10, 20, 30, 40]))
+
+    results = index.search(make_fingerprint("query", [3, 13, 23, 33]), top_k=1)
+
+    assert results[0].file_id == "aligned"  # scoring/tie-break unchanged
+    assert index._conn.in_transaction is False  # no lingering write transaction
+
+
+def test_sqlite_context_manager_closes_connection() -> None:
+    # The context-manager protocol must give deterministic cleanup: __exit__
+    # closes the underlying connection so subsequent use raises.
+    with SQLiteHashIndex(":memory:") as index:
+        assert index.__enter__() is index  # __enter__ returns self
+        index.add(make_fingerprint("a", [1, 2, 3]))
+        conn = index._conn
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")  # connection is closed after the with block
+
+
+def test_save_stamps_schema_version_and_round_trips(tmp_path: Path) -> None:
+    # save() must stamp the current schema_version into the snapshot, and a
+    # snapshot carrying that version must load back intact.
+    index_path = tmp_path / "index.json"
+    index = InMemoryHashIndex()
+    fingerprint = make_fingerprint("file-a", [1, 2, 3])
+    index.add(fingerprint)
+    index.save(index_path)
+
+    raw = json.loads(index_path.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == SNAPSHOT_SCHEMA_VERSION
+
+    loaded = InMemoryHashIndex.load(index_path)
+    assert loaded.file_count == 1
+    assert loaded.posting_count == 3
+    assert loaded.search(fingerprint)[0].file_id == "file-a"
+
+
+def test_load_rejects_unsupported_schema_version(tmp_path: Path) -> None:
+    # An explicit, unsupported schema_version must raise InvalidSnapshotError
+    # (which is also a ValueError) on every load entry point.
+    index_path = tmp_path / "index.json"
+    payload = {
+        "backend": "in_memory",
+        "files": {"file-a": [[1000, 1]]},
+        "metadata": {},
+        "schema_version": 9999,
+    }
+    index_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(InvalidSnapshotError, match="schema_version"):
+        InMemoryHashIndex.load(index_path)
+    # Joins both families: ValueError (back-compat) and FingerprintError.
+    assert issubclass(InvalidSnapshotError, ValueError)
+    assert issubclass(InvalidSnapshotError, FingerprintError)
+    with pytest.raises(ValueError):
+        InMemoryHashIndex.from_dict(payload)
+    with pytest.raises(InvalidSnapshotError, match="schema_version"):
+        SQLiteHashIndex(":memory:").load_snapshot(index_path)
+
+
+def test_load_accepts_absent_schema_version_as_legacy(tmp_path: Path) -> None:
+    # Snapshots written before versioning have NO schema_version key; they must
+    # still load (treated as version 1), not be rejected.
+    index_path = tmp_path / "index.json"
+    payload = {
+        "backend": "in_memory",
+        "files": {"file-a": [[1000, 1], [1001, 2]]},
+        "metadata": {"file-a": {"handler": "test", "hash_count": 2}},
+    }
+    assert "schema_version" not in payload
+    index_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = InMemoryHashIndex.load(index_path)
+    assert loaded.file_count == 1
+    assert loaded.posting_count == 2
+
+
+def test_load_raises_when_primary_missing_and_backup_corrupt(tmp_path: Path) -> None:
+    # The primary is gone but a .bak exists and is itself corrupt: this must
+    # surface as InvalidSnapshotError, not a raw JSONDecodeError.
+    index_path = tmp_path / "index.json"
+    backup = index_path.with_name("index.json.bak")
+    backup.write_text('{"backend": "in_memory", "files": {"file-a": [[100', encoding="utf-8")
+    assert not index_path.exists()
+
+    with pytest.raises(InvalidSnapshotError):
+        InMemoryHashIndex.load(index_path)
+
+
+def test_load_skips_out_of_range_hash_codes_without_overflow(tmp_path: Path) -> None:
+    # A hash_code outside the unsigned 64-bit range must be skipped on load
+    # rather than aborting the whole cross-backend import with OverflowError
+    # deep inside the SQL signed-offset encode.
+    index_path = tmp_path / "index.json"
+    too_big = 1 << 64          # one past the unsigned 64-bit max
+    negative = -1              # below the unsigned 64-bit min
+    in_range = (1 << 64) - 1   # the largest legal code
+    payload = {
+        "backend": "in_memory",
+        "files": {"file-a": [[in_range, 1], [too_big, 2], [negative, 3]]},
+        "metadata": {"file-a": {"handler": "test"}},
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+    }
+    index_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    # In-memory load keeps only the in-range posting.
+    mem = InMemoryHashIndex.load(index_path)
+    assert mem.posting_count == 1
+    assert mem.query(in_range) and mem.query(in_range)[0].hash_code == in_range
+    assert mem.query(too_big) == []
+
+    # The cross-backend bulk load into SQLite must NOT raise OverflowError.
+    sqlite_index = SQLiteHashIndex(":memory:").load_snapshot(index_path)
+    assert sqlite_index.posting_count == 1
+    assert sqlite_index.query(in_range)[0].hash_code == in_range
+
+
+def test_sqlite_file_backend_uses_wal_journal_mode(tmp_path: Path) -> None:
+    # A file-backed SQLite index must enable WAL after init so concurrent
+    # readers can run alongside one writer.
+    db = tmp_path / "index.sqlite3"
+    index = SQLiteHashIndex(db)
+    mode = index._conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode.lower() == "wal"
+    # busy_timeout is set so a contended writer waits rather than failing fast.
+    assert int(index._conn.execute("PRAGMA busy_timeout").fetchone()[0]) == 5000
+
+
+def test_in_memory_concurrent_add_and_search_stay_consistent() -> None:
+    # Many concurrent add()/search() calls on one InMemoryHashIndex must not
+    # crash or corrupt counts: writes are lock-serialized, reads are GIL-safe.
+    index = InMemoryHashIndex()
+    file_ids = [f"file-{i}" for i in range(50)]
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(len(file_ids))
+
+    def worker(file_id: str) -> None:
+        try:
+            barrier.wait()
+            index.add(make_fingerprint(file_id, [1, 2, 3]))
+            # Concurrent reads must never observe a half-applied write.
+            index.search(make_fingerprint("query", [1, 2, 3]), top_k=5)
+        except BaseException as exc:  # noqa: BLE001 - surface any thread failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(fid,)) for fid in file_ids]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert index.file_count == len(file_ids)
+    # Each file contributed exactly 3 postings; no double-counting or loss.
+    assert index.posting_count == 3 * len(file_ids)
+    assert {r.file_id for r in index.search(make_fingerprint("q", [1, 2, 3]), top_k=100)} == set(file_ids)

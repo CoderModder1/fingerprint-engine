@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+from fingerprint_engine.core.exceptions import MissingDependencyError
+
 from .base import FileHandler
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -64,7 +69,17 @@ class ImageFileHandler(FileHandler):
         try:
             from PIL import Image
         except ImportError as exc:
-            raise RuntimeError("Pillow is required for image fingerprinting") from exc
+            logger.warning(
+                "missing optional dependency %s (extra %s) for image fingerprinting",
+                "Pillow",
+                "image",
+            )
+            raise MissingDependencyError(
+                "Pillow is required for image fingerprinting; install with "
+                "'pip install fingerprint_engine[image]'",
+                package="Pillow",
+                extra="image",
+            ) from exc
 
         with Image.open(path) as image:
             mode = image.mode

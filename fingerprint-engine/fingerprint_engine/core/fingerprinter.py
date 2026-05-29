@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import inspect
+import logging
 import pkgutil
 import warnings
 from abc import ABC, abstractmethod
@@ -15,8 +16,11 @@ from pathlib import Path
 
 from fingerprint_engine.handlers.base import FileHandler
 
+from .exceptions import MissingDependencyError, NoHandlerError
 from .fft_pipeline import FFTFingerprintPipeline
 from .models import Fingerprint, FingerprintConfig, SearchResult
+
+logger = logging.getLogger(__name__)
 
 
 class FileProcessor(ABC):
@@ -31,6 +35,9 @@ class FileProcessor(ABC):
         self,
         paths: Iterable[str | Path],
         max_workers: int | None = None,
+        *,
+        skip_errors: bool = True,
+        errors: list[tuple[str, Exception]] | None = None,
     ) -> list[Fingerprint]:
         """Fingerprint many files."""
 
@@ -111,6 +118,7 @@ class Fingerprinter(FileProcessor):
         content_sha256 = hashlib.sha256(content).hexdigest()
         candidates = self._rank_handlers(source, content[:8192])
         errors: list[str] = []
+        top_handler_name = candidates[0][1].name if candidates else None
 
         for _score, handler in candidates:
             try:
@@ -137,6 +145,16 @@ class Fingerprinter(FileProcessor):
                         RuntimeWarning,
                         stacklevel=2,
                     )
+                if handler.name != top_handler_name:
+                    # A higher-ranked candidate was tried first and failed; the
+                    # routing fell back to this one. Surface it so the demotion
+                    # is observable without changing behavior.
+                    logger.info(
+                        "handler %s won for %s after %s higher-ranked candidate(s) failed",
+                        handler.name,
+                        source,
+                        len(errors),
+                    )
                 return Fingerprint(
                     file_id=content_sha256,
                     path=str(source.resolve()),
@@ -148,20 +166,72 @@ class Fingerprinter(FileProcessor):
                     hashes=hashes,
                     metadata=metadata,
                 )
+            except MissingDependencyError as exc:
+                # The correct handler exists but its optional dependency is not
+                # installed. Re-raise loudly instead of silently demoting to a
+                # lower-priority handler (e.g. binary), which would produce
+                # fingerprints incomparable to those made with the dependency
+                # installed and silently corrupt the index.
+                logger.warning(
+                    "handler %s for %s is missing optional dependency %s (extra %s)",
+                    handler.name,
+                    source,
+                    exc.package,
+                    exc.extra,
+                )
+                raise
             except Exception as exc:
+                logger.debug("handler %s failed for %s: %s", handler.name, source, exc)
                 errors.append(f"{handler.name}: {exc}")
 
-        raise RuntimeError(f"no handler could fingerprint {source}: {'; '.join(errors)}")
+        raise NoHandlerError(f"no handler could fingerprint {source}: {'; '.join(errors)}")
 
     def fingerprint_many(
         self,
         paths: Iterable[str | Path],
         max_workers: int | None = None,
+        *,
+        skip_errors: bool = True,
+        errors: list[tuple[str, Exception]] | None = None,
     ) -> list[Fingerprint]:
-        """Fingerprint a batch concurrently while preserving input order."""
+        """Fingerprint a batch concurrently while preserving input order.
 
+        Fail-soft by default (``skip_errors=True``): every path is submitted, the
+        results are gathered in input order, and any failure (missing file,
+        directory, oversized input, no handler, missing dependency, decode error,
+        ...) is skipped -- so one bad file never aborts the batch and the good ones
+        still come back. With ``skip_errors=False`` the legacy behavior is
+        preserved: the first failure propagates.
+
+        Pass ``errors`` to collect failures structurally: each skipped path appends
+        a ``(str(path), exc)`` tuple in input order, letting callers (e.g. the CLI)
+        report ``type``/``message`` without parsing warning text. When no collector
+        is supplied, a :class:`RuntimeWarning` naming the path and error is still
+        emitted for callers that rely on it.
+        """
+
+        ordered = list(paths)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            return list(executor.map(self.fingerprint_file, paths))
+            futures = [executor.submit(self.fingerprint_file, path) for path in ordered]
+            if not skip_errors:
+                return [future.result() for future in futures]
+            results: list[Fingerprint] = []
+            for path, future in zip(ordered, futures, strict=True):
+                try:
+                    results.append(future.result())
+                except Exception as exc:  # noqa: BLE001 - fail-soft: surface and skip
+                    logger.warning(
+                        "skipping %s: %s: %s", path, type(exc).__name__, exc
+                    )
+                    if errors is not None:
+                        errors.append((str(path), exc))
+                    else:
+                        warnings.warn(
+                            f"skipping {path}: {type(exc).__name__}: {exc}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+            return results
 
     def search_file(self, path: str | Path, index, top_k: int = 10) -> list[SearchResult]:
         fingerprint = self.fingerprint_file(path)
