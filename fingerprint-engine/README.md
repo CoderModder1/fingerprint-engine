@@ -170,17 +170,38 @@ class MyFormatHandler(FileHandler):
 
 The orchestrator imports handler modules dynamically and ranks them by `can_handle()` score and priority.
 
-### Add An Index Backend
+### Index Backends
 
-Subclass `HashIndex` in `core/index.py` or a new module and implement:
+The engine ships two backends; both implement the storage-agnostic `HashIndex`
+contract and **share the same `search()`** (time-coherent offset-histogram
+scoring lives in the base class), so they rank identically and scores stay
+comparable:
 
-- `add(fingerprint)`
-- `remove(file_id)`
-- `query(hash_code)`
-- `search(fingerprint, top_k)`
-- `save(path)`
+- **`InMemoryHashIndex`** — dict-backed, JSON-persisted. The default.
+- **`RedisHashIndex`** — postings live in Redis, so the index is persistent and
+  shareable across processes (horizontal scale). Requires `redis` (and a running
+  server); tests use `fakeredis`, no server needed.
 
-Keep `query(hash_code)` returning postings with `file_id`, `hash_code`, and `time_offset`; the time-alignment scoring can then be reused or pushed into the backend.
+```bash
+# CLI: index into / search a Redis-backed store
+python cli.py --backend redis --redis-url redis://localhost:6379/0 add path/to/file
+python cli.py --backend redis search path/to/query
+```
+
+```python
+from core.index import RedisHashIndex
+index = RedisHashIndex(url="redis://localhost:6379/0", key_prefix="fpidx")
+# or inject a client (e.g. fakeredis / a configured redis.Redis)
+index.add(fingerprint)
+results = index.search(query_fingerprint)
+index.save("snapshot.json")            # portable export (interops with InMemory)
+RedisHashIndex(...).load_snapshot("snapshot.json")  # bulk-load a snapshot
+```
+
+To add your own backend, subclass `HashIndex` and implement `add(fingerprint)`,
+`remove(file_id)`, `query(hash_code)`, `_metadata_for(file_id)`, and `save(path)`.
+Keep `query(hash_code)` returning postings with `file_id`, `hash_code`, and
+`time_offset`; the inherited `search()` does the rest.
 
 ## Tests
 
