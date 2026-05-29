@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.fingerprinter import Fingerprinter
+from core.index import InMemoryHashIndex
 from core.models import FingerprintConfig
 
 
@@ -82,6 +83,52 @@ def test_batch_processing_preserves_order(tmp_path: Path) -> None:
 
     assert [Path(item.path).name for item in fingerprints] == [path.name for path in paths]
     assert all(item.handler == "text" for item in fingerprints)
+
+
+def test_text_prefix_matches_full_file(tmp_path: Path) -> None:
+    # Scale-invariance regression: a truncated copy must still match its parent.
+    # Sequence handlers use a fixed window, so the prefix's hashes are a subset
+    # of the parent's instead of landing on a different length-adaptive window.
+    lines = [f"def function_{i}(value):\n    return value * {i} + {i * 7}\n\n" for i in range(80)]
+    full = tmp_path / "full.py"
+    full.write_text("".join(lines), encoding="utf-8")
+    prefix = tmp_path / "prefix.py"
+    prefix.write_text("".join(lines[:48]), encoding="utf-8")  # first 60%
+
+    fp = Fingerprinter(FingerprintConfig())
+    index = InMemoryHashIndex()
+    index.add(fp.fingerprint_file(full))
+
+    results = index.search(fp.fingerprint_file(prefix), top_k=1)
+
+    assert results, "truncated file should still match its parent"
+    assert Path(results[0].metadata["path"]).name == "full.py"
+    assert results[0].aligned_votes > 50  # a coherent match, not a single stray vote
+
+
+def test_resized_image_matches_original(tmp_path: Path) -> None:
+    # Scale-invariance regression: the same picture at a different resolution
+    # must still match, thanks to canonical-size normalisation in the handler.
+    import numpy as np
+    from PIL import Image
+
+    rng = np.random.default_rng(3)
+    yy, xx = np.mgrid[0:256, 0:256]
+    base = ((xx + yy) / 512.0 * 200 + rng.integers(0, 40, size=(256, 256))).astype(np.uint8)
+    original = tmp_path / "image.png"
+    Image.fromarray(base, mode="L").save(original)
+    smaller = tmp_path / "image_small.png"
+    Image.fromarray(base, mode="L").resize((180, 180)).save(smaller)
+
+    fp = Fingerprinter(FingerprintConfig())
+    index = InMemoryHashIndex()
+    index.add(fp.fingerprint_file(original))
+
+    results = index.search(fp.fingerprint_file(smaller), top_k=1)
+
+    assert results, "resized image should still match the original"
+    assert Path(results[0].metadata["path"]).name == "image.png"
+    assert results[0].aligned_votes > 50
 
 
 def test_fingerprint_records_effective_window(tmp_path: Path) -> None:

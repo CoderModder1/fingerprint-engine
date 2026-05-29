@@ -121,6 +121,30 @@ Consequences worth knowing:
 Tune this behaviour with `--min-time-frames` / `--min-window-size` (CLI) or the
 matching `FingerprintConfig` fields.
 
+## Scale Invariance
+
+Matching only works when the query and the indexed file share the same effective
+FFT window — a fingerprint built with a 512-point window cannot align with one
+built at 1024. Two design choices keep that window stable across size changes:
+
+- **Fixed per-handler windows.** Sequence handlers (text, binary, PDF) declare a
+  small fixed window (`default_signal_window = 512`) instead of inheriting the
+  audio-tuned 4096 default. So a file and a *truncated copy / excerpt* of it use
+  the same window and still match (their hashes are a subset relation), rather
+  than landing on different length-adaptive windows. Audio keeps the 4096 window,
+  which is why a short clip matches its full track at the correct time offset.
+- **Canonical image normalisation.** Every image is resampled to a fixed
+  256×256 grayscale grid before the signal is built, so the *same picture at a
+  different resolution* (or after lossy re-encoding) maps to a comparable signal.
+  A raw flattened-pixel signal would otherwise be destroyed by any resize.
+
+Explicitly setting `--window-size` / `--hop-size` overrides the per-handler
+windows globally (useful for experiments; all files then share one window).
+
+What is **not** supported (and is outside the Shazam model): true geometric or
+time-stretch invariance — e.g. cropping/rotating an image, or time-stretching
+audio — because those change the underlying signal sequence, not just its scale.
+
 ## Extension Guide
 
 ### Add A File Handler

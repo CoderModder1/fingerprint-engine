@@ -14,6 +14,8 @@ from .base import FileHandler
 class BinaryFileHandler(FileHandler):
     name = "binary"
     priority = -100
+    default_signal_window = 512
+    default_signal_hop = 128
 
     @classmethod
     def can_handle(

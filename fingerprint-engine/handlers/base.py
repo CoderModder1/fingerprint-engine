@@ -21,6 +21,13 @@ class FileHandler(ABC):
     supported_extensions: set[str] = set()
     supported_mime_types: set[str] = set()
     supported_mime_prefixes: set[str] = set()
+    # Optional per-handler preferred FFT window/hop, applied under the default
+    # config. A small *fixed* window keeps a content type's fingerprints
+    # comparable across files of different lengths, so excerpts/truncations of
+    # the same content still align on a shared time grid (a length-adaptive
+    # window would shift that grid and break matching). None -> use config.
+    default_signal_window: int | None = None
+    default_signal_hop: int | None = None
 
     @classmethod
     def can_handle(

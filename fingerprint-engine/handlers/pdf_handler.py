@@ -22,6 +22,8 @@ class PDFPayload:
 class PDFFileHandler(FileHandler):
     name = "pdf"
     priority = 65
+    default_signal_window = 512
+    default_signal_hop = 128
     supported_mime_types = {"application/pdf"}
     supported_extensions = {".pdf"}
 

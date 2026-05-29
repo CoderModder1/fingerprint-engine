@@ -9,6 +9,7 @@ import pkgutil
 import warnings
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterable
 
@@ -49,6 +50,7 @@ class Fingerprinter(FileProcessor):
         self.handlers = self.discover_handlers(handlers_package)
         if not self.handlers:
             raise RuntimeError("no file handlers discovered")
+        self._handler_pipelines = self._build_handler_pipelines()
 
     def discover_handlers(self, package_name: str) -> list[FileHandler]:
         """Auto-discover FileHandler subclasses in a handler package."""
@@ -68,6 +70,34 @@ class Fingerprinter(FileProcessor):
         instances.sort(key=lambda item: (-item.priority, item.name))
         return instances
 
+    def _build_handler_pipelines(self) -> dict[str, FFTFingerprintPipeline]:
+        """Per-handler pipelines for handlers that prefer a fixed window/hop.
+
+        A fixed window keeps a content type's fingerprints comparable across
+        files of different lengths, so excerpts/truncations of the same content
+        still align. Applied only under the default config; an explicitly
+        customized window_size/hop_size is honored globally instead (so callers
+        retain full control and the unit tests' explicit windows are unchanged).
+        """
+
+        defaults = FingerprintConfig()
+        using_defaults = (
+            self.config.window_size == defaults.window_size
+            and self.config.hop_size == defaults.hop_size
+        )
+        pipelines: dict[str, FFTFingerprintPipeline] = {}
+        if not using_defaults:
+            return pipelines
+        for handler in self.handlers:
+            window = getattr(handler, "default_signal_window", None)
+            if not window:
+                continue
+            hop = getattr(handler, "default_signal_hop", None) or max(1, window // 4)
+            pipelines[handler.name] = FFTFingerprintPipeline(
+                replace(self.config, window_size=window, hop_size=hop)
+            )
+        return pipelines
+
     def fingerprint_file(self, path: str | Path) -> Fingerprint:
         """Fingerprint a single file."""
 
@@ -84,10 +114,11 @@ class Fingerprinter(FileProcessor):
 
         for _score, handler in candidates:
             try:
+                pipeline = self._handler_pipelines.get(handler.name, self.pipeline)
                 payload = handler.load(source)
                 signal = handler.to_signal(payload)
-                landmarks, hashes = handler.extract_peaks(signal, self.pipeline)
-                effective_window, effective_hop = self.pipeline.effective_params(signal)
+                landmarks, hashes = handler.extract_peaks(signal, pipeline)
+                effective_window, effective_hop = pipeline.effective_params(signal)
                 metadata = handler.metadata(payload)
                 metadata.update(
                     {

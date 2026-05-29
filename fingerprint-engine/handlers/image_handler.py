@@ -16,11 +16,18 @@ class ImagePayload:
     width: int
     height: int
     mode: str
+    original_size: tuple[int, int] = (0, 0)
 
 
 class ImageFileHandler(FileHandler):
     name = "image"
     priority = 60
+    # Every image is resampled to this canonical grayscale grid before the
+    # signal is built, so the same picture at different resolutions (and after
+    # lossy re-encoding) maps to a comparable signal -- i.e. resolution-invariant
+    # matching, the perceptual-hash approach. A flattened raw-pixel signal is
+    # otherwise destroyed by any resize.
+    canonical_size = (256, 256)
     supported_mime_prefixes = {"image/"}
     supported_extensions = {
         ".png",
@@ -61,17 +68,18 @@ class ImageFileHandler(FileHandler):
 
         with Image.open(path) as image:
             mode = image.mode
-            grayscale = image.convert("L")
-            width, height = grayscale.size
-            max_pixels = 1_000_000
-            if width * height > max_pixels:
-                scale = (max_pixels / float(width * height)) ** 0.5
-                new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
-                resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
-                grayscale = grayscale.resize(new_size, resampling)
-                width, height = grayscale.size
+            original_size = (int(image.width), int(image.height))
+            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            grayscale = image.convert("L").resize(self.canonical_size, resampling)
             pixels = np.asarray(grayscale, dtype=np.float32)
-        return ImagePayload(pixels=pixels, width=width, height=height, mode=mode)
+        width, height = self.canonical_size
+        return ImagePayload(
+            pixels=pixels,
+            width=width,
+            height=height,
+            mode=mode,
+            original_size=original_size,
+        )
 
     def to_signal(self, payload: ImagePayload) -> np.ndarray:
         return (payload.pixels.reshape(-1) - 127.5) / 127.5
@@ -80,6 +88,8 @@ class ImageFileHandler(FileHandler):
         return {
             "width": payload.width,
             "height": payload.height,
+            "original_width": payload.original_size[0],
+            "original_height": payload.original_size[1],
             "mode": payload.mode,
-            "signal_strategy": "flattened_grayscale_intensity",
+            "signal_strategy": "canonical_256x256_grayscale_intensity",
         }
