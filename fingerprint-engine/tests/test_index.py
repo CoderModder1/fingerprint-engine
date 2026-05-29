@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.index import InMemoryHashIndex, RedisHashIndex, SQLiteHashIndex
-from core.models import ConstellationHash, Fingerprint
+from core.models import Calibration, ConstellationHash, Fingerprint
 
 
 def _fake_redis():
@@ -53,6 +53,41 @@ def test_time_coherent_search_ranks_aligned_match_first() -> None:
     assert results[0].file_id == "aligned"
     assert results[0].aligned_votes == 4
     assert results[0].offset == 7
+
+
+def test_search_reports_normalized_confidence() -> None:
+    index = InMemoryHashIndex()
+    index.add(make_fingerprint("aligned", [10, 20, 30, 40]))
+    index.add(make_fingerprint("scattered", [2, 40, 99, 125]))
+    query = make_fingerprint("query", [3, 13, 23, 33])
+
+    results = {r.file_id: r for r in index.search(query, top_k=5)}
+
+    # All four query hashes align coherently with "aligned" -> full confidence.
+    assert results["aligned"].confidence == 1.0
+    # "scattered" shares hashes but no coherent offset -> low confidence.
+    assert 0.0 < results["scattered"].confidence < 0.5
+    assert all(0.0 <= r.confidence <= 1.0 for r in results.values())
+
+
+def test_calibration_filters_and_per_handler_overrides() -> None:
+    index = InMemoryHashIndex()
+    index.add(make_fingerprint("aligned", [10, 20, 30, 40]))
+    index.add(make_fingerprint("scattered", [2, 40, 99, 125]))
+    query = make_fingerprint("query", [3, 13, 23, 33])
+
+    # A uniform threshold drops the low-confidence (incoherent) match.
+    strict = index.search(query, top_k=5, calibration=Calibration(default_min_confidence=0.5))
+    assert [r.file_id for r in strict] == ["aligned"]
+    assert all(r.confidence >= 0.5 for r in strict)
+
+    # A per-handler override loosens the cutoff for handler 'test', keeping both.
+    loose = index.search(
+        query,
+        top_k=5,
+        calibration=Calibration(default_min_confidence=0.9, per_handler={"test": 0.1}),
+    )
+    assert {r.file_id for r in loose} == {"aligned", "scattered"}
 
 
 def test_index_save_and_load_round_trips(tmp_path: Path) -> None:

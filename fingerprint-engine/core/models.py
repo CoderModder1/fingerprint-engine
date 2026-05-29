@@ -209,15 +209,37 @@ class SearchResult:
     total_votes: int
     unique_hashes: int
     offset: int
+    confidence: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "file_id": self.file_id,
             "score": self.score,
+            "confidence": self.confidence,
             "aligned_votes": self.aligned_votes,
             "total_votes": self.total_votes,
             "unique_hashes": self.unique_hashes,
             "offset": self.offset,
             "metadata": self.metadata,
         }
+
+
+@dataclass(frozen=True)
+class Calibration:
+    """Per-handler minimum match confidence for accept/reject decisions.
+
+    ``SearchResult.confidence`` (aligned votes / the smaller fingerprint's hash
+    count) is already normalised to [0, 1] and comparable across handlers, so a
+    single ``default_min_confidence`` usually suffices. ``per_handler`` overrides
+    let a content type use a stricter or looser cutoff when warranted.
+    """
+
+    default_min_confidence: float = 0.05
+    per_handler: dict[str, float] = field(default_factory=dict)
+
+    def min_confidence(self, handler: str) -> float:
+        return self.per_handler.get(handler, self.default_min_confidence)
+
+    def accepts(self, handler: str, confidence: float) -> bool:
+        return confidence >= self.min_confidence(handler)

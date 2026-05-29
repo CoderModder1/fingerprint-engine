@@ -94,6 +94,32 @@ Search uses time-coherent matching:
 
 This mirrors the core Shazam idea: many weak hash matches become strong evidence only when they agree on a consistent relative offset.
 
+## Match Confidence & Calibration
+
+The raw `score` scales with a file's hash count, so its magnitude is not
+comparable across handlers (a PDF self-match scores ~400 while an image scores
+~3500). Each `SearchResult` therefore also carries a **handler-independent
+`confidence` in [0, 1]** — the fraction of the *smaller* fingerprint's hashes
+that aligned at the winning offset. On a real corpus, true matches land at
+0.5–1.0 across every handler while unrelated files sit below ~0.02, so one
+threshold separates them all:
+
+```bash
+python cli.py search query.pdf --min-confidence 0.05   # drop matches below 0.05
+```
+
+```python
+from core.models import Calibration
+# Uniform threshold (usually enough, since confidence is already normalised):
+index.search(query, calibration=Calibration(default_min_confidence=0.05))
+# Per-handler overrides when a type needs a stricter/looser cutoff:
+index.search(query, calibration=Calibration(
+    default_min_confidence=0.05, per_handler={"text": 0.10}))
+```
+
+Ranking still uses the raw `score` (correct within a single query); `confidence`
+is the comparable measure for accept/reject decisions across handlers.
+
 ## Adaptive Windowing
 
 A signal shorter than `window_size` collapses to one or two FFT frames, so no

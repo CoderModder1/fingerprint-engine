@@ -9,7 +9,7 @@ from typing import Any
 
 from core.fingerprinter import Fingerprinter
 from core.index import HashIndex, InMemoryHashIndex, RedisHashIndex, SQLiteHashIndex
-from core.models import Fingerprint, FingerprintConfig
+from core.models import Calibration, Fingerprint, FingerprintConfig
 
 
 DEFAULT_INDEX_PATH = Path(__file__).with_name(".fingerprint_index.json")
@@ -48,6 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
     search = subparsers.add_parser("search", help="Search the index with a query file")
     search.add_argument("file")
     search.add_argument("--top-k", type=int, default=10)
+    search.add_argument("--min-confidence", type=float, default=None,
+                        help="drop matches below this confidence in [0,1] "
+                             "(handler-comparable; e.g. 0.05)")
 
     return parser
 
@@ -139,7 +142,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "search":
         index = open_index(args)
         query = fingerprinter.fingerprint_file(args.file)
-        results = index.search(query, top_k=args.top_k)
+        calibration = (
+            Calibration(default_min_confidence=args.min_confidence)
+            if args.min_confidence is not None
+            else None
+        )
+        results = index.search(query, top_k=args.top_k, calibration=calibration)
         payload = {
             "query": summarize_fingerprint(query, full=False),
             "backend": args.backend,

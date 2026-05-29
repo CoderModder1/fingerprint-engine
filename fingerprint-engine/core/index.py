@@ -9,7 +9,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import DefaultDict
 
-from .models import ConstellationHash, Fingerprint, IndexPosting, SearchResult
+from .models import Calibration, ConstellationHash, Fingerprint, IndexPosting, SearchResult
 
 
 class HashIndex(ABC):
@@ -35,11 +35,19 @@ class HashIndex(ABC):
     def to_dict(self) -> dict[str, object]:
         """Return a portable ``{backend, files, metadata}`` snapshot of the index."""
 
-    def search(self, fingerprint: Fingerprint, top_k: int = 10) -> list[SearchResult]:
+    def search(
+        self,
+        fingerprint: Fingerprint,
+        top_k: int = 10,
+        calibration: Calibration | None = None,
+    ) -> list[SearchResult]:
         """Return ranked matches via Shazam-style offset-histogram alignment.
 
         Backend-agnostic: it relies only on ``query()`` and ``_metadata_for()``,
-        so every backend ranks identically and scores stay comparable.
+        so every backend ranks identically. Each result carries a handler-
+        independent ``confidence`` in [0, 1] (aligned votes / the smaller
+        fingerprint's hash count); when a :class:`Calibration` is supplied,
+        results below its per-handler threshold are dropped.
         """
 
         offset_histograms: dict[str, Counter[int]] = defaultdict(Counter)
@@ -64,6 +72,15 @@ class HashIndex(ABC):
             alignment_ratio = aligned_votes / max(1, total)
             coverage_ratio = unique / query_hash_count
             score = aligned_votes + (0.30 * unique) + (5.0 * alignment_ratio) + (2.0 * coverage_ratio)
+            metadata = dict(self._metadata_for(file_id))
+            # Normalise to a handler-independent confidence: fraction of the
+            # smaller fingerprint's hashes that aligned at the winning offset.
+            target_hash_count = int(metadata.get("hash_count") or query_hash_count)
+            confidence = min(1.0, aligned_votes / max(1, min(query_hash_count, target_hash_count)))
+            if calibration is not None and not calibration.accepts(
+                str(metadata.get("handler", fingerprint.handler)), confidence
+            ):
+                continue
             results.append(
                 SearchResult(
                     file_id=file_id,
@@ -72,7 +89,8 @@ class HashIndex(ABC):
                     total_votes=int(total),
                     unique_hashes=int(unique),
                     offset=int(offset),
-                    metadata=dict(self._metadata_for(file_id)),
+                    confidence=round(float(confidence), 6),
+                    metadata=metadata,
                 )
             )
 
