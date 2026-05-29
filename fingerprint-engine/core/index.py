@@ -7,7 +7,7 @@ import sqlite3
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import DefaultDict
+from typing import DefaultDict, Iterable
 
 from .models import Calibration, ConstellationHash, Fingerprint, IndexPosting, SearchResult
 
@@ -35,6 +35,17 @@ class HashIndex(ABC):
     def to_dict(self) -> dict[str, object]:
         """Return a portable ``{backend, files, metadata}`` snapshot of the index."""
 
+    def query_many(self, hash_codes: Iterable[int]) -> dict[int, list[IndexPosting]]:
+        """Return postings for many hash codes in one batch: ``{code: postings}``.
+
+        The default fans out to :meth:`query`. Storage backends SHOULD override
+        this with a single batched round-trip -- the per-code default makes
+        :meth:`search` issue one lookup per query hash (thousands per search),
+        which is fine in-memory but catastrophic for SQL backends.
+        """
+
+        return {int(code): self.query(int(code)) for code in {int(c) for c in hash_codes}}
+
     def search(
         self,
         fingerprint: Fingerprint,
@@ -54,8 +65,10 @@ class HashIndex(ABC):
         total_votes: Counter[str] = Counter()
         unique_hashes: dict[str, set[int]] = defaultdict(set)
 
+        # One batched fetch for all distinct query hash codes, then group in memory.
+        postings_by_code = self.query_many({qh.hash_code for qh in fingerprint.hashes})
         for query_hash in fingerprint.hashes:
-            for posting in self.query(query_hash.hash_code):
+            for posting in postings_by_code.get(query_hash.hash_code, ()):
                 offset = posting.time_offset - query_hash.time_offset
                 offset_histograms[posting.file_id][offset] += 1
                 total_votes[posting.file_id] += 1
@@ -391,6 +404,24 @@ class RedisHashIndex(HashIndex):
             )
         return postings
 
+    def query_many(self, hash_codes: Iterable[int]) -> dict[int, list[IndexPosting]]:
+        codes = list({int(c) for c in hash_codes})
+        results: dict[int, list[IndexPosting]] = {}
+        if not codes:
+            return results
+        pipe = self._redis.pipeline()  # one round-trip for all LRANGEs
+        for code in codes:
+            pipe.lrange(self._key("h", str(code)), 0, -1)
+        for code, raw in zip(codes, pipe.execute()):
+            postings: list[IndexPosting] = []
+            for item in raw:
+                file_id, time_offset = self._text(item).rsplit(":", 1)
+                postings.append(
+                    IndexPosting(file_id=file_id, hash_code=code, time_offset=int(time_offset))
+                )
+            results[code] = postings
+        return results
+
     def _metadata_for(self, file_id: str) -> dict:
         raw = self._redis.get(self._key("m", file_id))
         if not raw:
@@ -515,6 +546,25 @@ class SQLiteHashIndex(HashIndex):
             IndexPosting(file_id=row[0], hash_code=code, time_offset=int(row[1]))
             for row in rows
         ]
+
+    def query_many(self, hash_codes: Iterable[int]) -> dict[int, list[IndexPosting]]:
+        codes = list({int(c) for c in hash_codes})
+        results: dict[int, list[IndexPosting]] = {code: [] for code in codes}
+        chunk = 500  # stay well under SQLITE_MAX_VARIABLE_NUMBER
+        for start in range(0, len(codes), chunk):
+            batch = [self._encode(code) for code in codes[start:start + chunk]]
+            placeholders = ",".join("?" * len(batch))
+            rows = self._conn.execute(
+                f"SELECT hash_code, file_id, time_offset FROM postings "
+                f"WHERE hash_code IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for stored, file_id, time_offset in rows:
+                code = self._decode(stored)
+                results[code].append(
+                    IndexPosting(file_id=file_id, hash_code=code, time_offset=int(time_offset))
+                )
+        return results
 
     def _metadata_for(self, file_id: str) -> dict:
         row = self._conn.execute(
@@ -672,6 +722,25 @@ class PostgresHashIndex(HashIndex):
             IndexPosting(file_id=row[0], hash_code=code, time_offset=int(row[1]))
             for row in rows
         ]
+
+    def query_many(self, hash_codes: Iterable[int]) -> dict[int, list[IndexPosting]]:
+        codes = list({int(c) for c in hash_codes})
+        results: dict[int, list[IndexPosting]] = {code: [] for code in codes}
+        if not codes:
+            return results
+        encoded = [self._encode(code) for code in codes]
+        with self._conn.cursor() as cur:  # single round-trip via array membership
+            cur.execute(
+                f"SELECT hash_code, file_id, time_offset FROM {self._postings_table} "
+                "WHERE hash_code = ANY(%s)",
+                (encoded,),
+            )
+            for stored, file_id, time_offset in cur.fetchall():
+                code = self._decode(stored)
+                results[code].append(
+                    IndexPosting(file_id=file_id, hash_code=code, time_offset=int(time_offset))
+                )
+        return results
 
     def _metadata_for(self, file_id: str) -> dict:
         with self._conn.cursor() as cur:

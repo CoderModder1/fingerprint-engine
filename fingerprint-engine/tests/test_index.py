@@ -81,6 +81,23 @@ def test_time_coherent_search_ranks_aligned_match_first() -> None:
     assert results[0].offset == 7
 
 
+def test_query_many_matches_individual_and_handles_chunking() -> None:
+    # Batched lookup must equal per-code query() and survive crossing the
+    # SQLite IN-chunk boundary (500). Run for the dict and SQLite backends.
+    for index in (InMemoryHashIndex(), SQLiteHashIndex(":memory:")):
+        index.add(make_fingerprint("big", list(range(600))))   # codes 1000..1599
+        index.add(make_fingerprint("other", [0, 1, 2]))        # codes 1000..1002
+        codes = list(range(1000, 1600)) + [999999]             # spans chunk + 1 absent
+        batched = index.query_many(codes)
+
+        assert set(batched) == set(codes)          # every requested code present
+        assert batched[999999] == []               # absent code -> empty list
+        assert {p.file_id for p in batched[1000]} == {"big", "other"}
+        for code in (1000, 1300, 1599):            # parity with individual query()
+            assert sorted((p.file_id, p.time_offset) for p in batched[code]) == \
+                   sorted((p.file_id, p.time_offset) for p in index.query(code))
+
+
 def test_search_reports_normalized_confidence() -> None:
     index = InMemoryHashIndex()
     index.add(make_fingerprint("aligned", [10, 20, 30, 40]))
