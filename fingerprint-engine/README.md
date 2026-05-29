@@ -247,3 +247,16 @@ Keep `query(hash_code)` returning postings with `file_id`, `hash_code`, and
 cd /Users/auto/Desktop/Claude/fingerprint-engine
 pytest
 ```
+
+## Benchmark
+
+`benchmarks/benchmark.py` measures fingerprinting throughput, per-backend index
+build rate and footprint, query-latency distribution, scaling across corpus
+sizes, and accuracy at scale (exact / near-duplicate recall@1 and confidence
+separation). By default it scans the running interpreter's stdlib + site-packages
+for a large real corpus; pass directories to scan your own.
+
+```bash
+python benchmarks/benchmark.py                      # default corpus + sizes
+python benchmarks/benchmark.py /path/to/files --sizes 500,5000   # custom
+```
