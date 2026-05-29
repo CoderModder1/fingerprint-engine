@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.index import InMemoryHashIndex, RedisHashIndex
+from core.index import InMemoryHashIndex, RedisHashIndex, SQLiteHashIndex
 from core.models import ConstellationHash, Fingerprint
 
 
@@ -129,3 +129,101 @@ def test_redis_snapshot_interops_with_in_memory(tmp_path: Path) -> None:
     assert target.file_count == 1
     assert target.posting_count == 3
     assert target.search(fingerprint)[0].file_id == "file-a"
+
+
+def test_sqlite_backend_search_matches_in_memory() -> None:
+    sqlite_index = SQLiteHashIndex(":memory:")
+    mem_index = InMemoryHashIndex()
+    for file_id, offsets in [("aligned", [10, 20, 30, 40]), ("scattered", [2, 40, 99, 125])]:
+        fingerprint = make_fingerprint(file_id, offsets)
+        sqlite_index.add(fingerprint)
+        mem_index.add(fingerprint)
+    query = make_fingerprint("query", [3, 13, 23, 33])
+
+    sqlite_results = sqlite_index.search(query, top_k=2)
+    mem_results = mem_index.search(query, top_k=2)
+
+    assert [r.file_id for r in sqlite_results] == [r.file_id for r in mem_results]
+    assert sqlite_results[0].file_id == "aligned"
+    assert sqlite_results[0].aligned_votes == 4
+    assert sqlite_results[0].offset == 7
+    assert sqlite_results[0].score == mem_results[0].score
+    assert sqlite_index.file_count == 2
+    assert sqlite_index.posting_count == 8
+
+
+def test_sqlite_backend_remove_and_replace() -> None:
+    index = SQLiteHashIndex(":memory:")
+    index.add(make_fingerprint("a", [1, 2, 3]))
+    index.add(make_fingerprint("b", [1, 2]))
+    assert index.file_count == 2
+    assert index.posting_count == 5
+
+    index.add(make_fingerprint("a", [9]))  # replace, no double counting
+    assert index.file_count == 2
+    assert index.posting_count == 3
+
+    index.remove("b")
+    assert index.file_count == 1
+    assert index.posting_count == 1
+    assert all(posting.file_id != "b" for posting in index.query(1000))
+
+
+def test_sqlite_snapshot_interops_with_in_memory(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snap.json"
+    fingerprint = make_fingerprint("file-a", [1, 2, 3])
+
+    source = SQLiteHashIndex(":memory:")
+    source.add(fingerprint)
+    source.save(snapshot)
+
+    loaded = InMemoryHashIndex.load(snapshot)
+    assert loaded.file_count == 1
+    assert loaded.posting_count == 3
+    assert loaded.search(fingerprint)[0].file_id == "file-a"
+
+    target = SQLiteHashIndex(":memory:").load_snapshot(snapshot)
+    assert target.file_count == 1
+    assert target.posting_count == 3
+    assert target.search(fingerprint)[0].file_id == "file-a"
+
+
+def test_sqlite_handles_full_64bit_hash_codes() -> None:
+    # Regression: hash codes are unsigned 64-bit but SQLite INTEGER is signed
+    # 64-bit; a code >= 2**63 must round-trip via the signed-offset mapping.
+    big = (1 << 64) - 1
+    fingerprint = Fingerprint(
+        file_id="big",
+        path="/tmp/big",
+        handler="test",
+        size_bytes=1,
+        content_sha256="big",
+        config={},
+        hashes=[
+            ConstellationHash(
+                hash_code=big, time_offset=4, anchor_time=4,
+                target_time=5, freq1=1, freq2=2, delta_t=1,
+            )
+        ],
+        metadata={},
+    )
+    index = SQLiteHashIndex(":memory:")
+    index.add(fingerprint)
+
+    assert index.posting_count == 1
+    postings = index.query(big)
+    assert postings and postings[0].hash_code == big
+    assert index.search(fingerprint)[0].file_id == "big"
+    assert index.to_dict()["files"]["big"][0][0] == big  # snapshot keeps the value
+
+
+def test_sqlite_file_backend_persists(tmp_path: Path) -> None:
+    # A file-backed SQLite index must survive being reopened.
+    db = tmp_path / "index.sqlite3"
+    fingerprint = make_fingerprint("persisted", [5, 6, 7])
+    SQLiteHashIndex(db).add(fingerprint)
+
+    reopened = SQLiteHashIndex(db)
+    assert reopened.file_count == 1
+    assert reopened.posting_count == 3
+    assert reopened.search(fingerprint)[0].file_id == "persisted"

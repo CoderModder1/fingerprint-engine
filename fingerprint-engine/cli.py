@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from core.fingerprinter import Fingerprinter
-from core.index import HashIndex, InMemoryHashIndex, RedisHashIndex
+from core.index import HashIndex, InMemoryHashIndex, RedisHashIndex, SQLiteHashIndex
 from core.models import Fingerprint, FingerprintConfig
 
 
@@ -26,12 +26,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hash-bits", type=int, default=FingerprintConfig.hash_bits)
     parser.add_argument("--min-time-frames", type=int, default=FingerprintConfig.min_time_frames)
     parser.add_argument("--min-window-size", type=int, default=FingerprintConfig.min_window_size)
-    parser.add_argument("--backend", choices=("memory", "redis"), default="memory",
+    parser.add_argument("--backend", choices=("memory", "redis", "sqlite"), default="memory",
                         help="index backend (default: memory)")
     parser.add_argument("--redis-url", default="redis://localhost:6379/0",
                         help="Redis connection URL (used when --backend redis)")
     parser.add_argument("--redis-prefix", default="fpidx",
                         help="Redis key namespace (used when --backend redis)")
+    parser.add_argument("--sqlite-path", default=".fingerprint_index.sqlite3",
+                        help="SQLite database path (used when --backend sqlite)")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -65,11 +67,24 @@ def config_from_args(args: argparse.Namespace) -> FingerprintConfig:
 
 def open_index(args: argparse.Namespace) -> HashIndex:
     """Open the index for the selected backend. Memory loads from --index-path;
-    Redis connects to a live, already-persistent store."""
+    Redis/SQLite connect to a live, already-persistent store."""
 
-    if getattr(args, "backend", "memory") == "redis":
+    backend = getattr(args, "backend", "memory")
+    if backend == "redis":
         return RedisHashIndex(url=args.redis_url, key_prefix=args.redis_prefix)
+    if backend == "sqlite":
+        return SQLiteHashIndex(database=args.sqlite_path)
     return InMemoryHashIndex.load(Path(args.index_path))
+
+
+def index_location(args: argparse.Namespace) -> str:
+    """Human-readable location of the index for the selected backend."""
+
+    if args.backend == "redis":
+        return args.redis_url
+    if args.backend == "sqlite":
+        return args.sqlite_path
+    return str(Path(args.index_path))
 
 
 def summarize_fingerprint(fingerprint: Fingerprint, full: bool = False) -> dict[str, Any]:
@@ -108,10 +123,10 @@ def main(argv: list[str] | None = None) -> int:
         for fingerprint in fingerprints:
             index.add(fingerprint)
         if args.backend == "memory":
-            index.save(index_path)  # Redis persists on add; no file to write.
+            index.save(index_path)  # Redis/SQLite persist on add; no file to write.
         payload = {
             "backend": args.backend,
-            "index_path": str(index_path) if args.backend == "memory" else args.redis_url,
+            "index_path": index_location(args),
             "indexed_files": [
                 summarize_fingerprint(fingerprint, full=False) for fingerprint in fingerprints
             ],
@@ -128,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = {
             "query": summarize_fingerprint(query, full=False),
             "backend": args.backend,
-            "index_path": str(index_path) if args.backend == "memory" else args.redis_url,
+            "index_path": index_location(args),
             "results": [result.to_dict() for result in results],
         }
         print(json.dumps(payload, indent=2, sort_keys=True))

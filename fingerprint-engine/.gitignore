@@ -6,6 +6,9 @@ env/
 # Engine index artifacts
 .fingerprint_index.json
 *.fingerprint_index.json
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Python caches
 __pycache__/

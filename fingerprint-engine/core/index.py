@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -31,8 +32,8 @@ class HashIndex(ABC):
         """Return stored metadata for a file (empty dict if unknown)."""
 
     @abstractmethod
-    def save(self, path: str | Path) -> None:
-        """Persist the index."""
+    def to_dict(self) -> dict[str, object]:
+        """Return a portable ``{backend, files, metadata}`` snapshot of the index."""
 
     def search(self, fingerprint: Fingerprint, top_k: int = 10) -> list[SearchResult]:
         """Return ranked matches via Shazam-style offset-histogram alignment.
@@ -84,6 +85,65 @@ class HashIndex(ABC):
             )
         )
         return results[:top_k]
+
+    def save(self, path: str | Path) -> None:
+        """Write a portable JSON snapshot (same schema for every backend)."""
+
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("w", encoding="utf-8") as handle:
+            json.dump(self.to_dict(), handle, sort_keys=True, separators=(",", ":"))
+
+    def load_snapshot(self, path: str | Path) -> "HashIndex":
+        """Bulk-load a JSON snapshot (from any backend's ``save``) via ``add``."""
+
+        source = Path(path)
+        if not source.exists():
+            return self
+        with source.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        files = data.get("files", {}) if isinstance(data, dict) else {}
+        metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
+        if not isinstance(files, dict):
+            raise ValueError("invalid index snapshot: files must be a mapping")
+        for file_id, entries in files.items():
+            if not isinstance(entries, list):
+                continue
+            hashes = [
+                ConstellationHash(
+                    hash_code=int(entry[0]),
+                    time_offset=int(entry[1]),
+                    anchor_time=int(entry[1]),
+                    target_time=int(entry[1]),
+                    freq1=0,
+                    freq2=0,
+                    delta_t=0,
+                )
+                for entry in entries
+                if isinstance(entry, (list, tuple)) and len(entry) == 2
+            ]
+            meta = metadata.get(file_id, {}) if isinstance(metadata, dict) else {}
+            meta = meta if isinstance(meta, dict) else {}
+            self.add(
+                Fingerprint(
+                    file_id=str(file_id),
+                    path=str(meta.get("path", "")),
+                    handler=str(meta.get("handler", "")),
+                    size_bytes=int(meta.get("size_bytes", 0) or 0),
+                    content_sha256=str(meta.get("content_sha256", file_id)),
+                    config={},
+                    hashes=hashes,
+                    metadata={
+                        key: value
+                        for key, value in meta.items()
+                        if key not in {
+                            "file_id", "path", "handler", "size_bytes",
+                            "content_sha256", "hash_count", "landmark_count",
+                        }
+                    },
+                )
+            )
+        return self
 
 
 class InMemoryHashIndex(HashIndex):
@@ -186,12 +246,6 @@ class InMemoryHashIndex(HashIndex):
                 )
             index._file_entries[str(file_id)] = normalized_entries
         return index
-
-    def save(self, path: str | Path) -> None:
-        destination = Path(path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("w", encoding="utf-8") as handle:
-            json.dump(self.to_dict(), handle, sort_keys=True, separators=(",", ":"))
 
     @classmethod
     def load(cls, path: str | Path) -> "InMemoryHashIndex":
@@ -342,56 +396,135 @@ class RedisHashIndex(HashIndex):
             metadata[file_id] = self._metadata_for(file_id)
         return {"backend": "redis", "files": files, "metadata": metadata}
 
-    def save(self, path: str | Path) -> None:
-        """Export a portable JSON snapshot (same schema as InMemoryHashIndex)."""
 
-        destination = Path(path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("w", encoding="utf-8") as handle:
-            json.dump(self.to_dict(), handle, sort_keys=True, separators=(",", ":"))
+class SQLiteHashIndex(HashIndex):
+    """SQLite-backed hash index: zero-dependency (stdlib), file-persistent.
 
-    def load_snapshot(self, path: str | Path) -> "RedisHashIndex":
-        """Bulk-load a JSON snapshot (from any backend's ``save``) into Redis."""
+    Implements the same :class:`HashIndex` contract and inherits the shared
+    ``search``/``save``/``load_snapshot``. Postings live in a relational table
+    indexed on ``hash_code`` (fast ``query``) and ``file_id`` (fast ``remove``).
+    Pass ``":memory:"`` for an ephemeral in-process database (used by tests) or a
+    file path for persistence; or inject an existing ``sqlite3.Connection``.
+    """
 
-        source = Path(path)
-        if not source.exists():
-            return self
-        with source.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        files = data.get("files", {}) if isinstance(data, dict) else {}
-        metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
-        if not isinstance(files, dict):
-            raise ValueError("invalid index snapshot: files must be a mapping")
-        for file_id, entries in files.items():
-            if not isinstance(entries, list):
-                continue
-            hashes = [
-                ConstellationHash(
-                    hash_code=int(entry[0]),
-                    time_offset=int(entry[1]),
-                    anchor_time=int(entry[1]),
-                    target_time=int(entry[1]),
-                    freq1=0,
-                    freq2=0,
-                    delta_t=0,
-                )
-                for entry in entries
-                if isinstance(entry, (list, tuple)) and len(entry) == 2
+    # Hash codes are unsigned 64-bit (0 .. 2**64-1) but SQLite INTEGER is signed
+    # 64-bit (max 2**63-1), so we store them shifted into signed range with this
+    # reversible offset. Keeps fast integer indexing without overflow.
+    _SIGNED_OFFSET = 1 << 63
+
+    def __init__(
+        self,
+        database: str | Path = "fingerprint_index.sqlite3",
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        if connection is not None:
+            self._conn = connection
+        else:
+            self._conn = sqlite3.connect(str(database), check_same_thread=False)
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS files (
+                file_id  TEXT PRIMARY KEY,
+                metadata TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS postings (
+                file_id     TEXT    NOT NULL,
+                hash_code   INTEGER NOT NULL,
+                time_offset INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_postings_hash ON postings(hash_code);
+            CREATE INDEX IF NOT EXISTS idx_postings_file ON postings(file_id);
+            """
+        )
+        self._conn.commit()
+
+    @classmethod
+    def _encode(cls, hash_code: int) -> int:
+        return int(hash_code) - cls._SIGNED_OFFSET
+
+    @classmethod
+    def _decode(cls, stored: int) -> int:
+        return int(stored) + cls._SIGNED_OFFSET
+
+    @property
+    def file_count(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+
+    @property
+    def posting_count(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) FROM postings").fetchone()[0])
+
+    def add(self, fingerprint: Fingerprint) -> None:
+        self.remove(fingerprint.file_id)
+        metadata = {
+            "file_id": fingerprint.file_id,
+            "path": fingerprint.path,
+            "handler": fingerprint.handler,
+            "size_bytes": fingerprint.size_bytes,
+            "content_sha256": fingerprint.content_sha256,
+            "hash_count": fingerprint.hash_count,
+            "landmark_count": fingerprint.landmark_count,
+            **fingerprint.metadata,
+        }
+        self._conn.execute(
+            "INSERT INTO files (file_id, metadata) VALUES (?, ?)",
+            (fingerprint.file_id, json.dumps(metadata, sort_keys=True)),
+        )
+        self._conn.executemany(
+            "INSERT INTO postings (file_id, hash_code, time_offset) VALUES (?, ?, ?)",
+            [
+                (fingerprint.file_id, self._encode(item.hash_code), int(item.time_offset))
+                for item in fingerprint.hashes
+            ],
+        )
+        self._conn.commit()
+
+    def remove(self, file_id: str) -> None:
+        self._conn.execute("DELETE FROM postings WHERE file_id = ?", (file_id,))
+        self._conn.execute("DELETE FROM files WHERE file_id = ?", (file_id,))
+        self._conn.commit()
+
+    def query(self, hash_code: int) -> list[IndexPosting]:
+        code = int(hash_code)
+        rows = self._conn.execute(
+            "SELECT file_id, time_offset FROM postings WHERE hash_code = ?",
+            (self._encode(code),),
+        ).fetchall()
+        return [
+            IndexPosting(file_id=row[0], hash_code=code, time_offset=int(row[1]))
+            for row in rows
+        ]
+
+    def _metadata_for(self, file_id: str) -> dict:
+        row = self._conn.execute(
+            "SELECT metadata FROM files WHERE file_id = ?", (file_id,)
+        ).fetchone()
+        if not row:
+            return {}
+        try:
+            data = json.loads(row[0])
+        except (ValueError, TypeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def to_dict(self) -> dict[str, object]:
+        files: dict[str, list[list[int]]] = {}
+        metadata: dict[str, dict] = {}
+        for (file_id,) in self._conn.execute("SELECT file_id FROM files").fetchall():
+            entries = [
+                [self._decode(hash_code), int(time_offset)]
+                for hash_code, time_offset in self._conn.execute(
+                    "SELECT hash_code, time_offset FROM postings "
+                    "WHERE file_id = ? ORDER BY rowid",
+                    (file_id,),
+                ).fetchall()
             ]
-            meta = metadata.get(file_id, {}) if isinstance(metadata, dict) else {}
-            meta = meta if isinstance(meta, dict) else {}
-            self.add(
-                Fingerprint(
-                    file_id=str(file_id),
-                    path=str(meta.get("path", "")),
-                    handler=str(meta.get("handler", "")),
-                    size_bytes=int(meta.get("size_bytes", 0) or 0),
-                    content_sha256=str(meta.get("content_sha256", file_id)),
-                    config={},
-                    hashes=hashes,
-                    metadata={k: v for k, v in meta.items()
-                              if k not in {"file_id", "path", "handler", "size_bytes",
-                                           "content_sha256", "hash_count", "landmark_count"}},
-                )
-            )
-        return self
+            files[file_id] = entries
+            metadata[file_id] = self._metadata_for(file_id)
+        return {"backend": "sqlite", "files": files, "metadata": metadata}
+
+    def close(self) -> None:
+        self._conn.close()

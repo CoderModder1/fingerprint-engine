@@ -172,36 +172,39 @@ The orchestrator imports handler modules dynamically and ranks them by `can_hand
 
 ### Index Backends
 
-The engine ships two backends; both implement the storage-agnostic `HashIndex`
-contract and **share the same `search()`** (time-coherent offset-histogram
-scoring lives in the base class), so they rank identically and scores stay
-comparable:
+The engine ships three backends. All implement the storage-agnostic `HashIndex`
+contract and **share the same `search()`, `save()`, and `load_snapshot()`** (the
+time-coherent offset-histogram scoring lives in the base class), so they rank
+identically and scores stay comparable:
 
 - **`InMemoryHashIndex`** — dict-backed, JSON-persisted. The default.
-- **`RedisHashIndex`** — postings live in Redis, so the index is persistent and
-  shareable across processes (horizontal scale). Requires `redis` (and a running
-  server); tests use `fakeredis`, no server needed.
+- **`SQLiteHashIndex`** — file-persistent, zero extra dependencies (stdlib
+  `sqlite3`), indexed lookups. Good single-node persistence.
+- **`RedisHashIndex`** — postings live in Redis, persistent and shareable across
+  processes (horizontal scale). Requires `redis` (and a running server); tests
+  use `fakeredis`, no server needed.
 
 ```bash
-# CLI: index into / search a Redis-backed store
-python cli.py --backend redis --redis-url redis://localhost:6379/0 add path/to/file
-python cli.py --backend redis search path/to/query
+# CLI: pick a backend with --backend (default: memory)
+python cli.py --backend sqlite --sqlite-path index.sqlite3 add path/to/file
+python cli.py --backend sqlite --sqlite-path index.sqlite3 search path/to/query
+python cli.py --backend redis  --redis-url redis://localhost:6379/0 add path/to/file
 ```
 
 ```python
-from core.index import RedisHashIndex
-index = RedisHashIndex(url="redis://localhost:6379/0", key_prefix="fpidx")
-# or inject a client (e.g. fakeredis / a configured redis.Redis)
+from core.index import SQLiteHashIndex, RedisHashIndex
+index = SQLiteHashIndex("index.sqlite3")            # or ":memory:"; or inject a sqlite3.Connection
+# index = RedisHashIndex(url="redis://localhost:6379/0")  # or inject a client (e.g. fakeredis)
 index.add(fingerprint)
 results = index.search(query_fingerprint)
-index.save("snapshot.json")            # portable export (interops with InMemory)
-RedisHashIndex(...).load_snapshot("snapshot.json")  # bulk-load a snapshot
+index.save("snapshot.json")                          # portable export (interops across backends)
+SQLiteHashIndex(":memory:").load_snapshot("snapshot.json")  # bulk-load any snapshot
 ```
 
 To add your own backend, subclass `HashIndex` and implement `add(fingerprint)`,
-`remove(file_id)`, `query(hash_code)`, `_metadata_for(file_id)`, and `save(path)`.
+`remove(file_id)`, `query(hash_code)`, `_metadata_for(file_id)`, and `to_dict()`.
 Keep `query(hash_code)` returning postings with `file_id`, `hash_code`, and
-`time_offset`; the inherited `search()` does the rest.
+`time_offset`; the inherited `search()`/`save()`/`load_snapshot()` do the rest.
 
 ## Tests
 
