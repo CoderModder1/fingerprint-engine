@@ -69,7 +69,7 @@ class ImageFileHandler(FileHandler):
         with Image.open(path) as image:
             mode = image.mode
             original_size = (int(image.width), int(image.height))
-            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
             grayscale = image.convert("L").resize(self.canonical_size, resampling)
             pixels = np.asarray(grayscale, dtype=np.float32)
         width, height = self.canonical_size

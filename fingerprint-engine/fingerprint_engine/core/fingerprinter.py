@@ -8,12 +8,12 @@ import inspect
 import pkgutil
 import warnings
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterable
 
-from handlers.base import FileHandler
+from fingerprint_engine.handlers.base import FileHandler
 
 from .fft_pipeline import FFTFingerprintPipeline
 from .models import Fingerprint, FingerprintConfig, SearchResult
@@ -41,7 +41,7 @@ class Fingerprinter(FileProcessor):
     def __init__(
         self,
         config: FingerprintConfig | None = None,
-        handlers_package: str = "handlers",
+        handlers_package: str = "fingerprint_engine.handlers",
     ) -> None:
         self.config = config or FingerprintConfig()
         self.config.validate()

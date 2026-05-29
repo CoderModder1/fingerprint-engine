@@ -9,8 +9,8 @@ from typing import Any
 
 import numpy as np
 
-from core.fft_pipeline import FFTFingerprintPipeline
-from core.models import ConstellationHash, LandmarkPoint
+from fingerprint_engine.core.fft_pipeline import FFTFingerprintPipeline
+from fingerprint_engine.core.models import ConstellationHash, LandmarkPoint
 
 
 class FileHandler(ABC):

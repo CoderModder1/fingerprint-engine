@@ -10,10 +10,15 @@ env/
 *.sqlite3-wal
 *.sqlite3-shm
 
-# Python caches
+# Python caches & build artifacts
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 
 # OS cruft
 .DS_Store

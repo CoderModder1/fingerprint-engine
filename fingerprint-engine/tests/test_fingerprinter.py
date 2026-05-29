@@ -8,9 +8,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.fingerprinter import Fingerprinter
-from core.index import InMemoryHashIndex
-from core.models import FingerprintConfig
+from fingerprint_engine.core.fingerprinter import Fingerprinter
+from fingerprint_engine.core.index import InMemoryHashIndex
+from fingerprint_engine.core.models import FingerprintConfig
 
 
 def test_text_fingerprint_is_deterministic(tmp_path: Path) -> None:

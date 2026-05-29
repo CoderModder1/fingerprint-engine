@@ -67,7 +67,7 @@ class LandmarkPoint:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "LandmarkPoint":
+    def from_dict(cls, data: dict[str, Any]) -> LandmarkPoint:
         return cls(
             time_index=int(data["time_index"]),
             frequency_bin=int(data["frequency_bin"]),
@@ -102,7 +102,7 @@ class ConstellationHash:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ConstellationHash":
+    def from_dict(cls, data: dict[str, Any]) -> ConstellationHash:
         return cls(
             hash_code=int(data["hash_code"]),
             time_offset=int(data["time_offset"]),
@@ -155,7 +155,7 @@ class Fingerprint:
         return data
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Fingerprint":
+    def from_dict(cls, data: dict[str, Any]) -> Fingerprint:
         return cls(
             file_id=str(data["file_id"]),
             path=str(data["path"]),
@@ -191,7 +191,7 @@ class IndexPosting:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "IndexPosting":
+    def from_dict(cls, data: dict[str, Any]) -> IndexPosting:
         return cls(
             file_id=str(data["file_id"]),
             hash_code=int(data["hash_code"]),

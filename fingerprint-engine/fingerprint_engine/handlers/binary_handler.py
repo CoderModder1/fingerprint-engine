@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from core.fft_pipeline import FFTFingerprintPipeline
+from fingerprint_engine.core.fft_pipeline import FFTFingerprintPipeline
 
 from .base import FileHandler
 

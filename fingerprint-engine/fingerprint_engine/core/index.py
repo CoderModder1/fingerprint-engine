@@ -6,14 +6,24 @@ import json
 import sqlite3
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from pathlib import Path
-from typing import DefaultDict, Iterable
 
 from .models import Calibration, ConstellationHash, Fingerprint, IndexPosting, SearchResult
 
 
 class HashIndex(ABC):
     """Storage-agnostic contract for searchable fingerprint postings."""
+
+    @property
+    @abstractmethod
+    def file_count(self) -> int:
+        """Number of indexed files."""
+
+    @property
+    @abstractmethod
+    def posting_count(self) -> int:
+        """Total number of postings across all indexed files."""
 
     @abstractmethod
     def add(self, fingerprint: Fingerprint) -> None:
@@ -148,7 +158,7 @@ class HashIndex(ABC):
         with destination.open("w", encoding="utf-8") as handle:
             json.dump(self.to_dict(), handle, sort_keys=True, separators=(",", ":"))
 
-    def load_snapshot(self, path: str | Path) -> "HashIndex":
+    def load_snapshot(self, path: str | Path) -> HashIndex:
         """Bulk-load a JSON snapshot (from any backend's ``save``) via ``add``."""
 
         source = Path(path)
@@ -221,7 +231,7 @@ class InMemoryHashIndex(HashIndex):
     """Dict-backed hash index with Shazam-style offset alignment scoring."""
 
     def __init__(self) -> None:
-        self._postings: DefaultDict[int, list[IndexPosting]] = defaultdict(list)
+        self._postings: defaultdict[int, list[IndexPosting]] = defaultdict(list)
         self._file_entries: dict[str, list[tuple[int, int]]] = {}
         self._metadata: dict[str, dict[str, object]] = {}
 
@@ -307,7 +317,7 @@ class InMemoryHashIndex(HashIndex):
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, object]) -> "InMemoryHashIndex":
+    def from_dict(cls, data: dict[str, object]) -> InMemoryHashIndex:
         index = cls()
         files = data.get("files", {})
         if not isinstance(files, dict):
@@ -340,7 +350,7 @@ class InMemoryHashIndex(HashIndex):
         return index
 
     @classmethod
-    def load(cls, path: str | Path) -> "InMemoryHashIndex":
+    def load(cls, path: str | Path) -> InMemoryHashIndex:
         source = Path(path)
         if not source.exists():
             return cls()
@@ -473,7 +483,7 @@ class RedisHashIndex(HashIndex):
         pipe = self._redis.pipeline()  # one round-trip for all LRANGEs
         for code in codes:
             pipe.lrange(self._key("h", str(code)), 0, -1)
-        for code, raw in zip(codes, pipe.execute()):
+        for code, raw in zip(codes, pipe.execute(), strict=False):
             postings: list[IndexPosting] = []
             for item in raw:
                 file_id, time_offset = self._text(item).rsplit(":", 1)

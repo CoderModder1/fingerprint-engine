@@ -7,16 +7,15 @@ import json
 from pathlib import Path
 from typing import Any
 
-from core.fingerprinter import Fingerprinter
-from core.index import (
+from fingerprint_engine.core.fingerprinter import Fingerprinter
+from fingerprint_engine.core.index import (
     HashIndex,
     InMemoryHashIndex,
     PostgresHashIndex,
     RedisHashIndex,
     SQLiteHashIndex,
 )
-from core.models import Calibration, Fingerprint, FingerprintConfig
-
+from fingerprint_engine.core.models import Calibration, Fingerprint, FingerprintConfig
 
 DEFAULT_INDEX_PATH = Path(__file__).with_name(".fingerprint_index.json")
 

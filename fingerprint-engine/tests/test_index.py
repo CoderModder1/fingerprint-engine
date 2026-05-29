@@ -9,13 +9,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.index import (
+from fingerprint_engine.core.index import (
     InMemoryHashIndex,
     PostgresHashIndex,
     RedisHashIndex,
     SQLiteHashIndex,
 )
-from core.models import Calibration, ConstellationHash, Fingerprint
+from fingerprint_engine.core.models import Calibration, ConstellationHash, Fingerprint
 
 
 def _fake_redis():

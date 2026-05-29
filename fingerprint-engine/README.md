@@ -7,12 +7,12 @@ A modular file fingerprinting engine inspired by Shazam's landmark-based audio m
 The engine has three layers:
 
 1. Core orchestration
-   - `core/fingerprinter.py` discovers `FileHandler` plugins from the `handlers` package.
-   - `core/models.py` defines `Fingerprint`, `LandmarkPoint`, `ConstellationHash`, and tuning config dataclasses.
-   - `core/index.py` defines the storage-agnostic `HashIndex` contract plus the default dict-backed index.
+   - `fingerprint_engine/core/fingerprinter.py` discovers `FileHandler` plugins from the `fingerprint_engine/handlers` package.
+   - `fingerprint_engine/core/models.py` defines `Fingerprint`, `LandmarkPoint`, `ConstellationHash`, and tuning config dataclasses.
+   - `fingerprint_engine/core/index.py` defines the storage-agnostic `HashIndex` contract plus the default dict-backed index.
 
 2. FFT-equivalent pipeline
-   - `core/fft_pipeline.py` normalizes handler signals, applies sliding windows, runs `numpy.fft.rfft`, extracts adaptive local maxima, builds peak-pair constellations, and hashes `(freq1, freq2, delta_t)` into deterministic integer codes.
+   - `fingerprint_engine/core/fft_pipeline.py` normalizes handler signals, applies sliding windows, runs `numpy.fft.rfft`, extracts adaptive local maxima, builds peak-pair constellations, and hashes `(freq1, freq2, delta_t)` into deterministic integer codes.
    - Binary files use normalized raw bytes.
    - Text and source files use character code, character class, and token-length rhythm.
    - Images use flattened grayscale pixel intensity.
@@ -28,51 +28,55 @@ The engine has three layers:
 ## Install
 
 ```bash
-cd /Users/auto/Desktop/Claude/fingerprint-engine
-python -m pip install -r requirements.txt
+cd fingerprint-engine
+python -m pip install -e ".[all]"     # all handlers + backends; installs the `fingerprint-engine` CLI
+# or pick extras: pip install -e ".[image,audio,pdf,redis,postgres]"
+# or just the core (numpy only): pip install -e .
 ```
 
-MP3 support requires `pydub` and a working ffmpeg installation.
+This installs the `fingerprint-engine` console command. For development without
+installing, run the CLI as `python -m fingerprint_engine.cli ...`. MP3 support
+requires the `[audio]` extra (`pydub`) and a working ffmpeg installation.
 
 ## CLI Usage
 
 Fingerprint a file:
 
 ```bash
-python cli.py fingerprint path/to/file
+fingerprint-engine fingerprint path/to/file
 ```
 
 Add files to the default local JSON index:
 
 ```bash
-python cli.py add path/to/file1 path/to/file2
+fingerprint-engine add path/to/file1 path/to/file2
 ```
 
 Search the index with a query file:
 
 ```bash
-python cli.py search path/to/query --top-k 5
+fingerprint-engine search path/to/query --top-k 5
 ```
 
 Use a custom index path:
 
 ```bash
-python cli.py --index-path ./my-index.json add path/to/file
-python cli.py --index-path ./my-index.json search path/to/query
+fingerprint-engine --index-path ./my-index.json add path/to/file
+fingerprint-engine --index-path ./my-index.json search path/to/query
 ```
 
 Tune resolution:
 
 ```bash
-python cli.py --window-size 2048 --hop-size 512 --fanout 8 fingerprint path/to/file
+fingerprint-engine --window-size 2048 --hop-size 512 --fanout 8 fingerprint path/to/file
 ```
 
 ## Python Usage
 
 ```python
-from core.fingerprinter import Fingerprinter
-from core.index import InMemoryHashIndex
-from core.models import FingerprintConfig
+from fingerprint_engine.core.fingerprinter import Fingerprinter
+from fingerprint_engine.core.index import InMemoryHashIndex
+from fingerprint_engine.core.models import FingerprintConfig
 
 fingerprinter = Fingerprinter(FingerprintConfig(window_size=2048, hop_size=512))
 index = InMemoryHashIndex()
@@ -105,11 +109,11 @@ that aligned at the winning offset. On a real corpus, true matches land at
 threshold separates them all:
 
 ```bash
-python cli.py search query.pdf --min-confidence 0.05   # drop matches below 0.05
+fingerprint-engine search query.pdf --min-confidence 0.05   # drop matches below 0.05
 ```
 
 ```python
-from core.models import Calibration
+from fingerprint_engine.core.models import Calibration
 # Uniform threshold (usually enough, since confidence is already normalised):
 index.search(query, calibration=Calibration(default_min_confidence=0.05))
 # Per-handler overrides when a type needs a stricter/looser cutoff:
@@ -130,7 +134,7 @@ indexed files, and recalibrates each file's stored `hash_count` so confidence
 stays meaningful (a self-match remains ~1.0).
 
 ```bash
-python cli.py --backend sqlite --sqlite-path index.sqlite3 prune --max-df-ratio 0.1
+fingerprint-engine --backend sqlite --sqlite-path index.sqlite3 prune --max-df-ratio 0.1
 ```
 
 On a 1000-file source corpus (default `0.1`), this removed ~36% of postings and
@@ -195,12 +199,12 @@ audio — because those change the underlying signal sequence, not just its scal
 
 ### Add A File Handler
 
-Create a module in `handlers/` containing a subclass of `FileHandler`:
+Create a module in `fingerprint_engine/handlers/` containing a subclass of `FileHandler`:
 
 ```python
 from pathlib import Path
 import numpy as np
-from handlers.base import FileHandler
+from fingerprint_engine.handlers.base import FileHandler
 
 class MyFormatHandler(FileHandler):
     name = "my_format"
@@ -235,14 +239,14 @@ identically and scores stay comparable:
 
 ```bash
 # CLI: pick a backend with --backend (default: memory)
-python cli.py --backend sqlite   --sqlite-path index.sqlite3 add path/to/file
-python cli.py --backend redis    --redis-url redis://localhost:6379/0 add path/to/file
-python cli.py --backend postgres --postgres-dsn postgresql://localhost/fingerprint add path/to/file
-python cli.py --backend postgres --postgres-dsn postgresql://localhost/fingerprint search path/to/query
+fingerprint-engine --backend sqlite   --sqlite-path index.sqlite3 add path/to/file
+fingerprint-engine --backend redis    --redis-url redis://localhost:6379/0 add path/to/file
+fingerprint-engine --backend postgres --postgres-dsn postgresql://localhost/fingerprint add path/to/file
+fingerprint-engine --backend postgres --postgres-dsn postgresql://localhost/fingerprint search path/to/query
 ```
 
 ```python
-from core.index import SQLiteHashIndex, RedisHashIndex, PostgresHashIndex
+from fingerprint_engine.core.index import SQLiteHashIndex, RedisHashIndex, PostgresHashIndex
 index = SQLiteHashIndex("index.sqlite3")            # or ":memory:"; or inject a sqlite3.Connection
 # index = RedisHashIndex(url="redis://localhost:6379/0")      # or inject a client (e.g. fakeredis)
 # index = PostgresHashIndex(dsn="postgresql://localhost/fingerprint")  # or inject a psycopg connection

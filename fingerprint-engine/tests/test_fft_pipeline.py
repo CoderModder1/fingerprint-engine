@@ -9,8 +9,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.fft_pipeline import FFTFingerprintPipeline
-from core.models import FingerprintConfig
+from fingerprint_engine.core.fft_pipeline import FFTFingerprintPipeline
+from fingerprint_engine.core.models import FingerprintConfig
 
 
 def test_pipeline_is_deterministic_for_same_signal() -> None:

@@ -38,9 +38,9 @@ warnings.simplefilter("ignore")  # 0-hash RuntimeWarnings are expected for tiny 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.fingerprinter import Fingerprinter
-from core.index import InMemoryHashIndex, SQLiteHashIndex
-from core.models import FingerprintConfig
+from fingerprint_engine.core.fingerprinter import Fingerprinter
+from fingerprint_engine.core.index import InMemoryHashIndex, SQLiteHashIndex
+from fingerprint_engine.core.models import FingerprintConfig
 
 
 def collect_files(roots: list[str], ext: str, min_bytes: int, max_bytes: int, limit: int) -> list[str]:
