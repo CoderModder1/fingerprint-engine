@@ -84,6 +84,17 @@ def fp_with_hashes(file_id: str, code_offsets: list[tuple[int, int]]) -> Fingerp
                        content_sha256=file_id, config={}, hashes=hashes, metadata={})
 
 
+def _search_tuples(index, query: Fingerprint, top_k: int = 10) -> list[tuple[str, int, int, float]]:
+    """The cross-backend-comparable shape of a ranked result list.
+
+    Pins exactly the fields whose computation is shared in the base class
+    (file_id, winning offset, aligned votes, score) and whose ORDER is the
+    contract every backend must reproduce byte-identically.
+    """
+
+    return [(r.file_id, r.offset, r.aligned_votes, r.score) for r in index.search(query, top_k=top_k)]
+
+
 def test_time_coherent_search_ranks_aligned_match_first() -> None:
     index = InMemoryHashIndex()
     index.add(make_fingerprint("aligned", [10, 20, 30, 40]))
@@ -695,3 +706,227 @@ def test_in_memory_concurrent_add_and_search_stay_consistent() -> None:
     # Each file contributed exactly 3 postings; no double-counting or loss.
     assert index.posting_count == 3 * len(file_ids)
     assert {r.file_id for r in index.search(make_fingerprint("q", [1, 2, 3]), top_k=100)} == set(file_ids)
+
+
+# ---------------------------------------------------------------------------
+# Cross-backend invariant parity (Task 4)
+#
+# These pin deliberately-implemented invariants whose divergence point had no
+# test: the offset tie-break (implemented in three places), the shared base
+# scoring/ranking (must stay byte-identical across backends), and the snapshot
+# interop preserving postings + metadata + ranks across a save/load between
+# different backends. Redis runs via fakeredis (importorskip); Postgres parity
+# is gated behind @requires_pg.
+# ---------------------------------------------------------------------------
+
+
+def _parity_backends() -> list[tuple[str, object]]:
+    """In-memory, SQLite and (if fakeredis is installed) Redis, fresh each call.
+
+    Postgres is intentionally NOT here: it needs a live server and is gated by
+    @requires_pg in its own test below.
+    """
+
+    backends: list[tuple[str, object]] = [
+        ("in_memory", InMemoryHashIndex()),
+        ("sqlite", SQLiteHashIndex(":memory:")),
+    ]
+    try:
+        import fakeredis  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        backends.append(("redis", RedisHashIndex(client=_fake_redis(), key_prefix="parity")))
+    return backends
+
+
+def _tie_corpus_and_query() -> tuple[Fingerprint, Fingerprint]:
+    """One indexed file with TWO equal-vote offset bins, plus its query.
+
+    The query has four distinct codes all at offset 0. Codes 1,2 sit at offset
+    100 in the indexed file (delta 100, two votes); codes 3,4 sit at offset 200
+    (delta 200, two votes). The offset histogram is therefore {100: 2, 200: 2}
+    -- a genuine tie. The tie-break rule (votes DESC, then offset ASC) must pick
+    the SMALLER offset, 100. This is the exact divergence point of the three
+    implementations: in-memory ``max(..., key=lambda kv: (kv[1], -kv[0]))`` and
+    the SQL ``ROW_NUMBER() ... ORDER BY votes DESC, delta ASC``.
+    """
+
+    indexed = fp_with_hashes("tie", [(1, 100), (2, 100), (3, 200), (4, 200)])
+    query = fp_with_hashes("q", [(1, 0), (2, 0), (3, 0), (4, 0)])
+    return indexed, query
+
+
+def test_offset_tie_break_picks_smaller_offset_across_backends() -> None:
+    # INVARIANT 1: winning-offset tie-break parity. Build a real tie (two offset
+    # bins with equal votes) and assert every backend returns the SMALLER offset.
+    # If either tie-break flipped (e.g. to offset DESC, or +kv[0]), this fails.
+    indexed, query = _tie_corpus_and_query()
+
+    winners: dict[str, tuple[int, int]] = {}
+    for name, index in _parity_backends():
+        index.add(indexed)
+        results = index.search(query, top_k=5)
+        assert results, name
+        top = results[0]
+        # Sanity-check the tie is real on the in-memory backend's histogram:
+        # both bins must carry the same (winning) vote count.
+        winners[name] = (top.offset, top.aligned_votes)
+
+    # Every backend agrees on the smaller offset (100), with the tied vote count.
+    assert set(winners.values()) == {(100, 2)}, winners
+
+    # Belt-and-suspenders: the losing bin really has equal votes, so this
+    # exercises the tie-break rather than a plain max.
+    histogram: dict[int, int] = {}
+    mem = InMemoryHashIndex()
+    mem.add(indexed)
+    for query_hash in query.hashes:
+        for posting in mem.query(query_hash.hash_code):
+            delta = posting.time_offset - query_hash.time_offset
+            histogram[delta] = histogram.get(delta, 0) + 1
+    assert histogram == {100: 2, 200: 2}  # two bins, equal votes -> genuine tie
+
+
+def test_cross_backend_ranking_is_byte_identical() -> None:
+    # INVARIANT 2: shared base scoring/ranking is byte-identical across backends.
+    # Index the same corpus into every backend and assert search() returns the
+    # SAME (file_id, offset, aligned_votes, score) ordering for one query.
+    corpus = [
+        fp_with_hashes("alpha", [(1, 10), (2, 20), (3, 30), (4, 40)]),
+        fp_with_hashes("beta", [(1, 5), (2, 40), (3, 99), (5, 7)]),
+        fp_with_hashes("gamma", [(1, 10), (2, 20), (6, 30)]),
+    ]
+    query = fp_with_hashes("q", [(1, 0), (2, 10), (3, 20), (4, 30), (5, 1), (6, 2)])
+
+    per_backend: dict[str, list[tuple[str, int, int, float]]] = {}
+    for name, index in _parity_backends():
+        for fingerprint in corpus:
+            index.add(fingerprint)
+        per_backend[name] = _search_tuples(index, query, top_k=10)
+
+    # A meaningful ranking (more than one match) actually ordered, not trivial.
+    reference = per_backend["in_memory"]
+    assert len(reference) >= 3
+    assert reference[0][0] == "alpha"  # the coherently-aligned file ranks first
+    for name, tuples in per_backend.items():
+        assert tuples == reference, (name, tuples, reference)
+
+
+def test_snapshot_interop_preserves_postings_metadata_and_ranks() -> None:
+    # INVARIANT 3: a snapshot save()'d by one backend, load_snapshot'd into
+    # another, preserves postings + metadata + ranks identically. Existing tests
+    # only check file_count/posting_count + the top result; this pins the full
+    # postings set, the metadata map, and the exact ranked ordering.
+    import tempfile
+    from pathlib import Path as _Path
+
+    corpus = [
+        fp_with_hashes("alpha", [(1, 10), (2, 20), (3, 30), (4, 40)]),
+        fp_with_hashes("beta", [(1, 5), (2, 40), (3, 99), (5, 7)]),
+        fp_with_hashes("gamma", [(1, 10), (2, 20), (6, 30)]),
+    ]
+    query = fp_with_hashes("q", [(1, 0), (2, 10), (3, 20), (4, 30), (5, 1), (6, 2)])
+
+    def normalized_files(index) -> dict[str, list[tuple[int, int]]]:
+        # to_dict() preserves per-file order differently per backend, so compare
+        # the postings as sorted multisets -- equality of CONTENT, not order.
+        return {
+            file_id: sorted((int(code), int(offset)) for code, offset in entries)
+            for file_id, entries in index.to_dict()["files"].items()
+        }
+
+    def metadata_map(index) -> dict[str, dict]:
+        return {file_id: index._metadata_for(file_id) for file_id in index.to_dict()["files"]}
+
+    # Save once from SQLite (a SQL backend, so it round-trips the signed-offset
+    # encode), then load into every backend and compare against the source.
+    source = SQLiteHashIndex(":memory:")
+    for fingerprint in corpus:
+        source.add(fingerprint)
+    source_files = normalized_files(source)
+    source_meta = metadata_map(source)
+    source_ranks = _search_tuples(source, query, top_k=10)
+
+    with tempfile.TemporaryDirectory() as directory:
+        snapshot = _Path(directory) / "snap.json"
+        source.save(snapshot)
+
+        targets: list[tuple[str, object]] = [
+            ("in_memory", InMemoryHashIndex().load_snapshot(snapshot)),
+            ("sqlite", SQLiteHashIndex(":memory:").load_snapshot(snapshot)),
+        ]
+        try:
+            import fakeredis  # noqa: F401
+        except ImportError:
+            pass
+        else:
+            targets.append(
+                ("redis", RedisHashIndex(client=_fake_redis(), key_prefix="snap").load_snapshot(snapshot))
+            )
+        # The classmethod load() entry point must agree with load_snapshot() too.
+        targets.append(("in_memory_load", InMemoryHashIndex.load(snapshot)))
+
+        for name, target in targets:
+            assert normalized_files(target) == source_files, name
+            assert metadata_map(target) == source_meta, name
+            assert _search_tuples(target, query, top_k=10) == source_ranks, name
+
+
+@requires_pg
+def test_postgres_offset_tie_break_picks_smaller_offset(pg_index) -> None:
+    # INVARIANT 1 for Postgres: its ROW_NUMBER() ... ORDER BY votes DESC, delta
+    # ASC must resolve a real tie to the smaller offset, like the others.
+    indexed, query = _tie_corpus_and_query()
+    pg_index.add(indexed)
+
+    top = pg_index.search(query, top_k=5)[0]
+    assert (top.offset, top.aligned_votes) == (100, 2)
+
+
+@requires_pg
+def test_postgres_ranking_matches_in_memory_byte_identical(pg_index) -> None:
+    # INVARIANT 2 for Postgres: full (file_id, offset, aligned_votes, score)
+    # ordering identical to the in-memory reference.
+    corpus = [
+        fp_with_hashes("alpha", [(1, 10), (2, 20), (3, 30), (4, 40)]),
+        fp_with_hashes("beta", [(1, 5), (2, 40), (3, 99), (5, 7)]),
+        fp_with_hashes("gamma", [(1, 10), (2, 20), (6, 30)]),
+    ]
+    query = fp_with_hashes("q", [(1, 0), (2, 10), (3, 20), (4, 30), (5, 1), (6, 2)])
+
+    mem = InMemoryHashIndex()
+    for fingerprint in corpus:
+        mem.add(fingerprint)
+        pg_index.add(fingerprint)
+
+    assert _search_tuples(pg_index, query, top_k=10) == _search_tuples(mem, query, top_k=10)
+
+
+@requires_pg
+def test_postgres_snapshot_interop_preserves_postings_metadata_and_ranks(pg_index, tmp_path: Path) -> None:
+    # INVARIANT 3 for Postgres: a Postgres-written snapshot loads into the
+    # in-memory backend with identical postings, metadata, and ranks.
+    corpus = [
+        fp_with_hashes("alpha", [(1, 10), (2, 20), (3, 30), (4, 40)]),
+        fp_with_hashes("beta", [(1, 5), (2, 40), (3, 99), (5, 7)]),
+    ]
+    query = fp_with_hashes("q", [(1, 0), (2, 10), (3, 20), (4, 30), (5, 1)])
+    for fingerprint in corpus:
+        pg_index.add(fingerprint)
+
+    def normalized_files(index) -> dict[str, list[tuple[int, int]]]:
+        return {
+            file_id: sorted((int(code), int(offset)) for code, offset in entries)
+            for file_id, entries in index.to_dict()["files"].items()
+        }
+
+    snapshot = tmp_path / "snap.json"
+    pg_index.save(snapshot)
+    loaded = InMemoryHashIndex.load(snapshot)
+
+    assert normalized_files(loaded) == normalized_files(pg_index)
+    assert {fid: loaded._metadata_for(fid) for fid in normalized_files(loaded)} == {
+        fid: pg_index._metadata_for(fid) for fid in normalized_files(pg_index)
+    }
+    assert _search_tuples(loaded, query, top_k=10) == _search_tuples(pg_index, query, top_k=10)

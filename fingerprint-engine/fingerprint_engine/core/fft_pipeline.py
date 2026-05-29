@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import warnings
 from collections.abc import Iterable
 
 import numpy as np
@@ -11,11 +12,30 @@ from .models import ConstellationHash, FingerprintConfig, LandmarkPoint
 
 
 class FFTFingerprintPipeline:
-    """Transforms a 1D signal into landmark peaks and constellation hashes."""
+    """Transforms a 1D signal into landmark peaks and constellation hashes.
 
-    def __init__(self, config: FingerprintConfig | None = None) -> None:
+    ``fixed_window`` marks the configured ``window_size``/``hop_size`` as
+    *authoritative* for a content type (see
+    :meth:`Fingerprinter._build_handler_pipelines`): such a window must NOT be
+    shrunk as a function of per-file length, otherwise two copies of the same
+    content at different lengths land on different time grids and silently fail
+    to match. The window is still adapted as a last resort when a signal is too
+    short to yield even one usable frame at the declared window (so tiny inputs
+    get *some* hashes rather than zero); that rare adaptation emits a one-line
+    ``RuntimeWarning`` so it is never silent. The default (``fixed_window`` is
+    False) keeps the original length-adaptive behaviour, which is what the
+    global ``--window-size`` override and the audio 4096 path rely on.
+    """
+
+    def __init__(
+        self,
+        config: FingerprintConfig | None = None,
+        *,
+        fixed_window: bool = False,
+    ) -> None:
         self.config = config or FingerprintConfig()
         self.config.validate()
+        self.fixed_window = fixed_window
 
     def bytes_to_signal(self, data: bytes) -> np.ndarray:
         """Default byte strategy used by binary-like handlers."""
@@ -47,11 +67,69 @@ class FFTFingerprintPipeline:
         std = float(array.std())
         if std > 1e-8:
             array = (array - mean) / std
-        elif np.max(np.abs(array)) > 0:
-            array = array / float(np.max(np.abs(array)))
+        else:
+            # Zero-variance (constant) signal: featureless, regardless of the
+            # constant's value. The old `array / max(abs)` branch normalised any
+            # nonzero constant to an all-ones array, so two DIFFERENT constants
+            # (e.g. full(N, 5.0) vs full(N, 99.0)) produced byte-identical
+            # spectra and hashes -- distinct files would mutually false-match.
+            # Return zeros so the spectrogram.max() <= 0 guard yields no peaks
+            # (0 hashes) and the 0-hash RuntimeWarning in Fingerprinter fires.
+            array = np.zeros_like(array)
         return array.astype(np.float32, copy=False)
 
-    def _effective_window_hop(self, signal_len: int) -> tuple[int, int]:
+    def _frames_at(self, signal_len: int, window: int, hop: int) -> float:
+        """Number of sliding frames a signal of ``signal_len`` yields."""
+
+        if signal_len <= window:
+            return 1.0
+        return (signal_len - window) / hop + 1
+
+    def _effective_window_hop(self, signal_len: int, *, warn: bool = False) -> tuple[int, int]:
+        """Resolve the (window, hop) actually used for ``signal_len`` samples.
+
+        For an *authoritative* window (``fixed_window``; see the class
+        docstring) the declared window/hop is returned UNCHANGED, so the same
+        content type lands on the same time grid regardless of length and
+        excerpts/truncations of the same content still match. The only
+        exception is a signal too short to yield even one usable frame pair at
+        the declared window: there we fall back to the adaptive shrink so tiny
+        inputs still get *some* hashes rather than zero, and -- when ``warn`` is
+        set -- emit a one-line ``RuntimeWarning`` so the rare adaptation is
+        never silent. ``warn`` is set only on the real compute path
+        (:meth:`spectrogram`); the metadata query :meth:`effective_params`
+        leaves it off so the warning fires once per fingerprint, not twice.
+
+        Otherwise (the default and the global ``--window-size`` override) the
+        length-adaptive shrink is applied as before.
+        """
+
+        if not self.fixed_window:
+            return self._adaptive_window_hop(signal_len)
+
+        window = self.config.window_size
+        hop = max(1, self.config.hop_size)
+        # A usable fingerprint needs at least one anchor->target pair that spans
+        # ``min_delta_t`` frames, i.e. min_delta_t + 1 frames (and >= 2 in any
+        # case, since a single frame can carry no time structure). Above that
+        # floor the declared window is authoritative and must not move.
+        min_usable_frames = max(2, self.config.min_delta_t + 1)
+        if signal_len <= 0 or self._frames_at(signal_len, window, hop) >= min_usable_frames:
+            return window, hop
+
+        adapted_window, adapted_hop = self._adaptive_window_hop(signal_len)
+        if warn and (adapted_window, adapted_hop) != (window, hop):
+            warnings.warn(
+                f"signal too short ({signal_len} samples) for the fixed "
+                f"window {window}/hop {hop}; adapting to window "
+                f"{adapted_window}/hop {adapted_hop} (this file may not align "
+                "with same-content files at the fixed window)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return adapted_window, adapted_hop
+
+    def _adaptive_window_hop(self, signal_len: int) -> tuple[int, int]:
         """Adapt window/hop so short signals still yield enough time frames.
 
         A signal shorter than the configured window collapses to one or two
@@ -85,7 +163,7 @@ class FFTFingerprintPipeline:
         if signal_len <= 0 or min_frames <= 1:
             return window, hop
 
-        current_frames = (signal_len - window) / hop + 1 if signal_len > window else 1.0
+        current_frames = self._frames_at(signal_len, window, hop)
         if current_frames >= min_frames:
             return window, hop
 
@@ -111,7 +189,7 @@ class FFTFingerprintPipeline:
         """Apply sliding windows and rFFT to build a time x frequency matrix."""
 
         normalized = self.normalize_signal(signal)
-        window_size, hop_size = self._effective_window_hop(normalized.size)
+        window_size, hop_size = self._effective_window_hop(normalized.size, warn=True)
         frame_count = max(1, int(np.ceil(max(1, normalized.size - window_size) / hop_size)) + 1)
         taper = np.hanning(window_size).astype(np.float32)
         spectra: list[np.ndarray] = []

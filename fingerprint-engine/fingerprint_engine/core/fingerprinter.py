@@ -16,7 +16,7 @@ from pathlib import Path
 
 from fingerprint_engine.handlers.base import FileHandler
 
-from .exceptions import MissingDependencyError, NoHandlerError
+from .exceptions import FileTooLargeError, MissingDependencyError, NoHandlerError
 from .fft_pipeline import FFTFingerprintPipeline
 from .models import Fingerprint, FingerprintConfig, SearchResult
 
@@ -57,6 +57,10 @@ class Fingerprinter(FileProcessor):
         self.handlers = self.discover_handlers(handlers_package)
         if not self.handlers:
             raise RuntimeError("no file handlers discovered")
+        # Handlers are discovered with no constructor args; push config-derived
+        # per-handler settings (e.g. the PDF page cap) onto them now.
+        for handler in self.handlers:
+            handler.configure(self.config)
         self._handler_pipelines = self._build_handler_pipelines()
 
     def discover_handlers(self, package_name: str) -> list[FileHandler]:
@@ -82,9 +86,16 @@ class Fingerprinter(FileProcessor):
 
         A fixed window keeps a content type's fingerprints comparable across
         files of different lengths, so excerpts/truncations of the same content
-        still align. Applied only under the default config; an explicitly
-        customized window_size/hop_size is honored globally instead (so callers
-        retain full control and the unit tests' explicit windows are unchanged).
+        still align. The per-handler pipeline is therefore built with
+        ``fixed_window=True``: the declared window is *authoritative* and is not
+        shrunk as a function of per-file length (which would shift the time grid
+        and silently break cross-length matching); it only adapts as a last
+        resort for inputs too short to yield a usable frame pair, with a warning.
+
+        Applied only under the default config; an explicitly customized
+        window_size/hop_size is honored globally instead (so callers retain full
+        control, the global ``--window-size`` override stays length-adaptive,
+        and the unit tests' explicit windows are unchanged).
         """
 
         defaults = FingerprintConfig()
@@ -101,7 +112,8 @@ class Fingerprinter(FileProcessor):
                 continue
             hop = getattr(handler, "default_signal_hop", None) or max(1, window // 4)
             pipelines[handler.name] = FFTFingerprintPipeline(
-                replace(self.config, window_size=window, hop_size=hop)
+                replace(self.config, window_size=window, hop_size=hop),
+                fixed_window=True,
             )
         return pipelines
 
@@ -113,6 +125,20 @@ class Fingerprinter(FileProcessor):
             raise FileNotFoundError(source)
         if not source.is_file():
             raise IsADirectoryError(source)
+
+        # Bound the OOM vector from untrusted input: stat the file and reject it
+        # BEFORE read_bytes() pulls the whole thing into memory, so a huge file
+        # never gets loaded. 0 = unlimited (opt-out). See SECURITY.md.
+        limit = self.config.max_file_size_bytes
+        if limit > 0:
+            size = source.stat().st_size
+            if size > limit:
+                raise FileTooLargeError(
+                    f"{source}: file size {size} bytes exceeds max_file_size_bytes "
+                    f"limit of {limit} bytes",
+                    size=size,
+                    limit=limit,
+                )
 
         content = source.read_bytes()
         content_sha256 = hashlib.sha256(content).hexdigest()

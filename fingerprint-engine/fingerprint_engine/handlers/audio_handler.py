@@ -26,7 +26,23 @@ class AudioPayload:
 class AudioFileHandler(FileHandler):
     name = "audio"
     priority = 70
-    supported_mime_prefixes = {"audio/"}
+    # Deliberately NARROW to the formats the loaders actually support (WAV via
+    # scipy, MP3 via pydub/ffmpeg). The previous broad ``audio/`` MIME prefix
+    # routed every audio container (.ogg/.flac/.m4a/.aac) here, where load()
+    # then force-decoded them as MP3 and produced garbage or failed; those now
+    # score 0.0 and fall through to text/binary deliberately. Exact MIME types
+    # (not the prefix) keep the WAV/MP3 routing intact.
+    supported_mime_types = {
+        "audio/wav",
+        "audio/x-wav",
+        "audio/wave",
+        "audio/vnd.wave",
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/x-mp3",
+        "audio/mpeg3",
+        "audio/x-mpeg-3",
+    }
     supported_extensions = {".wav", ".wave", ".mp3"}
 
     @classmethod
@@ -131,7 +147,11 @@ class AudioFileHandler(FileHandler):
                 extra="audio",
             ) from exc
 
-        segment = AudioSegment.from_file(path, format="mp3")
+        # No hardcoded ``format=`` so ffmpeg sniffs the real container. The
+        # previous force-decode-as-mp3 turned any non-MP3 input routed here into
+        # garbage; letting ffmpeg detect the format keeps a genuinely-MP3 file
+        # decoding correctly while a mislabeled one fails cleanly instead.
+        segment = AudioSegment.from_file(path)
         samples = np.asarray(segment.get_array_of_samples(), dtype=np.float32)
         channels = int(segment.channels)
         if channels > 1:

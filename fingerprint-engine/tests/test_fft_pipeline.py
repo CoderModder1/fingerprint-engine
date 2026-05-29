@@ -93,3 +93,51 @@ def test_adaptive_window_only_shrinks_short_signals() -> None:
 def test_min_window_size_must_not_exceed_window_size() -> None:
     with pytest.raises(ValueError):
         FingerprintConfig(window_size=32, hop_size=8, min_window_size=64).validate()
+
+
+def test_distinct_nonzero_constants_do_not_collide() -> None:
+    # Defect A regression: a constant (zero-variance) signal is featureless, but
+    # the old `array / max(abs)` branch normalised any nonzero constant to an
+    # all-ones array, so two DIFFERENT constants produced byte-identical spectra
+    # and constellation hashes -- distinct files would mutually false-match.
+    # A zero-variance signal must now produce 0 hashes regardless of its value.
+    pipeline = FFTFingerprintPipeline(FingerprintConfig())  # default window 4096
+
+    _, hashes_five = pipeline.fingerprint_signal(np.full(4096, 5.0, dtype=np.float32))
+    _, hashes_ninetynine = pipeline.fingerprint_signal(np.full(4096, 99.0, dtype=np.float32))
+
+    assert hashes_five == []
+    assert hashes_ninetynine == []
+    # And the normalised constant is genuinely featureless (all zeros), not the
+    # old all-ones array that the two constants used to collapse onto.
+    normalized = pipeline.normalize_signal(np.full(4096, 5.0, dtype=np.float32))
+    assert float(np.max(np.abs(normalized))) == 0.0
+
+
+def test_fixed_window_is_authoritative_across_lengths() -> None:
+    # Defect B regression at the pipeline level: with fixed_window=True the
+    # declared window/hop is authoritative and must NOT shrink with per-file
+    # length, so same-content files of differing length share a time grid.
+    config = FingerprintConfig(window_size=512, hop_size=128)
+    fixed = FFTFingerprintPipeline(config, fixed_window=True)
+    adaptive = FFTFingerprintPipeline(config, fixed_window=False)
+
+    # Two lengths that the ADAPTIVE path would map to different windows (the bug)
+    # but that both clear the fixed window's tiny floor (>= 2 frames at 512/128).
+    assert adaptive._effective_window_hop(2332) != adaptive._effective_window_hop(1136)
+    assert fixed._effective_window_hop(2332) == (512, 128)
+    assert fixed._effective_window_hop(1136) == (512, 128)
+
+
+def test_fixed_window_falls_back_and_warns_for_tiny_signal() -> None:
+    # The fixed window still adapts as a last resort for inputs too short to
+    # yield a usable frame pair, and that rare adaptation is NOT silent.
+    config = FingerprintConfig(window_size=512, hop_size=128)
+    fixed = FFTFingerprintPipeline(config, fixed_window=True)
+
+    # 200 samples -> < 2 frames at 512/128 -> fall back to the adaptive shrink.
+    window, hop = fixed._effective_window_hop(200, warn=False)
+    assert window < 512
+
+    with pytest.warns(RuntimeWarning, match="fixed window"):
+        fixed.spectrogram(np.linspace(0.0, 1.0, 200, dtype=np.float32))

@@ -189,6 +189,48 @@ def test_text_prefix_matches_full_file(tmp_path: Path) -> None:
     assert results[0].aligned_votes > 50  # a coherent match, not a single stray vote
 
 
+def test_text_differing_lengths_share_window_and_match(tmp_path: Path) -> None:
+    # Defect B behavioral regression. Two copies of the SAME content at DIFFERENT
+    # lengths -- both comfortably above the fixed window's tiny floor (>= 2 frames
+    # at 512/128, i.e. >= 640 chars) -- must:
+    #   (a) use the SAME effective window (the fixed 512 the text handler declares)
+    #   (b) so the shorter file's hashes strongly overlap the longer's -> they MATCH.
+    #
+    # This FAILS on the length-adaptive code: the longer file (~2.3k chars) maps to
+    # window 256 and the shorter (~1.1k chars) to window 128, two different time
+    # grids whose hashes never align (zero overlap, no match).
+    lines = [f"value_{i} = compute({i}, {i * 3}) + offset_{i}\n" for i in range(60)]
+    long_path = tmp_path / "long.txt"
+    long_path.write_text("".join(lines), encoding="utf-8")  # ~2.3k chars
+    short_path = tmp_path / "short.txt"
+    short_path.write_text("".join(lines[:30]), encoding="utf-8")  # ~1.1k chars, different length
+
+    fp = Fingerprinter(FingerprintConfig())  # default config -> text handler window 512/hop 128
+    assert fp._handler_pipelines["text"].config.window_size == 512
+
+    long_fp = fp.fingerprint_file(long_path)
+    short_fp = fp.fingerprint_file(short_path)
+
+    # (a) same effective window despite the different lengths.
+    assert long_fp.handler == short_fp.handler == "text"
+    assert long_fp.metadata["effective_window_size"] == short_fp.metadata["effective_window_size"]
+    assert short_fp.hash_count > 0
+
+    # (b) the shorter file's hash codes are (almost) a subset of the longer's.
+    long_codes = {item.hash_code for item in long_fp.hashes}
+    short_codes = {item.hash_code for item in short_fp.hashes}
+    overlap = long_codes & short_codes
+    assert len(overlap) / len(short_codes) > 0.5
+
+    # ... and that overlap is enough for a coherent index match, not a stray vote.
+    index = InMemoryHashIndex()
+    index.add(long_fp)
+    results = index.search(short_fp, top_k=1)
+    assert results, "shorter same-content file should match the longer one"
+    assert Path(results[0].metadata["path"]).name == "long.txt"
+    assert results[0].aligned_votes > 50
+
+
 def test_resized_image_matches_original(tmp_path: Path) -> None:
     # Scale-invariance regression: the same picture at a different resolution
     # must still match, thanks to canonical-size normalisation in the handler.

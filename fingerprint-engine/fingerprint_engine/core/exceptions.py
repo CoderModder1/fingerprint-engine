@@ -11,6 +11,21 @@ class NoHandlerError(FingerprintError):
     """No handler was able to fingerprint the file."""
 
 
+class FileTooLargeError(FingerprintError):
+    """An input file exceeds the configured ``max_file_size_bytes`` limit.
+
+    Raised by :meth:`Fingerprinter.fingerprint_file` *before* the whole file is
+    read into memory, so an oversized (potentially malicious) input never gets
+    loaded. Carries the offending ``size`` and the configured ``limit`` (both in
+    bytes) for clear diagnostics.
+    """
+
+    def __init__(self, message: str, *, size: int, limit: int) -> None:
+        super().__init__(message)
+        self.size = size
+        self.limit = limit
+
+
 class InvalidSnapshotError(FingerprintError, ValueError):
     """A persisted index snapshot is structurally invalid or unsupported.
 

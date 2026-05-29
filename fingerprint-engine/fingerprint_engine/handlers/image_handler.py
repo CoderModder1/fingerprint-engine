@@ -34,6 +34,14 @@ class ImageFileHandler(FileHandler):
     # otherwise destroyed by any resize.
     canonical_size = (256, 256)
     supported_mime_prefixes = {"image/"}
+    # Text/vector "image/*" types that the raster decoder (PIL grayscale resize)
+    # cannot meaningfully handle. They share the ``image/`` MIME prefix but are
+    # really XML/text, so they must NOT route here; excluding them lets them
+    # fall through to the text/binary handlers instead of failing in load().
+    excluded_mime_types = {
+        "image/svg+xml",
+        "image/svg",
+    }
     supported_extensions = {
         ".png",
         ".jpg",
@@ -52,6 +60,8 @@ class ImageFileHandler(FileHandler):
         mime_type: str | None = None,
         sample: bytes | None = None,
     ) -> float:
+        if mime_type and mime_type in cls.excluded_mime_types:
+            return 0.0
         base_score = super().can_handle(path, mime_type, sample)
         if base_score:
             return base_score + 0.10

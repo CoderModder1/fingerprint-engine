@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from fingerprint_engine.core.fft_pipeline import FFTFingerprintPipeline
-from fingerprint_engine.core.models import ConstellationHash, LandmarkPoint
+from fingerprint_engine.core.models import ConstellationHash, FingerprintConfig, LandmarkPoint
 
 
 class FileHandler(ABC):
@@ -36,16 +36,24 @@ class FileHandler(ABC):
         mime_type: str | None = None,
         sample: bytes | None = None,
     ) -> float:
-        """Return a confidence score between 0 and 1."""
+        """Return a confidence score between 0 and 1.
+
+        Every candidate signal (extension, exact MIME, MIME prefix) is scored
+        and the *strongest* one wins. Returning the first match in priority
+        order would let a weak signal (e.g. an extension match, 0.75) mask a
+        stronger one (an exact MIME match, 0.80) on the same file, so the MAX
+        is taken instead. 0.0 means no evidence at all.
+        """
 
         suffix = Path(path).suffix.lower()
+        score = 0.0
         if suffix in cls.supported_extensions:
-            return 0.75
+            score = max(score, 0.75)
         if mime_type and mime_type in cls.supported_mime_types:
-            return 0.80
+            score = max(score, 0.80)
         if mime_type and any(mime_type.startswith(prefix) for prefix in cls.supported_mime_prefixes):
-            return 0.70
-        return 0.0
+            score = max(score, 0.70)
+        return score
 
     @abstractmethod
     def load(self, path: str | Path) -> Any:
@@ -68,6 +76,16 @@ class FileHandler(ABC):
         """Return optional metadata for the fingerprint and index."""
 
         return {}
+
+    def configure(self, config: FingerprintConfig) -> None:  # noqa: B027 - intentional optional no-op hook
+        """Apply config-derived per-handler settings. Default is a no-op.
+
+        :class:`Fingerprinter` calls this once on each discovered handler so a
+        handler can pull limits/tuning from the active config -- handlers are
+        discovered and instantiated with no constructor arguments, so this is
+        how a config value (e.g. the PDF page cap) reaches them. Override to
+        read what the handler needs.
+        """
 
     @staticmethod
     def sniff_mime(path: str | Path) -> str | None:

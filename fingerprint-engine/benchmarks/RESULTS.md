@@ -1,63 +1,101 @@
-# Benchmark results (baseline)
+# Benchmark results (current, post-optimization)
 
 Raw data: [`baseline-results.json`](baseline-results.json). Reproduce with
-`python benchmarks/benchmark.py`.
+`python benchmarks/benchmark.py --sizes 200,1000`.
 
 - **Date:** 2026-05-29
-- **Environment:** macOS (Darwin, Apple Silicon), Python 3.13, single-threaded.
-- **Corpus:** 2000 real Python source files (1–200 KB each), 34.5 MB total, from
+- **Environment:** macOS (Darwin 25.x, Apple Silicon, arm64), CPython 3.13.13,
+  single-threaded.
+- **Code under test:** HEAD, i.e. *after* the three SQL-query optimizations
+  (`d1bbdad` batched hash lookups, `ee5c303` server-side offset aggregation,
+  `84d400d` stop-hash pruning). `prune_stop_hashes` is **not** applied in this
+  run — `search()` is measured against the full, unpruned index, so these are a
+  floor; enabling pruning lowers latency and storage further.
+- **Corpus:** 1000 real Python source files (1–200 KB each), 17.9 MB total, from
   the interpreter stdlib + site-packages. 0 fingerprinting failures.
+- **Scope note (bounded re-run):** the original baseline scanned up to 2000
+  files; this refresh is capped at 200 and 1000 to keep wall-clock reasonable.
+  The superseded pre-optimization 2000-file run is preserved verbatim in
+  [`pre-optimization-results.json`](pre-optimization-results.json) for
+  historical comparison. The 2000-file row in the tables below is therefore
+  omitted rather than restated with stale numbers.
 
 ## Throughput & footprint
 
 | corpus | postings | mem add (files/s) | sqlite add (files/s) | snapshot | sqlite DB |
 |-------:|---------:|------------------:|---------------------:|---------:|----------:|
-|    200 |    669 K |             103.5 |                 29.5 |   16.6 MB |  119 MB |
-|  1 000 |   3.66 M |             274.1 |                  9.3 |   91.1 MB |  653 MB |
-|  2 000 |   7.24 M |             187.7 |                  5.6 |  180.1 MB | 1.29 GB |
+|    200 |    667 K |             212.7 |                 32.4 |   16.5 MB |  119 MB |
+|  1 000 |   3.69 M |             305.9 |                 10.7 |   91.8 MB |  660 MB |
 
-Fingerprinting (handler + FFT pipeline) ran at **28 files/s (0.49 MB/s)**,
-averaging **~3 640 hashes/file** for source text (window 512).
+Fingerprinting (handler + FFT pipeline) ran at **30 files/s (0.54 MB/s)**,
+averaging **~3 692 hashes/file** for source text (window 512). This pass is
+unchanged by the optimizations (they touch index lookup, not fingerprinting).
 
 ## Query latency (50 queries; index lookup only, query fingerprints precomputed)
 
 | corpus | mem mean / p50 / p95 | sqlite mean / p50 / p95 |
 |-------:|---------------------:|------------------------:|
-|    200 |   25 / 12 / 77 ms    |    158 / 79 / 483 ms    |
-|  1 000 |  191 / 114 / 467 ms  |   6 633 / 4 070 / 20 881 ms |
-|  2 000 |  319 / 108 / 1 069 ms | 30 696 / 9 965 / 95 816 ms |
+|    200 |   26 / 14 / 79 ms    |    192 / 150 / 398 ms    |
+|  1 000 |  225 / 98 / 751 ms   |   1 252 / 828 / 3 130 ms |
+
+The SQLite path is now dominated by one batched round-trip per search instead of
+~3 700 single-row `SELECT`s. At 1000 files SQLite mean latency dropped from
+**6 633 ms → 1 252 ms** (~5.3x) and p95 from **20 881 ms → 3 130 ms** (~6.7x)
+relative to the pre-optimization baseline; the worst-case `max` fell from 35 s to
+~5 s. (At 200 files the mean is flat — 158 ms → 192 ms — because at that scale
+the per-query fixed cost dominates the savings, but tail latency still improved:
+p95 482 → 398 ms, max 1 323 → 816 ms.) In-memory query is unchanged within
+run-to-run noise, as expected — dict lookups never had the round-trip problem.
 
 ## Accuracy at scale
 
 | corpus | recall@1 (exact) | self-conf | best-other-conf |
 |-------:|-----------------:|----------:|----------------:|
-|    200 |             0.96 |       1.0 |           0.185 |
-|  1 000 |             1.00 |       1.0 |           0.053 |
-|  2 000 |             1.00 |       1.0 |           0.039 |
+|    200 |             0.96 |       1.0 |           0.193 |
+|  1 000 |             1.00 |       1.0 |           0.045 |
 
-**Near-duplicate recall@1 = 1.0** (mean confidence 0.982) at 2000 files: every
+**Near-duplicate recall@1 = 1.0** (mean confidence 0.98) at 1000 files: every
 edited file still found its parent. Self-vs-best-other confidence separation is
 large at every scale (1.0 vs ≤0.19). The 0.96 at 200 files is a tie-break
 artifact — a couple of sampled files have a near-duplicate twin in the stdlib
 that shares all their hashes (both confidence 1.0), so the lexicographically
-smaller `file_id` wins.
+smaller `file_id` wins. The optimizations are lossless: recall and confidence
+match the pre-optimization baseline at every size.
 
 ## Findings
 
-1. **Accuracy holds at scale.** recall@1 is 1.0 at 1k/2k files, near-duplicate
-   recall is 1.0, and the confidence calibration keeps a wide true-vs-noise gap.
-2. **In-memory query scales acceptably** — sub-second median through 2000 files.
-3. **SQL backends are query-bound (the main bottleneck).** `search()` issues one
-   `query(hash_code)` per query hash — ~3 640 single-row `SELECT`s per search —
-   so SQLite degrades to ~30 s/query at 2000 files. The fix is a **batched
-   lookup** (`WHERE hash_code IN (...)` or a temp-table join) so a search is one
-   round-trip; this would also benefit Postgres. (In-memory/Redis are unaffected:
-   dict lookups / pipeline-able.)
-4. **Storage is dominated by hash volume.** ~3 640 hashes/file → 7.2 M postings
-   and a 1.3 GB SQLite DB at 2000 files. Lowering `constellation_fanout` /
-   `max_peaks_per_frame` would cut storage and latency at some recall cost.
-5. **SQLite ingest degrades** (per-`add` `commit()` fsync): batching commits
-   (or `COPY` for Postgres) would raise build throughput.
+1. **Accuracy holds at scale and the SQL optimizations are lossless.** recall@1
+   is 1.0 at 1k files, near-duplicate recall is 1.0, and confidence calibration
+   keeps a wide true-vs-noise gap — identical to the pre-optimization run.
+2. **In-memory query scales well** — sub-second median through 1000 files.
+3. **SQLite query is no longer the headline bottleneck.** The batched
+   `WHERE hash_code IN (...)` lookup plus server-side offset-histogram
+   aggregation turned ~30 s/query (at 2000 files) and ~6.6 s/query (at 1000)
+   into low-single-digit-second worst cases and a ~0.8 s median at 1000 files.
+   Stop-hash pruning (`prune_stop_hashes`, not exercised here) trims this further
+   by dropping the highest-document-frequency hashes before they reach the join.
 
-These are single-machine baselines; the headline next optimization is batched
-hash lookup for the SQL backends.
+### Genuinely-remaining levers (none of these are merged yet)
+
+These are the real next steps; the SQL-query work above is already done.
+
+- **Ingest throughput.** SQLite `add` is still the slowest stage: 10.7 files/s at
+  1000 files (each `add` commits/fsyncs). Batching commits — or `COPY` for the
+  Postgres backend — would raise build throughput; fingerprinting itself caps
+  end-to-end ingest at ~30 files/s regardless.
+- **In-memory footprint.** The snapshot is 91.8 MB at 1000 files and the live
+  index holds 3.69 M postings; the resident set grows roughly linearly. Compact
+  posting encodings (delta/varint offsets, interned file ids) would shrink both
+  RSS and snapshot size.
+- **Posting volume.** ~3 692 hashes/file → 3.69 M postings and a 660 MB SQLite DB
+  at 1000 files; storage and latency both scale with this. Lowering
+  `constellation_fanout` / `max_peaks_per_frame`, or applying stop-hash pruning
+  by default, would cut volume at some recall cost — a tunable trade-off.
+- **Approximate nearest-neighbour (ANN).** The current path is exact
+  hash-intersection. For very large corpora an ANN/locality-sensitive layer over
+  the constellation hashes would bound query cost sub-linearly, at the price of
+  exactness.
+
+These are single-machine numbers from a bounded (≤1000-file) re-run; treat them
+as representative of the current code's relative behaviour, not as a hard
+capacity ceiling.

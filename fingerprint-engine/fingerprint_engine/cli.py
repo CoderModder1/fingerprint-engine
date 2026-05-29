@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fingerprint_engine.core.exceptions import (
+    FileTooLargeError,
     FingerprintError,
     MissingDependencyError,
     NoHandlerError,
@@ -39,6 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hash-bits", type=int, default=FingerprintConfig.hash_bits)
     parser.add_argument("--min-time-frames", type=int, default=FingerprintConfig.min_time_frames)
     parser.add_argument("--min-window-size", type=int, default=FingerprintConfig.min_window_size)
+    parser.add_argument("--max-file-size", type=int, default=FingerprintConfig.max_file_size_bytes,
+                        help="reject input files larger than this many bytes before reading them "
+                             "(0 = unlimited); bounds the OOM vector from untrusted input")
+    parser.add_argument("--max-pdf-pages", type=int, default=FingerprintConfig.max_pdf_pages,
+                        help="cap PDF pages decoded per file (0 = unlimited)")
     parser.add_argument("--backend", choices=("memory", "redis", "sqlite", "postgres"),
                         default="memory", help="index backend (default: memory)")
     parser.add_argument("--redis-url", default="redis://localhost:6379/0",
@@ -86,6 +92,8 @@ def config_from_args(args: argparse.Namespace) -> FingerprintConfig:
         hash_bits=args.hash_bits,
         min_time_frames=args.min_time_frames,
         min_window_size=args.min_window_size,
+        max_file_size_bytes=args.max_file_size,
+        max_pdf_pages=args.max_pdf_pages,
     )
 
 
@@ -223,7 +231,8 @@ def main(argv: list[str] | None = None) -> int:
     * ``4``  -- backend/connection errors (Redis/Postgres connect, missing index,
       or other operational ``RuntimeError``/``OSError`` from the index layer).
     * ``1``  -- input errors on the query/fingerprint path (no handler, missing
-      file, or a directory passed where a file was expected).
+      file, a directory passed where a file was expected, or an input exceeding
+      the configured ``--max-file-size``).
     * ``0``  -- success.
 
     ``SystemExit``/``KeyboardInterrupt`` are never caught here.
@@ -236,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
     except MissingDependencyError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 3
-    except (NoHandlerError, FileNotFoundError, IsADirectoryError) as exc:
+    except (NoHandlerError, FileTooLargeError, FileNotFoundError, IsADirectoryError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except FingerprintError as exc:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from fingerprint_engine.core.exceptions import MissingDependencyError
+from fingerprint_engine.core.models import FingerprintConfig
 
 from .base import FileHandler
 from .text_handler import TextFileHandler
@@ -31,6 +33,17 @@ class PDFFileHandler(FileHandler):
     default_signal_hop = 128
     supported_mime_types = {"application/pdf"}
     supported_extensions = {".pdf"}
+
+    def __init__(self, max_pdf_pages: int | None = None) -> None:
+        # Page cap for untrusted PDFs (see SECURITY.md / FingerprintConfig).
+        # ``None`` falls back to the config default (0 = unlimited), so the
+        # no-arg construction the Fingerprinter uses keeps current behavior
+        # while a caller (or a future config wiring) can bound page extraction.
+        if max_pdf_pages is None:
+            max_pdf_pages = FingerprintConfig().max_pdf_pages
+        if max_pdf_pages < 0:
+            raise ValueError("max_pdf_pages must be non-negative (0 = unlimited)")
+        self.max_pdf_pages = max_pdf_pages
 
     @classmethod
     def can_handle(
@@ -66,17 +79,41 @@ class PDFFileHandler(FileHandler):
         try:
             reader = PdfReader(BytesIO(data))
             chunks: list[str] = []
+            extracted_pages = 0
             for page_index, page in enumerate(reader.pages):
+                # Bound work/memory on untrusted PDFs: when max_pdf_pages > 0,
+                # stop after that many pages (0 = unlimited). Capping keeps a
+                # multi-thousand-page document from blowing up extraction.
+                if self.max_pdf_pages and extracted_pages >= self.max_pdf_pages:
+                    break
                 chunks.append(f"\n[[PAGE:{page_index + 1}]]\n")
                 chunks.append(page.extract_text() or "")
+                extracted_pages += 1
             return PDFPayload(
                 text="".join(chunks),
-                page_count=len(reader.pages),
+                page_count=extracted_pages,
                 parser="pypdf",
             )
         except Exception:
+            # Genuine pypdf parse failure (corrupt/encrypted): degrade to the
+            # latin1 byte fallback rather than raise. Warn loudly that this is a
+            # STRUCTURAL-ONLY fingerprint of the raw bytes -- not real text
+            # extraction -- so it is not silently mistaken for parsed content.
+            warnings.warn(
+                f"{Path(path).name}: pypdf could not parse this PDF; falling back "
+                "to a structural-only fingerprint of the raw bytes (no text was "
+                "extracted), which is not comparable to a text-extracted one.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             text = data.decode("latin-1", errors="ignore")
             return PDFPayload(text=text, page_count=0, parser="latin1_fallback")
+
+    def configure(self, config: FingerprintConfig) -> None:
+        # Honor the configured page cap (0 = unlimited) so the page limit set
+        # via FingerprintConfig / --max-pdf-pages reaches the handler that the
+        # Fingerprinter discovers and instantiates with no arguments.
+        self.max_pdf_pages = config.max_pdf_pages
 
     def to_signal(self, payload: PDFPayload) -> np.ndarray:
         return TextFileHandler().to_signal(payload.text)

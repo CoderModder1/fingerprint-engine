@@ -22,6 +22,13 @@ class FingerprintConfig:
     max_signal_samples: int = 2_000_000
     min_time_frames: int = 16
     min_window_size: int = 16
+    # Resource limits for untrusted input (see SECURITY.md). A finite default
+    # for max_file_size_bytes bounds the OOM vector from a hostile/huge file
+    # while sitting far above any normal source/image/pdf/audio input. Use 0 to
+    # opt out (unlimited). max_pdf_pages bounds how many PDF pages a handler will
+    # decode; 0 means unlimited (enforcement lives in the PDF handler).
+    max_file_size_bytes: int = 256 * 1024 * 1024  # 256 MiB; 0 = unlimited
+    max_pdf_pages: int = 0  # 0 = unlimited
 
     def validate(self) -> None:
         if self.window_size < 8:
@@ -50,6 +57,10 @@ class FingerprintConfig:
             raise ValueError("peak_percentile must be between 0.0 and 100.0")
         if self.peak_threshold < 0.0:
             raise ValueError("peak_threshold must be non-negative")
+        if self.max_file_size_bytes < 0:
+            raise ValueError("max_file_size_bytes must be non-negative (0 = unlimited)")
+        if self.max_pdf_pages < 0:
+            raise ValueError("max_pdf_pages must be non-negative (0 = unlimited)")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
