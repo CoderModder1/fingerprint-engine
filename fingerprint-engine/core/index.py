@@ -546,3 +546,168 @@ class SQLiteHashIndex(HashIndex):
 
     def close(self) -> None:
         self._conn.close()
+
+
+class PostgresHashIndex(HashIndex):
+    """PostgreSQL-backed hash index for a shared, durable, server-grade store.
+
+    Implements the same :class:`HashIndex` contract and inherits the shared
+    ``search``/``save``/``load_snapshot``. Postings live in a table indexed on
+    ``hash_code`` (fast ``query``) and ``file_id`` (fast ``remove``); metadata is
+    stored as ``JSONB``. Pass a ``dsn`` (libpq connection string) or inject a
+    ``psycopg`` connection. ``psycopg`` is imported lazily, so importing this
+    module never requires it.
+
+    Like SQLite, PostgreSQL ``BIGINT`` is signed 64-bit, so unsigned 64-bit hash
+    codes are stored with the same reversible signed offset.
+    """
+
+    _SIGNED_OFFSET = 1 << 63
+
+    def __init__(
+        self,
+        dsn: str = "postgresql://localhost/fingerprint",
+        connection=None,
+        table_prefix: str = "fp",
+    ) -> None:
+        if not table_prefix.isidentifier():
+            raise ValueError("table_prefix must be a valid SQL identifier")
+        self._files_table = f"{table_prefix}_files"
+        self._postings_table = f"{table_prefix}_postings"
+        if connection is not None:
+            self._conn = connection
+        else:
+            try:
+                import psycopg
+            except ImportError as exc:  # pragma: no cover - exercised only without psycopg
+                raise RuntimeError(
+                    "psycopg is required for PostgresHashIndex; install it with "
+                    "'pip install \"psycopg[binary]\"'"
+                ) from exc
+            self._conn = psycopg.connect(dsn)
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS {self._files_table} ("
+                "file_id TEXT PRIMARY KEY, metadata JSONB NOT NULL)"
+            )
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS {self._postings_table} ("
+                "file_id TEXT NOT NULL, hash_code BIGINT NOT NULL, time_offset INTEGER NOT NULL)"
+            )
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS {self._postings_table}_hash_idx "
+                f"ON {self._postings_table}(hash_code)"
+            )
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS {self._postings_table}_file_idx "
+                f"ON {self._postings_table}(file_id)"
+            )
+        self._conn.commit()
+
+    @classmethod
+    def _encode(cls, hash_code: int) -> int:
+        return int(hash_code) - cls._SIGNED_OFFSET
+
+    @classmethod
+    def _decode(cls, stored: int) -> int:
+        return int(stored) + cls._SIGNED_OFFSET
+
+    @property
+    def file_count(self) -> int:
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {self._files_table}")
+            return int(cur.fetchone()[0])
+
+    @property
+    def posting_count(self) -> int:
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {self._postings_table}")
+            return int(cur.fetchone()[0])
+
+    def add(self, fingerprint: Fingerprint) -> None:
+        self.remove(fingerprint.file_id)
+        metadata = {
+            "file_id": fingerprint.file_id,
+            "path": fingerprint.path,
+            "handler": fingerprint.handler,
+            "size_bytes": fingerprint.size_bytes,
+            "content_sha256": fingerprint.content_sha256,
+            "hash_count": fingerprint.hash_count,
+            "landmark_count": fingerprint.landmark_count,
+            **fingerprint.metadata,
+        }
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {self._files_table} (file_id, metadata) VALUES (%s, %s::jsonb)",
+                (fingerprint.file_id, json.dumps(metadata, sort_keys=True)),
+            )
+            cur.executemany(
+                f"INSERT INTO {self._postings_table} (file_id, hash_code, time_offset) "
+                "VALUES (%s, %s, %s)",
+                [
+                    (fingerprint.file_id, self._encode(item.hash_code), int(item.time_offset))
+                    for item in fingerprint.hashes
+                ],
+            )
+        self._conn.commit()
+
+    def remove(self, file_id: str) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(f"DELETE FROM {self._postings_table} WHERE file_id = %s", (file_id,))
+            cur.execute(f"DELETE FROM {self._files_table} WHERE file_id = %s", (file_id,))
+        self._conn.commit()
+
+    def query(self, hash_code: int) -> list[IndexPosting]:
+        code = int(hash_code)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT file_id, time_offset FROM {self._postings_table} WHERE hash_code = %s",
+                (self._encode(code),),
+            )
+            rows = cur.fetchall()
+        return [
+            IndexPosting(file_id=row[0], hash_code=code, time_offset=int(row[1]))
+            for row in rows
+        ]
+
+    def _metadata_for(self, file_id: str) -> dict:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT metadata FROM {self._files_table} WHERE file_id = %s", (file_id,)
+            )
+            row = cur.fetchone()
+        if not row:
+            return {}
+        data = row[0]
+        if isinstance(data, str):  # some drivers return JSONB as text
+            try:
+                data = json.loads(data)
+            except (ValueError, TypeError):
+                return {}
+        return data if isinstance(data, dict) else {}
+
+    def to_dict(self) -> dict[str, object]:
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT file_id FROM {self._files_table}")
+            file_ids = [row[0] for row in cur.fetchall()]
+        files: dict[str, list[list[int]]] = {}
+        metadata: dict[str, dict] = {}
+        for file_id in file_ids:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT hash_code, time_offset FROM {self._postings_table} "
+                    "WHERE file_id = %s ORDER BY hash_code, time_offset",
+                    (file_id,),
+                )
+                files[file_id] = [
+                    [self._decode(hash_code), int(time_offset)]
+                    for hash_code, time_offset in cur.fetchall()
+                ]
+            metadata[file_id] = self._metadata_for(file_id)
+        return {"backend": "postgres", "files": files, "metadata": metadata}
+
+    def close(self) -> None:
+        self._conn.close()

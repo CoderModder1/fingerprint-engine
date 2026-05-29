@@ -198,7 +198,7 @@ The orchestrator imports handler modules dynamically and ranks them by `can_hand
 
 ### Index Backends
 
-The engine ships three backends. All implement the storage-agnostic `HashIndex`
+The engine ships four backends. All implement the storage-agnostic `HashIndex`
 contract and **share the same `search()`, `save()`, and `load_snapshot()`** (the
 time-coherent offset-histogram scoring lives in the base class), so they rank
 identically and scores stay comparable:
@@ -209,23 +209,32 @@ identically and scores stay comparable:
 - **`RedisHashIndex`** — postings live in Redis, persistent and shareable across
   processes (horizontal scale). Requires `redis` (and a running server); tests
   use `fakeredis`, no server needed.
+- **`PostgresHashIndex`** — server-grade shared/durable store; postings in an
+  indexed table, metadata as `JSONB`. Requires `psycopg` and a running server;
+  integration tests run when `FINGERPRINT_TEST_PG_DSN` is set.
 
 ```bash
 # CLI: pick a backend with --backend (default: memory)
-python cli.py --backend sqlite --sqlite-path index.sqlite3 add path/to/file
-python cli.py --backend sqlite --sqlite-path index.sqlite3 search path/to/query
-python cli.py --backend redis  --redis-url redis://localhost:6379/0 add path/to/file
+python cli.py --backend sqlite   --sqlite-path index.sqlite3 add path/to/file
+python cli.py --backend redis    --redis-url redis://localhost:6379/0 add path/to/file
+python cli.py --backend postgres --postgres-dsn postgresql://localhost/fingerprint add path/to/file
+python cli.py --backend postgres --postgres-dsn postgresql://localhost/fingerprint search path/to/query
 ```
 
 ```python
-from core.index import SQLiteHashIndex, RedisHashIndex
+from core.index import SQLiteHashIndex, RedisHashIndex, PostgresHashIndex
 index = SQLiteHashIndex("index.sqlite3")            # or ":memory:"; or inject a sqlite3.Connection
-# index = RedisHashIndex(url="redis://localhost:6379/0")  # or inject a client (e.g. fakeredis)
+# index = RedisHashIndex(url="redis://localhost:6379/0")      # or inject a client (e.g. fakeredis)
+# index = PostgresHashIndex(dsn="postgresql://localhost/fingerprint")  # or inject a psycopg connection
 index.add(fingerprint)
 results = index.search(query_fingerprint)
 index.save("snapshot.json")                          # portable export (interops across backends)
 SQLiteHashIndex(":memory:").load_snapshot("snapshot.json")  # bulk-load any snapshot
 ```
+
+> Note: both SQLite and PostgreSQL store hash codes as *signed* 64-bit integers,
+> so the unsigned 64-bit codes are mapped reversibly into signed range
+> (`code - 2**63`) to avoid overflow.
 
 To add your own backend, subclass `HashIndex` and implement `add(fingerprint)`,
 `remove(file_id)`, `query(hash_code)`, `_metadata_for(file_id)`, and `to_dict()`.

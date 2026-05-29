@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from core.fingerprinter import Fingerprinter
-from core.index import HashIndex, InMemoryHashIndex, RedisHashIndex, SQLiteHashIndex
+from core.index import (
+    HashIndex,
+    InMemoryHashIndex,
+    PostgresHashIndex,
+    RedisHashIndex,
+    SQLiteHashIndex,
+)
 from core.models import Calibration, Fingerprint, FingerprintConfig
 
 
@@ -26,14 +32,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hash-bits", type=int, default=FingerprintConfig.hash_bits)
     parser.add_argument("--min-time-frames", type=int, default=FingerprintConfig.min_time_frames)
     parser.add_argument("--min-window-size", type=int, default=FingerprintConfig.min_window_size)
-    parser.add_argument("--backend", choices=("memory", "redis", "sqlite"), default="memory",
-                        help="index backend (default: memory)")
+    parser.add_argument("--backend", choices=("memory", "redis", "sqlite", "postgres"),
+                        default="memory", help="index backend (default: memory)")
     parser.add_argument("--redis-url", default="redis://localhost:6379/0",
                         help="Redis connection URL (used when --backend redis)")
     parser.add_argument("--redis-prefix", default="fpidx",
                         help="Redis key namespace (used when --backend redis)")
     parser.add_argument("--sqlite-path", default=".fingerprint_index.sqlite3",
                         help="SQLite database path (used when --backend sqlite)")
+    parser.add_argument("--postgres-dsn", default="postgresql://localhost/fingerprint",
+                        help="PostgreSQL connection string (used when --backend postgres)")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -77,6 +85,8 @@ def open_index(args: argparse.Namespace) -> HashIndex:
         return RedisHashIndex(url=args.redis_url, key_prefix=args.redis_prefix)
     if backend == "sqlite":
         return SQLiteHashIndex(database=args.sqlite_path)
+    if backend == "postgres":
+        return PostgresHashIndex(dsn=args.postgres_dsn)
     return InMemoryHashIndex.load(Path(args.index_path))
 
 
@@ -87,6 +97,8 @@ def index_location(args: argparse.Namespace) -> str:
         return args.redis_url
     if args.backend == "sqlite":
         return args.sqlite_path
+    if args.backend == "postgres":
+        return args.postgres_dsn
     return str(Path(args.index_path))
 
 

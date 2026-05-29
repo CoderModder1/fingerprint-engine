@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -8,13 +9,38 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.index import InMemoryHashIndex, RedisHashIndex, SQLiteHashIndex
+from core.index import (
+    InMemoryHashIndex,
+    PostgresHashIndex,
+    RedisHashIndex,
+    SQLiteHashIndex,
+)
 from core.models import Calibration, ConstellationHash, Fingerprint
 
 
 def _fake_redis():
     fakeredis = pytest.importorskip("fakeredis")
     return fakeredis.FakeStrictRedis(decode_responses=True)
+
+
+# Postgres integration tests need a live server; set FINGERPRINT_TEST_PG_DSN to run them.
+PG_DSN = os.environ.get("FINGERPRINT_TEST_PG_DSN")
+requires_pg = pytest.mark.skipif(not PG_DSN, reason="set FINGERPRINT_TEST_PG_DSN to run Postgres tests")
+
+
+@pytest.fixture
+def pg_index():
+    index = PostgresHashIndex(dsn=PG_DSN, table_prefix="fp_pytest")
+    with index._conn.cursor() as cur:  # start from a clean slate
+        cur.execute(f"TRUNCATE {index._files_table}, {index._postings_table}")
+    index._conn.commit()
+    try:
+        yield index
+    finally:
+        with index._conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS {index._postings_table}, {index._files_table}")
+        index._conn.commit()
+        index.close()
 
 
 def make_fingerprint(file_id: str, offsets: list[int]) -> Fingerprint:
@@ -250,6 +276,82 @@ def test_sqlite_handles_full_64bit_hash_codes() -> None:
     assert postings and postings[0].hash_code == big
     assert index.search(fingerprint)[0].file_id == "big"
     assert index.to_dict()["files"]["big"][0][0] == big  # snapshot keeps the value
+
+
+def test_postgres_signed_offset_roundtrip_is_overflow_safe() -> None:
+    # Serverless: PostgreSQL BIGINT is signed 64-bit, so unsigned 64-bit hash
+    # codes must map reversibly into signed range (same lesson as SQLite).
+    extremes = [0, 1, 1 << 62, (1 << 63) - 1, 1 << 63, (1 << 64) - 1]
+    for code in extremes:
+        assert PostgresHashIndex._decode(PostgresHashIndex._encode(code)) == code
+        assert -(1 << 63) <= PostgresHashIndex._encode(code) < (1 << 63)  # fits BIGINT
+
+
+@requires_pg
+def test_postgres_backend_search_matches_in_memory(pg_index) -> None:
+    mem_index = InMemoryHashIndex()
+    for file_id, offsets in [("aligned", [10, 20, 30, 40]), ("scattered", [2, 40, 99, 125])]:
+        fingerprint = make_fingerprint(file_id, offsets)
+        pg_index.add(fingerprint)
+        mem_index.add(fingerprint)
+    query = make_fingerprint("query", [3, 13, 23, 33])
+
+    pg_results = pg_index.search(query, top_k=2)
+    mem_results = mem_index.search(query, top_k=2)
+
+    assert [r.file_id for r in pg_results] == [r.file_id for r in mem_results]
+    assert pg_results[0].file_id == "aligned"
+    assert pg_results[0].aligned_votes == 4
+    assert pg_results[0].offset == 7
+    assert pg_results[0].score == mem_results[0].score
+    assert pg_index.file_count == 2
+    assert pg_index.posting_count == 8
+
+
+@requires_pg
+def test_postgres_backend_remove_and_replace(pg_index) -> None:
+    pg_index.add(make_fingerprint("a", [1, 2, 3]))
+    pg_index.add(make_fingerprint("b", [1, 2]))
+    assert pg_index.file_count == 2
+    assert pg_index.posting_count == 5
+
+    pg_index.add(make_fingerprint("a", [9]))  # replace, no double counting
+    assert pg_index.file_count == 2
+    assert pg_index.posting_count == 3
+
+    pg_index.remove("b")
+    assert pg_index.file_count == 1
+    assert pg_index.posting_count == 1
+    assert all(posting.file_id != "b" for posting in pg_index.query(1000))
+
+
+@requires_pg
+def test_postgres_handles_full_64bit_hash_codes(pg_index) -> None:
+    big = (1 << 64) - 1
+    fingerprint = Fingerprint(
+        file_id="big", path="/tmp/big", handler="test", size_bytes=1,
+        content_sha256="big", config={},
+        hashes=[ConstellationHash(hash_code=big, time_offset=4, anchor_time=4,
+                                  target_time=5, freq1=1, freq2=2, delta_t=1)],
+        metadata={},
+    )
+    pg_index.add(fingerprint)
+    assert pg_index.query(big)[0].hash_code == big
+    assert pg_index.search(fingerprint)[0].file_id == "big"
+    assert pg_index.to_dict()["files"]["big"][0][0] == big
+
+
+@requires_pg
+def test_postgres_snapshot_interops_with_in_memory(pg_index, tmp_path: Path) -> None:
+    snapshot = tmp_path / "snap.json"
+    fingerprint = make_fingerprint("file-a", [1, 2, 3])
+    pg_index.add(fingerprint)
+    pg_index.save(snapshot)
+
+    loaded = InMemoryHashIndex.load(snapshot)
+    assert loaded.file_count == 1
+    assert loaded.posting_count == 3
+    assert loaded.search(fingerprint)[0].file_id == "file-a"
 
 
 def test_sqlite_file_backend_persists(tmp_path: Path) -> None:
