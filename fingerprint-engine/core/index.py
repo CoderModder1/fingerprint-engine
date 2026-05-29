@@ -54,18 +54,29 @@ class HashIndex(ABC):
     ) -> list[SearchResult]:
         """Return ranked matches via Shazam-style offset-histogram alignment.
 
-        Backend-agnostic: it relies only on ``query()`` and ``_metadata_for()``,
-        so every backend ranks identically. Each result carries a handler-
-        independent ``confidence`` in [0, 1] (aligned votes / the smaller
-        fingerprint's hash count); when a :class:`Calibration` is supplied,
-        results below its per-handler threshold are dropped.
+        Aggregation (per file: winning offset, aligned/total votes, unique
+        hashes) is delegated to :meth:`_aggregate` so SQL backends can compute it
+        server-side; scoring/calibration/ranking is shared here, so every backend
+        produces identical results. Each result carries a handler-independent
+        ``confidence`` in [0, 1] (aligned votes / the smaller fingerprint's hash
+        count); when a :class:`Calibration` is supplied, results below its
+        per-handler threshold are dropped.
+        """
+
+        return self._finalize(fingerprint, self._aggregate(fingerprint), top_k, calibration)
+
+    def _aggregate(self, fingerprint: Fingerprint) -> dict[str, tuple[int, int, int, int]]:
+        """Per-file ``(offset, aligned_votes, total_votes, unique_hashes)``.
+
+        Default in-memory aggregation over a batched :meth:`query_many` fetch.
+        The winning offset is the bin with the most votes, ties broken by
+        smallest offset -- a deterministic rule SQL backends replicate exactly.
         """
 
         offset_histograms: dict[str, Counter[int]] = defaultdict(Counter)
         total_votes: Counter[str] = Counter()
         unique_hashes: dict[str, set[int]] = defaultdict(set)
 
-        # One batched fetch for all distinct query hash codes, then group in memory.
         postings_by_code = self.query_many({qh.hash_code for qh in fingerprint.hashes})
         for query_hash in fingerprint.hashes:
             for posting in postings_by_code.get(query_hash.hash_code, ()):
@@ -74,20 +85,32 @@ class HashIndex(ABC):
                 total_votes[posting.file_id] += 1
                 unique_hashes[posting.file_id].add(query_hash.hash_code)
 
-        results: list[SearchResult] = []
-        query_hash_count = max(1, fingerprint.hash_count)
+        aggregates: dict[str, tuple[int, int, int, int]] = {}
         for file_id, histogram in offset_histograms.items():
             if not histogram:
                 continue
-            offset, aligned_votes = histogram.most_common(1)[0]
-            total = total_votes[file_id]
-            unique = len(unique_hashes[file_id])
+            offset, aligned = max(histogram.items(), key=lambda kv: (kv[1], -kv[0]))
+            aggregates[file_id] = (offset, aligned, total_votes[file_id], len(unique_hashes[file_id]))
+        return aggregates
+
+    def _finalize(
+        self,
+        fingerprint: Fingerprint,
+        aggregates: dict[str, tuple[int, int, int, int]],
+        top_k: int,
+        calibration: Calibration | None,
+    ) -> list[SearchResult]:
+        """Score, calibrate, and rank per-file aggregates (shared by all backends)."""
+
+        results: list[SearchResult] = []
+        query_hash_count = max(1, fingerprint.hash_count)
+        for file_id, (offset, aligned_votes, total, unique) in aggregates.items():
             alignment_ratio = aligned_votes / max(1, total)
             coverage_ratio = unique / query_hash_count
             score = aligned_votes + (0.30 * unique) + (5.0 * alignment_ratio) + (2.0 * coverage_ratio)
             metadata = dict(self._metadata_for(file_id))
-            # Normalise to a handler-independent confidence: fraction of the
-            # smaller fingerprint's hashes that aligned at the winning offset.
+            # Handler-independent confidence: fraction of the smaller fingerprint's
+            # hashes that aligned at the winning offset.
             target_hash_count = int(metadata.get("hash_count") or query_hash_count)
             confidence = min(1.0, aligned_votes / max(1, min(query_hash_count, target_hash_count)))
             if calibration is not None and not calibration.accepts(
@@ -566,6 +589,48 @@ class SQLiteHashIndex(HashIndex):
                 )
         return results
 
+    def _aggregate(self, fingerprint: Fingerprint) -> dict[str, tuple[int, int, int, int]]:
+        """Aggregate the offset histogram server-side via a single SQL pass.
+
+        Loads the query's (hash_code, offset) pairs into a temp table, joins to
+        the postings, and groups by (file_id, delta) -- so only per-file
+        aggregates cross the boundary, not millions of postings. The winning bin
+        is votes DESC then delta ASC, matching the base in-memory tie-break.
+        """
+
+        pairs = [(self._encode(h.hash_code), int(h.time_offset)) for h in fingerprint.hashes]
+        if not pairs:
+            return {}
+        self._conn.execute("CREATE TEMP TABLE IF NOT EXISTS _query (hash_code INTEGER, qoff INTEGER)")
+        self._conn.execute("DELETE FROM _query")
+        self._conn.executemany("INSERT INTO _query (hash_code, qoff) VALUES (?, ?)", pairs)
+        rows = self._conn.execute(
+            """
+            WITH matches AS (
+                SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
+                FROM postings p JOIN _query q ON p.hash_code = q.hash_code
+            ),
+            bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
+            ranked AS (
+                SELECT file_id, delta, votes,
+                       ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY votes DESC, delta ASC) AS rn
+                FROM bins
+            ),
+            totals AS (
+                SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
+                FROM matches GROUP BY file_id
+            )
+            SELECT r.file_id, r.delta, r.votes, t.total_votes, t.uniq
+            FROM ranked r JOIN totals t ON r.file_id = t.file_id
+            WHERE r.rn = 1
+            """
+        ).fetchall()
+        self._conn.execute("DELETE FROM _query")
+        return {
+            file_id: (int(delta), int(votes), int(total), int(uniq))
+            for file_id, delta, votes, total, uniq in rows
+        }
+
     def _metadata_for(self, file_id: str) -> dict:
         row = self._conn.execute(
             "SELECT metadata FROM files WHERE file_id = ?", (file_id,)
@@ -741,6 +806,49 @@ class PostgresHashIndex(HashIndex):
                     IndexPosting(file_id=file_id, hash_code=code, time_offset=int(time_offset))
                 )
         return results
+
+    def _aggregate(self, fingerprint: Fingerprint) -> dict[str, tuple[int, int, int, int]]:
+        """Aggregate the offset histogram server-side in one round-trip.
+
+        The query's (hash_code, offset) pairs are passed as two arrays and
+        unnested into a derived table, joined to the postings, then grouped by
+        (file_id, delta). Only per-file aggregates return. Winning bin is votes
+        DESC then delta ASC, matching the base in-memory tie-break.
+        """
+
+        if not fingerprint.hashes:
+            return {}
+        codes = [self._encode(h.hash_code) for h in fingerprint.hashes]
+        offsets = [int(h.time_offset) for h in fingerprint.hashes]
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH q(hash_code, qoff) AS (SELECT * FROM unnest(%s::bigint[], %s::int[])),
+                matches AS (
+                    SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
+                    FROM {self._postings_table} p JOIN q ON p.hash_code = q.hash_code
+                ),
+                bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
+                ranked AS (
+                    SELECT file_id, delta, votes,
+                           ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY votes DESC, delta ASC) AS rn
+                    FROM bins
+                ),
+                totals AS (
+                    SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
+                    FROM matches GROUP BY file_id
+                )
+                SELECT r.file_id, r.delta, r.votes, t.total_votes, t.uniq
+                FROM ranked r JOIN totals t ON r.file_id = t.file_id
+                WHERE r.rn = 1
+                """,
+                (codes, offsets),
+            )
+            rows = cur.fetchall()
+        return {
+            file_id: (int(delta), int(votes), int(total), int(uniq))
+            for file_id, delta, votes, total, uniq in rows
+        }
 
     def _metadata_for(self, file_id: str) -> dict:
         with self._conn.cursor() as cur:
