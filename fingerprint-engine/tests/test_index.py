@@ -68,6 +68,17 @@ def make_fingerprint(file_id: str, offsets: list[int]) -> Fingerprint:
     )
 
 
+def fp_with_hashes(file_id: str, code_offsets: list[tuple[int, int]]) -> Fingerprint:
+    """Fingerprint with explicit (hash_code, time_offset) pairs."""
+    hashes = [
+        ConstellationHash(hash_code=code, time_offset=offset, anchor_time=offset,
+                          target_time=offset + 1, freq1=1, freq2=2, delta_t=1)
+        for code, offset in code_offsets
+    ]
+    return Fingerprint(file_id=file_id, path=f"/tmp/{file_id}", handler="test", size_bytes=10,
+                       content_sha256=file_id, config={}, hashes=hashes, metadata={})
+
+
 def test_time_coherent_search_ranks_aligned_match_first() -> None:
     index = InMemoryHashIndex()
     index.add(make_fingerprint("aligned", [10, 20, 30, 40]))
@@ -369,6 +380,42 @@ def test_postgres_snapshot_interops_with_in_memory(pg_index, tmp_path: Path) -> 
     assert loaded.file_count == 1
     assert loaded.posting_count == 3
     assert loaded.search(fingerprint)[0].file_id == "file-a"
+
+
+def _stop_hash_corpus(index):
+    # Code 7 appears in all 4 files (a "stop" hash); other codes are file-unique.
+    index.add(fp_with_hashes("a", [(7, 0), (100, 1), (101, 2)]))
+    index.add(fp_with_hashes("b", [(7, 0), (200, 1), (201, 2)]))
+    index.add(fp_with_hashes("c", [(7, 0), (300, 1), (301, 2)]))
+    index.add(fp_with_hashes("d", [(7, 0), (400, 1), (401, 2)]))
+    return index
+
+
+def test_prune_stop_hashes_removes_common_codes_and_recalibrates() -> None:
+    for index in (InMemoryHashIndex(), SQLiteHashIndex(":memory:")):
+        _stop_hash_corpus(index)
+        assert index.posting_count == 12
+        assert len(index.query(7)) == 4  # common code present in all files
+
+        removed = index.prune_stop_hashes(max_df_ratio=0.5)  # code 7 is in 100% of files
+
+        assert removed == 4
+        assert index.query(7) == []                 # stop code gone
+        assert index.posting_count == 8
+        assert len(index.query(100)) == 1           # discriminative codes kept
+
+        # A self-search still matches at full confidence: the pruned target's
+        # hash_count was recalibrated, so aligned / target == 1.0.
+        result = index.search(fp_with_hashes("a", [(7, 0), (100, 1), (101, 2)]), top_k=1)[0]
+        assert result.file_id == "a"
+        assert result.confidence == 1.0
+        assert result.metadata["hash_count"] == 2   # was 3, code 7 pruned
+
+
+def test_redis_prune_stop_hashes_declines() -> None:
+    index = RedisHashIndex(client=_fake_redis(), key_prefix="t9")
+    with pytest.raises(NotImplementedError):
+        index.prune_stop_hashes()
 
 
 def test_sqlite_file_backend_persists(tmp_path: Path) -> None:

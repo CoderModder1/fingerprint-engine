@@ -199,6 +199,23 @@ class HashIndex(ABC):
             )
         return self
 
+    def prune_stop_hashes(self, max_df_ratio: float = 0.1) -> int:
+        """Remove postings for non-discriminative "stop" hash codes.
+
+        A hash code present in more than ``max_df_ratio`` of indexed files
+        carries little discriminative signal but dominates query cost and storage
+        (its posting list is huge). Pruning these speeds up search and shrinks the
+        index. Each affected file's stored ``hash_count`` is updated to its
+        remaining postings so confidence stays calibrated (a self-match stays
+        ~1.0). Returns the number of postings removed. Backends override this;
+        the default declines.
+        """
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support prune_stop_hashes; "
+            "rebuild from a snapshot of a pruned index instead"
+        )
+
 
 class InMemoryHashIndex(HashIndex):
     """Dict-backed hash index with Shazam-style offset alignment scoring."""
@@ -257,6 +274,27 @@ class InMemoryHashIndex(HashIndex):
 
     def query(self, hash_code: int) -> list[IndexPosting]:
         return list(self._postings.get(int(hash_code), []))
+
+    def prune_stop_hashes(self, max_df_ratio: float = 0.1) -> int:
+        file_total = len(self._file_entries)
+        if file_total == 0:
+            return 0
+        threshold = max_df_ratio * file_total
+        stop = {
+            code
+            for code, postings in self._postings.items()
+            if len({posting.file_id for posting in postings}) > threshold
+        }
+        if not stop:
+            return 0
+        removed = sum(len(self._postings.pop(code)) for code in stop)
+        for file_id, entries in self._file_entries.items():
+            kept = [(h, t) for (h, t) in entries if h not in stop]
+            if len(kept) != len(entries):
+                self._file_entries[file_id] = kept
+                if file_id in self._metadata:
+                    self._metadata[file_id]["hash_count"] = len(kept)
+        return removed
 
     def _metadata_for(self, file_id: str) -> dict:
         return dict(self._metadata.get(file_id, {}))
@@ -631,6 +669,34 @@ class SQLiteHashIndex(HashIndex):
             for file_id, delta, votes, total, uniq in rows
         }
 
+    def prune_stop_hashes(self, max_df_ratio: float = 0.1) -> int:
+        file_total = self.file_count
+        if file_total == 0:
+            return 0
+        threshold = max_df_ratio * file_total
+        cursor = self._conn.execute(
+            "DELETE FROM postings WHERE hash_code IN ("
+            "  SELECT hash_code FROM postings GROUP BY hash_code "
+            "  HAVING COUNT(DISTINCT file_id) > ?)",
+            (threshold,),
+        )
+        removed = cursor.rowcount
+        if removed:
+            counts = dict(
+                self._conn.execute("SELECT file_id, COUNT(*) FROM postings GROUP BY file_id").fetchall()
+            )
+            for file_id, meta_json in self._conn.execute("SELECT file_id, metadata FROM files").fetchall():
+                metadata = json.loads(meta_json)
+                new_count = int(counts.get(file_id, 0))
+                if metadata.get("hash_count") != new_count:
+                    metadata["hash_count"] = new_count
+                    self._conn.execute(
+                        "UPDATE files SET metadata = ? WHERE file_id = ?",
+                        (json.dumps(metadata, sort_keys=True), file_id),
+                    )
+        self._conn.commit()
+        return removed
+
     def _metadata_for(self, file_id: str) -> dict:
         row = self._conn.execute(
             "SELECT metadata FROM files WHERE file_id = ?", (file_id,)
@@ -849,6 +915,35 @@ class PostgresHashIndex(HashIndex):
             file_id: (int(delta), int(votes), int(total), int(uniq))
             for file_id, delta, votes, total, uniq in rows
         }
+
+    def prune_stop_hashes(self, max_df_ratio: float = 0.1) -> int:
+        file_total = self.file_count
+        if file_total == 0:
+            return 0
+        threshold = max_df_ratio * file_total
+        posts, files = self._postings_table, self._files_table
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {posts} WHERE hash_code IN ("
+                f"  SELECT hash_code FROM {posts} GROUP BY hash_code "
+                f"  HAVING COUNT(DISTINCT file_id) > %s)",
+                (threshold,),
+            )
+            removed = cur.rowcount
+            if removed:
+                # Recalibrate stored hash_count to remaining postings per file.
+                cur.execute(
+                    f"UPDATE {files} f SET metadata = "
+                    f"jsonb_set(f.metadata, '{{hash_count}}', to_jsonb(c.cnt)) "
+                    f"FROM (SELECT file_id, COUNT(*) AS cnt FROM {posts} GROUP BY file_id) c "
+                    f"WHERE f.file_id = c.file_id"
+                )
+                cur.execute(
+                    f"UPDATE {files} SET metadata = jsonb_set(metadata, '{{hash_count}}', '0'::jsonb) "
+                    f"WHERE file_id NOT IN (SELECT DISTINCT file_id FROM {posts})"
+                )
+        self._conn.commit()
+        return removed
 
     def _metadata_for(self, file_id: str) -> dict:
         with self._conn.cursor() as cur:

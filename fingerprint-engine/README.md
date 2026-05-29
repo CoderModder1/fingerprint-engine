@@ -120,6 +120,26 @@ index.search(query, calibration=Calibration(
 Ranking still uses the raw `score` (correct within a single query); `confidence`
 is the comparable measure for accept/reject decisions across handlers.
 
+## Stop-Hash Pruning
+
+Query cost and storage are dominated by posting volume: a query touches every
+posting of each of its hash codes, and common-but-non-discriminative codes
+(present in many files) carry most of the postings. `prune_stop_hashes(max_df_ratio)`
+removes postings for any hash code present in more than `max_df_ratio` of the
+indexed files, and recalibrates each file's stored `hash_count` so confidence
+stays meaningful (a self-match remains ~1.0).
+
+```bash
+python cli.py --backend sqlite --sqlite-path index.sqlite3 prune --max-df-ratio 0.1
+```
+
+On a 1000-file source corpus (default `0.1`), this removed ~36% of postings and
+made in-memory queries **~5× faster** (≈0.05 for ~51% / ~10×), with **recall@1
+and self-confidence unchanged at 1.0** — the pruned codes are noise, not signal.
+Supported by the in-memory, SQLite, and Postgres backends (Redis raises
+`NotImplementedError`; rebuild it from a pruned snapshot instead). You can also
+generate fewer hashes up front via `--fanout` / `--max-peaks-per-frame`.
+
 ## Adaptive Windowing
 
 A signal shorter than `window_size` collapses to one or two FFT frames, so no

@@ -29,6 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--peak-threshold", type=float, default=FingerprintConfig.peak_threshold)
     parser.add_argument("--peak-percentile", type=float, default=FingerprintConfig.peak_percentile)
     parser.add_argument("--fanout", type=int, default=FingerprintConfig.constellation_fanout)
+    parser.add_argument("--max-peaks-per-frame", type=int, default=FingerprintConfig.max_peaks_per_frame,
+                        help="cap landmark peaks per frame (lower = fewer hashes/file)")
     parser.add_argument("--hash-bits", type=int, default=FingerprintConfig.hash_bits)
     parser.add_argument("--min-time-frames", type=int, default=FingerprintConfig.min_time_frames)
     parser.add_argument("--min-window-size", type=int, default=FingerprintConfig.min_window_size)
@@ -60,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="drop matches below this confidence in [0,1] "
                              "(handler-comparable; e.g. 0.05)")
 
+    prune = subparsers.add_parser("prune", help="Remove non-discriminative 'stop' hash codes")
+    prune.add_argument("--max-df-ratio", type=float, default=0.1,
+                       help="prune hash codes present in more than this fraction of files "
+                            "(default 0.1; lower = more aggressive)")
+
     return parser
 
 
@@ -70,6 +77,7 @@ def config_from_args(args: argparse.Namespace) -> FingerprintConfig:
         peak_threshold=args.peak_threshold,
         peak_percentile=args.peak_percentile,
         constellation_fanout=args.fanout,
+        max_peaks_per_frame=args.max_peaks_per_frame,
         hash_bits=args.hash_bits,
         min_time_frames=args.min_time_frames,
         min_window_size=args.min_window_size,
@@ -165,6 +173,22 @@ def main(argv: list[str] | None = None) -> int:
             "backend": args.backend,
             "index_path": index_location(args),
             "results": [result.to_dict() for result in results],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "prune":
+        index = open_index(args)
+        removed = index.prune_stop_hashes(max_df_ratio=args.max_df_ratio)
+        if args.backend == "memory":
+            index.save(index_path)
+        payload = {
+            "backend": args.backend,
+            "index_path": index_location(args),
+            "max_df_ratio": args.max_df_ratio,
+            "pruned_postings": removed,
+            "file_count": index.file_count,
+            "posting_count": index.posting_count,
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
