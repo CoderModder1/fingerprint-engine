@@ -1320,10 +1320,31 @@ class SQLiteHashIndex(HashIndex):
     """SQLite-backed hash index: zero-dependency (stdlib), file-persistent.
 
     Implements the same :class:`HashIndex` contract and inherits the shared
-    ``search``/``save``/``load_snapshot``. Postings live in a relational table
-    indexed on ``hash_code`` (fast ``query``) and ``file_id`` (fast ``remove``).
-    Pass ``":memory:"`` for an ephemeral in-process database (used by tests) or a
-    file path for persistence; or inject an existing ``sqlite3.Connection``.
+    ``search``/``save``/``load_snapshot``. Pass ``":memory:"`` for an ephemeral
+    in-process database (used by tests) or a file path for persistence; or inject
+    an existing ``sqlite3.Connection``.
+
+    Storage layout (internal, output-preserving): the 64-char SHA-256 ``file_id``
+    is the dominant per-posting cost when stored verbatim on every posting row.
+    Instead a normalized ``files`` row maps each ``file_id`` to a small integer
+    surrogate (its ``INTEGER PRIMARY KEY`` rowid), and each posting stores that
+    integer ``file_ref`` foreign key rather than the 64-char string. The
+    surrogate is mapped back to the original ``file_id`` string only at the
+    query/aggregate/snapshot boundary (every read JOINs ``postings`` to
+    ``files``), so :meth:`search`, :meth:`to_dict`, :meth:`list_files`,
+    :meth:`iter_metadata`, :meth:`query`, :meth:`query_many`, ``posting_count``,
+    ``file_count`` and cross-backend parity are all BYTE-IDENTICAL to storing the
+    string verbatim. This mirrors the in-memory backend's surrogate concept.
+
+    ``postings`` is indexed on ``hash_code`` (fast ``query``) and ``file_ref``
+    (fast ``remove``/aggregation join).
+
+    Migration: a database written by a PRIOR version of this class has the OLD
+    schema (``postings.file_id TEXT``, a ``files`` table with no ``id`` column).
+    :meth:`_init_schema` DETECTS that layout and migrates it in place, in a single
+    transaction, exactly once on open -- preserving every ``file_id``, metadata
+    blob, and posting -- so an existing persistent ``.sqlite3`` keeps working
+    transparently. See :meth:`_migrate_legacy_schema`.
 
     Concurrency contract: file-backed databases run in WAL journal mode, which
     allows many concurrent readers alongside a single writer; a 5s
@@ -1359,22 +1380,106 @@ class SQLiteHashIndex(HashIndex):
         # committed transaction on an OS/power crash (never corruption). This
         # cuts the fsync-per-commit cost that bottlenecks bulk add_many.
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        # An existing database written by the OLD schema (postings.file_id TEXT,
+        # files without an id surrogate) is migrated in place, once, before the
+        # new tables/indexes are (idempotently) ensured below.
+        self._migrate_legacy_schema_if_present()
+        # files.id is an INTEGER PRIMARY KEY, i.e. an alias for the rowid -- the
+        # small integer surrogate stored in postings.file_ref. file_id stays
+        # UNIQUE so upsert-by-file_id resolves a stable id; metadata is the same
+        # JSON blob as before.
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS files (
-                file_id  TEXT PRIMARY KEY,
+                id       INTEGER PRIMARY KEY,
+                file_id  TEXT UNIQUE NOT NULL,
                 metadata TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS postings (
-                file_id     TEXT    NOT NULL,
+                file_ref    INTEGER NOT NULL,
                 hash_code   INTEGER NOT NULL,
                 time_offset INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_postings_hash ON postings(hash_code);
-            CREATE INDEX IF NOT EXISTS idx_postings_file ON postings(file_id);
+            CREATE INDEX IF NOT EXISTS idx_postings_file ON postings(file_ref);
             """
         )
         self._conn.commit()
+
+    def _postings_columns(self) -> set[str]:
+        """Column names of the existing ``postings`` table (empty set if absent)."""
+
+        return {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(postings)").fetchall()
+        }
+
+    def _migrate_legacy_schema_if_present(self) -> None:
+        """One-time, transactional, in-place upgrade of an OLD-schema database.
+
+        The pre-surrogate schema stored ``postings.file_id TEXT`` and a ``files``
+        table with no ``id`` column. We detect that exact shape -- a ``postings``
+        table that HAS a ``file_id`` column and LACKS ``file_ref`` -- and rewrite
+        it to the surrogate layout: build the new ``files`` (with an INTEGER
+        PRIMARY KEY id) and ``postings`` (with file_ref), populate the surrogate
+        ids from the distinct file_ids, copy every posting across resolving its
+        file_id to the new id, then drop the old tables and rename the new ones
+        into place. Every file_id, metadata blob, and posting (and its insertion
+        order, preserved by copying ORDER BY the old rowid) survives unchanged, so
+        a migrated index is output-identical to one freshly built from the same
+        data.
+
+        A brand-new or already-migrated database (no ``postings`` table, or one
+        that already has ``file_ref``) is left untouched -- this is a no-op except
+        the one-time legacy upgrade. The whole rewrite runs in a single
+        transaction: a failure rolls back to the original old-schema database
+        rather than leaving a half-migrated one.
+        """
+
+        columns = self._postings_columns()
+        if not columns or "file_ref" in columns or "file_id" not in columns:
+            # No postings table yet (fresh DB), or already the new schema, or an
+            # unrecognized shape we must not touch -- nothing to migrate.
+            return
+        # Stamp a marker so the intent is greppable in the file; harmless if the
+        # rewrite below is interrupted (the next open re-detects the old schema).
+        self._conn.execute("PRAGMA legacy_alter_table=OFF")
+        try:
+            self._conn.execute("BEGIN")
+            self._conn.executescript(
+                """
+                CREATE TABLE files_new (
+                    id       INTEGER PRIMARY KEY,
+                    file_id  TEXT UNIQUE NOT NULL,
+                    metadata TEXT NOT NULL
+                );
+                CREATE TABLE postings_new (
+                    file_ref    INTEGER NOT NULL,
+                    hash_code   INTEGER NOT NULL,
+                    time_offset INTEGER NOT NULL
+                );
+                -- Surrogate ids are assigned by INTEGER PRIMARY KEY rowid as the
+                -- distinct file_ids are inserted (ordered by the old files rowid
+                -- for a deterministic assignment).
+                INSERT INTO files_new (file_id, metadata)
+                    SELECT file_id, metadata FROM files ORDER BY rowid;
+                -- Copy every posting, resolving its file_id to the new surrogate.
+                -- ORDER BY the old posting rowid preserves per-file insertion
+                -- order, so to_dict()'s ORDER BY rowid stays byte-identical.
+                INSERT INTO postings_new (file_ref, hash_code, time_offset)
+                    SELECT f.id, p.hash_code, p.time_offset
+                    FROM postings p JOIN files_new f ON f.file_id = p.file_id
+                    ORDER BY p.rowid;
+                DROP TABLE postings;
+                DROP TABLE files;
+                ALTER TABLE files_new RENAME TO files;
+                ALTER TABLE postings_new RENAME TO postings;
+                """
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
 
     @classmethod
     def _encode(cls, hash_code: int) -> int:
@@ -1405,14 +1510,18 @@ class SQLiteHashIndex(HashIndex):
             "landmark_count": fingerprint.landmark_count,
             **fingerprint.metadata,
         }
-        self._conn.execute(
+        # remove() above deleted any prior files row, so this INSERT allocates a
+        # fresh surrogate id (cursor.lastrowid). Postings carry that file_ref, not
+        # the 64-char file_id string.
+        cursor = self._conn.execute(
             "INSERT INTO files (file_id, metadata) VALUES (?, ?)",
             (fingerprint.file_id, json.dumps(metadata, sort_keys=True)),
         )
+        file_ref = cursor.lastrowid
         self._conn.executemany(
-            "INSERT INTO postings (file_id, hash_code, time_offset) VALUES (?, ?, ?)",
+            "INSERT INTO postings (file_ref, hash_code, time_offset) VALUES (?, ?, ?)",
             [
-                (fingerprint.file_id, self._encode(item.hash_code), int(item.time_offset))
+                (file_ref, self._encode(item.hash_code), int(item.time_offset))
                 for item in fingerprint.hashes
             ],
         )
@@ -1439,8 +1548,11 @@ class SQLiteHashIndex(HashIndex):
         if not survivors:
             return
 
-        file_rows: list[tuple[str, str]] = []
-        posting_rows: list[tuple[str, int, int]] = []
+        # Per file: its metadata blob plus its encoded postings. The surrogate
+        # file_ref is filled in below, once the files row is inserted and its id
+        # (lastrowid) is known -- postings can only carry a ref after the id
+        # exists, so they are staged per file and assembled into one bulk insert.
+        staged: list[tuple[str, str, list[tuple[int, int]]]] = []
         for file_id, fingerprint in survivors.items():
             metadata = {
                 "file_id": file_id,
@@ -1452,25 +1564,44 @@ class SQLiteHashIndex(HashIndex):
                 "landmark_count": fingerprint.landmark_count,
                 **fingerprint.metadata,
             }
-            file_rows.append((file_id, json.dumps(metadata, sort_keys=True)))
-            posting_rows.extend(
-                (file_id, self._encode(item.hash_code), int(item.time_offset))
-                for item in fingerprint.hashes
-            )
+            staged.append((
+                file_id,
+                json.dumps(metadata, sort_keys=True),
+                [(self._encode(item.hash_code), int(item.time_offset)) for item in fingerprint.hashes],
+            ))
 
         try:
-            # remove() effect for every target file_id (pre-batch rows), batched.
+            # remove() effect for every target file_id (pre-batch rows). Postings
+            # are keyed by the surrogate, so resolve each id and delete by ref
+            # (one batched lookup of the existing ids, then a batched delete).
+            file_ids = list(survivors)
+            placeholders = ",".join("?" * len(file_ids))
+            old_refs = [
+                row[0]
+                for row in self._conn.execute(
+                    f"SELECT id FROM files WHERE file_id IN ({placeholders})", file_ids
+                ).fetchall()
+            ]
+            if old_refs:
+                self._conn.executemany(
+                    "DELETE FROM postings WHERE file_ref = ?", [(ref,) for ref in old_refs]
+                )
             self._conn.executemany(
-                "DELETE FROM postings WHERE file_id = ?", [(fid,) for fid in survivors]
+                "DELETE FROM files WHERE file_id = ?", [(fid,) for fid in file_ids]
             )
+            # Insert each files row (capturing its fresh surrogate id) then stage
+            # that file's postings with the resolved file_ref. One executemany
+            # then bulk-inserts every posting in a single statement.
+            posting_rows: list[tuple[int, int, int]] = []
+            for file_id, meta_json, encoded in staged:
+                cursor = self._conn.execute(
+                    "INSERT INTO files (file_id, metadata) VALUES (?, ?)", (file_id, meta_json)
+                )
+                file_ref = cursor.lastrowid
+                assert file_ref is not None  # an INTEGER PRIMARY KEY insert always sets it
+                posting_rows.extend((file_ref, code, offset) for code, offset in encoded)
             self._conn.executemany(
-                "DELETE FROM files WHERE file_id = ?", [(fid,) for fid in survivors]
-            )
-            self._conn.executemany(
-                "INSERT INTO files (file_id, metadata) VALUES (?, ?)", file_rows
-            )
-            self._conn.executemany(
-                "INSERT INTO postings (file_id, hash_code, time_offset) VALUES (?, ?, ?)",
+                "INSERT INTO postings (file_ref, hash_code, time_offset) VALUES (?, ?, ?)",
                 posting_rows,
             )
         except BaseException:
@@ -1481,14 +1612,22 @@ class SQLiteHashIndex(HashIndex):
         self._conn.commit()
 
     def remove(self, file_id: str) -> None:
-        self._conn.execute("DELETE FROM postings WHERE file_id = ?", (file_id,))
+        # Resolve the surrogate first so postings (keyed by file_ref) can be
+        # deleted, then drop the files row. A subselect keeps it one round-trip.
+        self._conn.execute(
+            "DELETE FROM postings WHERE file_ref = (SELECT id FROM files WHERE file_id = ?)",
+            (file_id,),
+        )
         self._conn.execute("DELETE FROM files WHERE file_id = ?", (file_id,))
         self._conn.commit()
 
     def query(self, hash_code: int) -> list[IndexPosting]:
         code = int(hash_code)
+        # JOIN postings -> files to recover the original str file_id from the
+        # surrogate file_ref; the returned IndexPosting values are unchanged.
         rows = self._conn.execute(
-            "SELECT file_id, time_offset FROM postings WHERE hash_code = ?",
+            "SELECT f.file_id, p.time_offset FROM postings p "
+            "JOIN files f ON f.id = p.file_ref WHERE p.hash_code = ?",
             (self._encode(code),),
         ).fetchall()
         return [
@@ -1503,9 +1642,12 @@ class SQLiteHashIndex(HashIndex):
         for start in range(0, len(codes), chunk):
             batch = [self._encode(code) for code in codes[start:start + chunk]]
             placeholders = ",".join("?" * len(batch))
+            # JOIN to files to map each posting's surrogate file_ref back to the
+            # original str file_id, preserving the IndexPosting return contract.
             rows = self._conn.execute(
-                f"SELECT hash_code, file_id, time_offset FROM postings "
-                f"WHERE hash_code IN ({placeholders})",
+                f"SELECT p.hash_code, f.file_id, p.time_offset FROM postings p "
+                f"JOIN files f ON f.id = p.file_ref "
+                f"WHERE p.hash_code IN ({placeholders})",
                 batch,
             ).fetchall()
             for stored, file_id, time_offset in rows:
@@ -1524,16 +1666,22 @@ class SQLiteHashIndex(HashIndex):
         """Aggregate the offset histogram server-side via a single SQL pass.
 
         Loads the query's (hash_code, offset) pairs into a temp table, joins to
-        the postings, and groups by (file_id, delta) -- so only per-file
-        aggregates cross the boundary, not millions of postings.
+        the postings, and groups by (file_ref, delta) -- so only per-file
+        aggregates cross the boundary, not millions of postings. Grouping on the
+        small integer ``file_ref`` (the surrogate) is cheaper than grouping on the
+        64-char file_id; the surrogate is resolved back to the original str
+        ``file_id`` by a single JOIN to ``files`` in the final SELECT, so the
+        result is keyed by the SAME ``file_id`` string as every other backend.
 
         With ``offset_tolerance == 0`` (the default) the winning bin is picked
         server-side as votes DESC then delta ASC, matching the base in-memory
         tie-break exactly -- this path is unchanged and BYTE-IDENTICAL to before
-        the option existed. With ``> 0`` the SQL still groups to per-(file, delta)
-        bins server-side (only the compact histogram crosses the boundary, never
-        raw postings), but the banded winner is chosen in Python via the shared
-        :meth:`_banded_winner`, so every backend bands identically.
+        the option existed (partitioning by ``file_ref`` instead of the file_id
+        string is a 1:1 relabelling of the same partitions, so the per-file
+        winning row is unchanged). With ``> 0`` the SQL still groups to
+        per-(file, delta) bins server-side (only the compact histogram crosses the
+        boundary, never raw postings), but the banded winner is chosen in Python
+        via the shared :meth:`_banded_winner`, so every backend bands identically.
 
         ``candidates`` is the OPT-IN prefilter set: ``None`` (the default) returns
         the aggregate for every matched file, byte-identical to before the
@@ -1555,37 +1703,39 @@ class SQLiteHashIndex(HashIndex):
                 rows = self._conn.execute(
                     """
                     WITH matches AS (
-                        SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
+                        SELECT p.file_ref AS file_ref, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
                         FROM postings p JOIN _query q ON p.hash_code = q.hash_code
                     ),
-                    bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
+                    bins AS (SELECT file_ref, delta, COUNT(*) AS votes FROM matches GROUP BY file_ref, delta),
                     totals AS (
-                        SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
-                        FROM matches GROUP BY file_id
+                        SELECT file_ref, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
+                        FROM matches GROUP BY file_ref
                     )
-                    SELECT b.file_id, b.delta, b.votes, t.total_votes, t.uniq
-                    FROM bins b JOIN totals t ON b.file_id = t.file_id
+                    SELECT f.file_id, b.delta, b.votes, t.total_votes, t.uniq
+                    FROM bins b JOIN totals t ON b.file_ref = t.file_ref
+                    JOIN files f ON f.id = b.file_ref
                     """
                 ).fetchall()
             else:
                 rows = self._conn.execute(
                     """
                     WITH matches AS (
-                        SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
+                        SELECT p.file_ref AS file_ref, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
                         FROM postings p JOIN _query q ON p.hash_code = q.hash_code
                     ),
-                    bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
+                    bins AS (SELECT file_ref, delta, COUNT(*) AS votes FROM matches GROUP BY file_ref, delta),
                     ranked AS (
-                        SELECT file_id, delta, votes,
-                               ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY votes DESC, delta ASC) AS rn
+                        SELECT file_ref, delta, votes,
+                               ROW_NUMBER() OVER (PARTITION BY file_ref ORDER BY votes DESC, delta ASC) AS rn
                         FROM bins
                     ),
                     totals AS (
-                        SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
-                        FROM matches GROUP BY file_id
+                        SELECT file_ref, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
+                        FROM matches GROUP BY file_ref
                     )
-                    SELECT r.file_id, r.delta, r.votes, t.total_votes, t.uniq
-                    FROM ranked r JOIN totals t ON r.file_id = t.file_id
+                    SELECT f.file_id, r.delta, r.votes, t.total_votes, t.uniq
+                    FROM ranked r JOIN totals t ON r.file_ref = t.file_ref
+                    JOIN files f ON f.id = r.file_ref
                     WHERE r.rn = 1
                     """
                 ).fetchall()
@@ -1609,16 +1759,22 @@ class SQLiteHashIndex(HashIndex):
         if file_total == 0:
             return 0
         threshold = max_df_ratio * file_total
+        # Document frequency is distinct surrogates touching a code (1:1 with
+        # distinct file_ids), so COUNT(DISTINCT file_ref) is the same df test.
         cursor = self._conn.execute(
             "DELETE FROM postings WHERE hash_code IN ("
             "  SELECT hash_code FROM postings GROUP BY hash_code "
-            "  HAVING COUNT(DISTINCT file_id) > ?)",
+            "  HAVING COUNT(DISTINCT file_ref) > ?)",
             (threshold,),
         )
         removed = cursor.rowcount
         if removed:
+            # Remaining postings per file, resolving the surrogate back to file_id.
             counts = dict(
-                self._conn.execute("SELECT file_id, COUNT(*) FROM postings GROUP BY file_id").fetchall()
+                self._conn.execute(
+                    "SELECT f.file_id, COUNT(*) FROM postings p "
+                    "JOIN files f ON f.id = p.file_ref GROUP BY p.file_ref"
+                ).fetchall()
             )
             for file_id, meta_json in self._conn.execute("SELECT file_id, metadata FROM files").fetchall():
                 metadata = json.loads(meta_json)
@@ -1661,13 +1817,15 @@ class SQLiteHashIndex(HashIndex):
     def to_dict(self) -> dict[str, object]:
         files: dict[str, list[list[int]]] = {}
         metadata: dict[str, dict] = {}
-        for (file_id,) in self._conn.execute("SELECT file_id FROM files").fetchall():
+        # Carry the surrogate id so postings can be read by file_ref; ORDER BY
+        # rowid is preserved so per-file posting order is byte-identical to before.
+        for file_ref, file_id in self._conn.execute("SELECT id, file_id FROM files").fetchall():
             entries = [
                 [self._decode(hash_code), int(time_offset)]
                 for hash_code, time_offset in self._conn.execute(
                     "SELECT hash_code, time_offset FROM postings "
-                    "WHERE file_id = ? ORDER BY rowid",
-                    (file_id,),
+                    "WHERE file_ref = ? ORDER BY rowid",
+                    (file_ref,),
                 ).fetchall()
             ]
             files[file_id] = entries
@@ -1688,11 +1846,27 @@ class PostgresHashIndex(HashIndex):
     """PostgreSQL-backed hash index for a shared, durable, server-grade store.
 
     Implements the same :class:`HashIndex` contract and inherits the shared
-    ``search``/``save``/``load_snapshot``. Postings live in a table indexed on
-    ``hash_code`` (fast ``query``) and ``file_id`` (fast ``remove``); metadata is
-    stored as ``JSONB``. Pass a ``dsn`` (libpq connection string) or inject a
-    ``psycopg`` connection. ``psycopg`` is imported lazily, so importing this
-    module never requires it.
+    ``search``/``save``/``load_snapshot``. Pass a ``dsn`` (libpq connection
+    string) or inject a ``psycopg`` connection. ``psycopg`` is imported lazily, so
+    importing this module never requires it.
+
+    Storage layout (internal, output-preserving): mirroring SQLite, the
+    ``files`` table maps each ``file_id`` to a small ``BIGINT`` surrogate id
+    (``GENERATED BY DEFAULT AS IDENTITY``), and each posting stores that integer
+    ``file_ref`` foreign key rather than the 64-char ``file_id`` string. Every
+    read JOINs ``postings`` to ``files`` to recover the original ``file_id``, so
+    :meth:`search`, :meth:`to_dict`, :meth:`list_files`, :meth:`query`,
+    :meth:`query_many`, the counts, and cross-backend parity are BYTE-IDENTICAL to
+    storing the string verbatim. ``postings`` is indexed on ``hash_code`` (fast
+    ``query``) and ``file_ref`` (fast ``remove``/join). Metadata is ``JSONB``.
+
+    Migration: a table set written by a PRIOR version of this class has the OLD
+    schema (``postings.file_id TEXT``, ``files`` with no ``id`` column).
+    :meth:`_init_schema` detects that and migrates it in place, transactionally,
+    once on open (see :meth:`_migrate_legacy_schema_if_present`). This backend
+    cannot be exercised in CI without a live server (it is gated behind
+    ``@requires_pg``), so the migration here is implemented structurally to mirror
+    the SQLite path that IS tested live.
 
     Like SQLite, PostgreSQL ``BIGINT`` is signed 64-bit, so unsigned 64-bit hash
     codes are stored with the same reversible signed offset.
@@ -1724,14 +1898,19 @@ class PostgresHashIndex(HashIndex):
         self._init_schema()
 
     def _init_schema(self) -> None:
+        # Migrate an OLD-schema table set (postings.file_id TEXT, files without a
+        # surrogate id) in place, once, before idempotently ensuring the new
+        # tables/indexes below.
+        self._migrate_legacy_schema_if_present()
         with self._conn.cursor() as cur:
             cur.execute(
                 f"CREATE TABLE IF NOT EXISTS {self._files_table} ("
-                "file_id TEXT PRIMARY KEY, metadata JSONB NOT NULL)"
+                "id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, "
+                "file_id TEXT UNIQUE NOT NULL, metadata JSONB NOT NULL)"
             )
             cur.execute(
                 f"CREATE TABLE IF NOT EXISTS {self._postings_table} ("
-                "file_id TEXT NOT NULL, hash_code BIGINT NOT NULL, time_offset INTEGER NOT NULL)"
+                "file_ref BIGINT NOT NULL, hash_code BIGINT NOT NULL, time_offset INTEGER NOT NULL)"
             )
             cur.execute(
                 f"CREATE INDEX IF NOT EXISTS {self._postings_table}_hash_idx "
@@ -1739,9 +1918,66 @@ class PostgresHashIndex(HashIndex):
             )
             cur.execute(
                 f"CREATE INDEX IF NOT EXISTS {self._postings_table}_file_idx "
-                f"ON {self._postings_table}(file_id)"
+                f"ON {self._postings_table}(file_ref)"
             )
         self._conn.commit()
+
+    def _migrate_legacy_schema_if_present(self) -> None:
+        """One-time, transactional, in-place upgrade of an OLD-schema table set.
+
+        Detects the pre-surrogate layout -- a ``postings`` table that HAS a
+        ``file_id`` column and LACKS ``file_ref`` -- and rewrites it: a new
+        ``files`` table with a ``BIGINT GENERATED ... AS IDENTITY`` surrogate id,
+        populated from the distinct old file_ids; a new ``postings`` table whose
+        ``file_ref`` is each posting's resolved surrogate; then drop the old
+        tables and rename the new ones into place. Every file_id, metadata blob,
+        and posting survives; the whole rewrite is one transaction, so a failure
+        rolls back to the original old-schema tables. A fresh or already-migrated
+        table set (no postings table, or one that already has ``file_ref``) is a
+        no-op. Mirrors :meth:`SQLiteHashIndex._migrate_legacy_schema_if_present`;
+        gated behind ``@requires_pg`` so it is not run live in CI.
+        """
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                (self._postings_table,),
+            )
+            columns = {row[0] for row in cur.fetchall()}
+        if not columns or "file_ref" in columns or "file_id" not in columns:
+            self._conn.rollback()  # release the read txn; nothing to migrate
+            return
+        files_new = f"{self._files_table}_new"
+        postings_new = f"{self._postings_table}_new"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    f"CREATE TABLE {files_new} ("
+                    "id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, "
+                    "file_id TEXT UNIQUE NOT NULL, metadata JSONB NOT NULL)"
+                )
+                cur.execute(
+                    f"CREATE TABLE {postings_new} ("
+                    "file_ref BIGINT NOT NULL, hash_code BIGINT NOT NULL, time_offset INTEGER NOT NULL)"
+                )
+                # Identity ids are assigned as the distinct file_ids are inserted.
+                cur.execute(
+                    f"INSERT INTO {files_new} (file_id, metadata) "
+                    f"SELECT file_id, metadata FROM {self._files_table}"
+                )
+                cur.execute(
+                    f"INSERT INTO {postings_new} (file_ref, hash_code, time_offset) "
+                    f"SELECT f.id, p.hash_code, p.time_offset "
+                    f"FROM {self._postings_table} p JOIN {files_new} f ON f.file_id = p.file_id"
+                )
+                cur.execute(f"DROP TABLE {self._postings_table}")
+                cur.execute(f"DROP TABLE {self._files_table}")
+                cur.execute(f"ALTER TABLE {files_new} RENAME TO {self._files_table}")
+                cur.execute(f"ALTER TABLE {postings_new} RENAME TO {self._postings_table}")
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
 
     @classmethod
     def _encode(cls, hash_code: int) -> int:
@@ -1785,15 +2021,19 @@ class PostgresHashIndex(HashIndex):
             **fingerprint.metadata,
         }
         with self._conn.cursor() as cur:
+            # remove() above deleted any prior files row, so RETURNING id yields a
+            # fresh surrogate; postings carry that file_ref, not the file_id string.
             cur.execute(
-                f"INSERT INTO {self._files_table} (file_id, metadata) VALUES (%s, %s::jsonb)",
+                f"INSERT INTO {self._files_table} (file_id, metadata) "
+                "VALUES (%s, %s::jsonb) RETURNING id",
                 (fingerprint.file_id, json.dumps(metadata, sort_keys=True)),
             )
+            file_ref = cur.fetchone()[0]
             cur.executemany(
-                f"INSERT INTO {self._postings_table} (file_id, hash_code, time_offset) "
+                f"INSERT INTO {self._postings_table} (file_ref, hash_code, time_offset) "
                 "VALUES (%s, %s, %s)",
                 [
-                    (fingerprint.file_id, self._encode(item.hash_code), int(item.time_offset))
+                    (file_ref, self._encode(item.hash_code), int(item.time_offset))
                     for item in fingerprint.hashes
                 ],
             )
@@ -1819,8 +2059,9 @@ class PostgresHashIndex(HashIndex):
         if not survivors:
             return
 
-        file_rows: list[tuple[str, str]] = []
-        posting_rows: list[tuple[str, int, int]] = []
+        # Per file: metadata blob plus encoded postings; the surrogate file_ref
+        # is filled in once the files row is inserted and its id known.
+        staged: list[tuple[str, str, list[tuple[int, int]]]] = []
         for file_id, fingerprint in survivors.items():
             metadata = {
                 "file_id": file_id,
@@ -1832,29 +2073,40 @@ class PostgresHashIndex(HashIndex):
                 "landmark_count": fingerprint.landmark_count,
                 **fingerprint.metadata,
             }
-            file_rows.append((file_id, json.dumps(metadata, sort_keys=True)))
-            posting_rows.extend(
-                (file_id, self._encode(item.hash_code), int(item.time_offset))
-                for item in fingerprint.hashes
-            )
+            staged.append((
+                file_id,
+                json.dumps(metadata, sort_keys=True),
+                [(self._encode(item.hash_code), int(item.time_offset)) for item in fingerprint.hashes],
+            ))
 
         file_ids = list(survivors)
         try:
             with self._conn.cursor() as cur:
-                # remove() effect for every target file_id (pre-batch rows).
+                # remove() effect for every target file_id (pre-batch rows):
+                # postings are keyed by the surrogate, so delete by file_ref of
+                # the existing rows, then drop the files rows.
                 cur.execute(
-                    f"DELETE FROM {self._postings_table} WHERE file_id = ANY(%s)", (file_ids,)
+                    f"DELETE FROM {self._postings_table} WHERE file_ref IN "
+                    f"(SELECT id FROM {self._files_table} WHERE file_id = ANY(%s))",
+                    (file_ids,),
                 )
                 cur.execute(
                     f"DELETE FROM {self._files_table} WHERE file_id = ANY(%s)", (file_ids,)
                 )
-                cur.executemany(
-                    f"INSERT INTO {self._files_table} (file_id, metadata) VALUES (%s, %s::jsonb)",
-                    file_rows,
-                )
+                # Insert each files row, capturing its fresh surrogate id, then
+                # stage that file's postings with the resolved file_ref.
+                posting_rows: list[tuple[int, int, int]] = []
+                for file_id, meta_json, encoded in staged:
+                    cur.execute(
+                        f"INSERT INTO {self._files_table} (file_id, metadata) "
+                        "VALUES (%s, %s::jsonb) RETURNING id",
+                        (file_id, meta_json),
+                    )
+                    file_ref = cur.fetchone()[0]
+                    posting_rows.extend((file_ref, code, offset) for code, offset in encoded)
                 if posting_rows:
                     with cur.copy(
-                        f"COPY {self._postings_table} (file_id, hash_code, time_offset) FROM STDIN"
+                        f"COPY {self._postings_table} (file_ref, hash_code, time_offset) FROM STDIN"
                     ) as copy:
                         for row in posting_rows:
                             copy.write_row(row)
@@ -1865,7 +2117,13 @@ class PostgresHashIndex(HashIndex):
 
     def remove(self, file_id: str) -> None:
         with self._conn.cursor() as cur:
-            cur.execute(f"DELETE FROM {self._postings_table} WHERE file_id = %s", (file_id,))
+            # Postings are keyed by the surrogate; delete by the file's file_ref
+            # (resolved via subselect), then drop the files row.
+            cur.execute(
+                f"DELETE FROM {self._postings_table} WHERE file_ref = "
+                f"(SELECT id FROM {self._files_table} WHERE file_id = %s)",
+                (file_id,),
+            )
             cur.execute(f"DELETE FROM {self._files_table} WHERE file_id = %s", (file_id,))
         self._conn.commit()
 
@@ -1873,8 +2131,10 @@ class PostgresHashIndex(HashIndex):
         code = int(hash_code)
         try:
             with self._conn.cursor() as cur:
+                # JOIN to files to recover the str file_id from the surrogate.
                 cur.execute(
-                    f"SELECT file_id, time_offset FROM {self._postings_table} WHERE hash_code = %s",
+                    f"SELECT f.file_id, p.time_offset FROM {self._postings_table} p "
+                    f"JOIN {self._files_table} f ON f.id = p.file_ref WHERE p.hash_code = %s",
                     (self._encode(code),),
                 )
                 rows = cur.fetchall()
@@ -1893,9 +2153,11 @@ class PostgresHashIndex(HashIndex):
         encoded = [self._encode(code) for code in codes]
         try:
             with self._conn.cursor() as cur:  # single round-trip via array membership
+                # JOIN to files to map each posting's surrogate back to file_id.
                 cur.execute(
-                    f"SELECT hash_code, file_id, time_offset FROM {self._postings_table} "
-                    "WHERE hash_code = ANY(%s)",
+                    f"SELECT p.hash_code, f.file_id, p.time_offset FROM {self._postings_table} p "
+                    f"JOIN {self._files_table} f ON f.id = p.file_ref "
+                    "WHERE p.hash_code = ANY(%s)",
                     (encoded,),
                 )
                 for stored, file_id, time_offset in cur.fetchall():
@@ -1917,14 +2179,20 @@ class PostgresHashIndex(HashIndex):
 
         The query's (hash_code, offset) pairs are passed as two arrays and
         unnested into a derived table, joined to the postings, then grouped by
-        (file_id, delta). Only per-file aggregates return.
+        (file_ref, delta) -- grouping on the small integer surrogate, not the
+        64-char file_id. Only per-file aggregates return; the surrogate is
+        resolved back to the original str ``file_id`` by a single JOIN to the
+        files table in the final SELECT, so the result is keyed by the SAME
+        ``file_id`` as every other backend.
 
         With ``offset_tolerance == 0`` (the default) the winning bin is picked
         server-side as votes DESC then delta ASC, matching the base in-memory
-        tie-break -- unchanged and BYTE-IDENTICAL to before the option existed.
-        With ``> 0`` the compact per-(file, delta) histogram is returned and the
-        banded winner is chosen by the shared :meth:`_banded_winner` so every
-        backend bands identically.
+        tie-break -- unchanged and BYTE-IDENTICAL to before the option existed
+        (partitioning by ``file_ref`` is a 1:1 relabelling of the file_id
+        partitions, so the per-file winning row is unchanged). With ``> 0`` the
+        compact per-(file, delta) histogram is returned and the banded winner is
+        chosen by the shared :meth:`_banded_winner` so every backend bands
+        identically.
 
         ``candidates`` is the OPT-IN prefilter set: ``None`` (the default) returns
         the aggregate for every matched file, byte-identical to before the
@@ -1942,36 +2210,38 @@ class PostgresHashIndex(HashIndex):
             sql = f"""
                 WITH q(hash_code, qoff) AS (SELECT * FROM unnest(%s::bigint[], %s::int[])),
                 matches AS (
-                    SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
+                    SELECT p.file_ref AS file_ref, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
                     FROM {self._postings_table} p JOIN q ON p.hash_code = q.hash_code
                 ),
-                bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
+                bins AS (SELECT file_ref, delta, COUNT(*) AS votes FROM matches GROUP BY file_ref, delta),
                 totals AS (
-                    SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
-                    FROM matches GROUP BY file_id
+                    SELECT file_ref, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
+                    FROM matches GROUP BY file_ref
                 )
-                SELECT b.file_id, b.delta, b.votes, t.total_votes, t.uniq
-                FROM bins b JOIN totals t ON b.file_id = t.file_id
+                SELECT f.file_id, b.delta, b.votes, t.total_votes, t.uniq
+                FROM bins b JOIN totals t ON b.file_ref = t.file_ref
+                JOIN {self._files_table} f ON f.id = b.file_ref
                 """
         else:
             sql = f"""
                 WITH q(hash_code, qoff) AS (SELECT * FROM unnest(%s::bigint[], %s::int[])),
                 matches AS (
-                    SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
+                    SELECT p.file_ref AS file_ref, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
                     FROM {self._postings_table} p JOIN q ON p.hash_code = q.hash_code
                 ),
-                bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
+                bins AS (SELECT file_ref, delta, COUNT(*) AS votes FROM matches GROUP BY file_ref, delta),
                 ranked AS (
-                    SELECT file_id, delta, votes,
-                           ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY votes DESC, delta ASC) AS rn
+                    SELECT file_ref, delta, votes,
+                           ROW_NUMBER() OVER (PARTITION BY file_ref ORDER BY votes DESC, delta ASC) AS rn
                     FROM bins
                 ),
                 totals AS (
-                    SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
-                    FROM matches GROUP BY file_id
+                    SELECT file_ref, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
+                    FROM matches GROUP BY file_ref
                 )
-                SELECT r.file_id, r.delta, r.votes, t.total_votes, t.uniq
-                FROM ranked r JOIN totals t ON r.file_id = t.file_id
+                SELECT f.file_id, r.delta, r.votes, t.total_votes, t.uniq
+                FROM ranked r JOIN totals t ON r.file_ref = t.file_ref
+                JOIN {self._files_table} f ON f.id = r.file_ref
                 WHERE r.rn = 1
                 """
         try:
@@ -1996,24 +2266,27 @@ class PostgresHashIndex(HashIndex):
         threshold = max_df_ratio * file_total
         posts, files = self._postings_table, self._files_table
         with self._conn.cursor() as cur:
+            # Document frequency is distinct surrogates touching a code (1:1 with
+            # distinct file_ids), so COUNT(DISTINCT file_ref) is the same df test.
             cur.execute(
                 f"DELETE FROM {posts} WHERE hash_code IN ("
                 f"  SELECT hash_code FROM {posts} GROUP BY hash_code "
-                f"  HAVING COUNT(DISTINCT file_id) > %s)",
+                f"  HAVING COUNT(DISTINCT file_ref) > %s)",
                 (threshold,),
             )
             removed = cur.rowcount
             if removed:
-                # Recalibrate stored hash_count to remaining postings per file.
+                # Recalibrate stored hash_count to remaining postings per file,
+                # joining the surrogate-keyed counts back to files by id.
                 cur.execute(
                     f"UPDATE {files} f SET metadata = "
                     f"jsonb_set(f.metadata, '{{hash_count}}', to_jsonb(c.cnt)) "
-                    f"FROM (SELECT file_id, COUNT(*) AS cnt FROM {posts} GROUP BY file_id) c "
-                    f"WHERE f.file_id = c.file_id"
+                    f"FROM (SELECT file_ref, COUNT(*) AS cnt FROM {posts} GROUP BY file_ref) c "
+                    f"WHERE f.id = c.file_ref"
                 )
                 cur.execute(
                     f"UPDATE {files} SET metadata = jsonb_set(metadata, '{{hash_count}}', '0'::jsonb) "
-                    f"WHERE file_id NOT IN (SELECT DISTINCT file_id FROM {posts})"
+                    f"WHERE id NOT IN (SELECT DISTINCT file_ref FROM {posts})"
                 )
         self._conn.commit()
         return removed
@@ -2063,14 +2336,17 @@ class PostgresHashIndex(HashIndex):
         metadata: dict[str, dict] = {}
         try:
             with self._conn.cursor() as cur:
-                cur.execute(f"SELECT file_id FROM {self._files_table}")
-                file_ids = [row[0] for row in cur.fetchall()]
-            for file_id in file_ids:
+                # Carry the surrogate id so postings can be read by file_ref; the
+                # ORDER BY hash_code, time_offset is preserved so per-file posting
+                # order is byte-identical to before.
+                cur.execute(f"SELECT id, file_id FROM {self._files_table}")
+                file_rows = cur.fetchall()
+            for file_ref, file_id in file_rows:
                 with self._conn.cursor() as cur:
                     cur.execute(
                         f"SELECT hash_code, time_offset FROM {self._postings_table} "
-                        "WHERE file_id = %s ORDER BY hash_code, time_offset",
-                        (file_id,),
+                        "WHERE file_ref = %s ORDER BY hash_code, time_offset",
+                        (file_ref,),
                     )
                     files[file_id] = [
                         [self._decode(hash_code), int(time_offset)]
