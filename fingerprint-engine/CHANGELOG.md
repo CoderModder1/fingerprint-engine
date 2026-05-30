@@ -91,6 +91,44 @@ stability guarantees and the path to 1.0.
 - README "Tests" section no longer hardcodes a machine-specific absolute path;
   it documents `pip install -e ".[dev]"` and running `pytest` from the repo root.
 
+### Security
+
+Hardening from an adversarial review. None of these change the default fingerprint
+derivation or search ranking (verified byte-identical old-vs-new on a
+text/image/audio/archive corpus across the SQLite and in-memory backends).
+
+- Cross-format index integrity now FAILS CLOSED: adding a fingerprint whose hash
+  format version differs from the index's pinned version raises
+  `FormatVersionMismatchError` instead of only warning and committing the
+  incompatible postings (which silently mixed two hash code spaces and could
+  fabricate matches). Opt into the legacy warn-and-proceed behaviour with
+  `HashIndex.allow_format_mixing = True`. `add_many` validates the whole batch
+  up front, so a rejected cross-format batch leaves the index — and its durable
+  version stamp — completely untouched (all-or-nothing).
+- The corpus hash-format version is now persisted by the durable backends
+  (SQLite/Postgres side meta table, Redis key) and restored on open, so reopening
+  a non-default-config store no longer silently reports the engine baseline and
+  bypasses the cross-format compatibility check. A default corpus records nothing
+  (absent meta == baseline), keeping the default store byte-identical.
+- SQLite (and Postgres) backends serialize all connection access under a
+  per-index re-entrant lock. Previously concurrent `search()` calls — as the
+  FastAPI service issues from its threadpool against one shared index — could
+  interleave the connection-global `_query` temp-table DELETE/INSERT/SELECT and
+  return cross-contaminated rankings or raise `InterfaceError`.
+- The HTTP service enforces `max_file_size_bytes` DURING upload streaming: an
+  oversized body is rejected (413) after at most the limit reaches temp disk,
+  instead of being spooled in full before the engine's post-write size check.
+- The archive handler bounds decompression work against zip/tar bombs: an
+  aggregate decompressed-read budget (`max_total_content_bytes`), a total-entry
+  cap counting every entry including non-file tar entries (`max_entries`), and a
+  tar traversal bound. Over-budget members degrade to their CRC/size identity
+  token (never raising). Normal archives are unaffected.
+- Routing correctness: `.npz` files (numpy vector containers, which are zip
+  archives) are no longer claimed by the generic archive handler off the zip
+  magic. The archive handler declines `.npz` so it routes to `EmbeddingFileHandler`
+  and gets the advertised vector-sequence fingerprint instead of a structural
+  archive one. Ordinary `.zip`/`.tar`/`.tar.gz` routing is unchanged.
+
 ## [0.1.0] - 2026-05-29
 
 Baseline release.

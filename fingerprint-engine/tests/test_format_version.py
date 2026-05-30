@@ -34,6 +34,8 @@ from fingerprint_engine.core.index import (
     SNAPSHOT_FORMAT_VERSION_KEY,
     SNAPSHOT_SCHEMA_VERSION,
     InMemoryHashIndex,
+    RedisHashIndex,
+    SQLiteHashIndex,
 )
 from fingerprint_engine.core.models import (
     FINGERPRINT_FORMAT_VERSION,
@@ -150,14 +152,101 @@ def test_cross_format_query_raises_under_strict() -> None:
     assert isinstance(excinfo.value, FingerprintError)
 
 
-def test_cross_format_add_warns_and_first_writer_wins() -> None:
+def test_cross_format_add_raises_by_default() -> None:
+    # FAIL CLOSED (F1): a cross-format add raises instead of silently committing
+    # incompatible postings into one code space, and leaves the index unchanged.
     index = InMemoryHashIndex()
+    index.add(make_fingerprint("a", [10], version=1))
+
+    with pytest.raises(FormatVersionMismatchError) as excinfo:
+        index.add(make_fingerprint("b", [20], version=2001))
+    assert excinfo.value.query_version == 2001
+    assert excinfo.value.index_version == 1
+    # The rejected add never mutated the index: still one file, still version 1.
+    assert index.file_count == 1
+    assert index.posting_count == 1
+    assert index.format_version == 1
+    assert index.search(make_fingerprint("q", [20], version=1)) == []
+
+
+def test_cross_format_add_allow_mixing_warns_and_first_writer_wins() -> None:
+    # Opt-in legacy behaviour: allow_format_mixing downgrades the hard failure to
+    # a RuntimeWarning and keeps the pinned version (first writer wins).
+    index = InMemoryHashIndex()
+    index.allow_format_mixing = True
     index.add(make_fingerprint("a", [10], version=1))
 
     with pytest.warns(RuntimeWarning, match="do not share a code space"):
         index.add(make_fingerprint("b", [20], version=2001))
     # The index keeps its pinned version; a stray add never re-stamps the corpus.
     assert index.format_version == 1
+
+
+def test_cross_format_add_many_is_atomic_when_failing_closed() -> None:
+    # A mixed-version batch fails closed BEFORE any member is committed AND before
+    # the index version is pinned, so the index is left EXACTLY as it was
+    # (all-or-nothing) -- not partially populated and (critically) not pinned off
+    # the batch's first member. The first member is deliberately NON-default to
+    # prove the version stamp does not leak from a batch that commits nothing.
+    index = InMemoryHashIndex()
+    with pytest.raises(FormatVersionMismatchError):
+        index.add_many(
+            [
+                make_fingerprint("a", [10], version=2001),
+                make_fingerprint("b", [20], version=3001),
+            ]
+        )
+    assert index.file_count == 0
+    assert index.posting_count == 0
+    # The rejected batch must NOT have pinned a version off its first member.
+    assert index.format_version == FINGERPRINT_FORMAT_VERSION
+    # The index is still fresh: a later, consistent default batch is accepted.
+    index.add_many([make_fingerprint("c", [30], version=1)])
+    assert index.file_count == 1
+
+
+def test_sqlite_rejected_cross_format_add_many_persists_no_version(tmp_path: Path) -> None:
+    # The durable counterpart: a rejected cross-format add_many must not leave a
+    # persisted version behind (an empty store reopening as a non-default version
+    # would spuriously reject later default writes/queries).
+    db = tmp_path / "idx.sqlite3"
+    index = SQLiteHashIndex(db)
+    with pytest.raises(FormatVersionMismatchError):
+        index.add_many(
+            [
+                make_fingerprint("a", [1, 2], version=2001),
+                make_fingerprint("b", [3, 4], version=3001),
+            ]
+        )
+    assert index.file_count == 0
+    assert index.posting_count == 0
+    assert index.format_version == FINGERPRINT_FORMAT_VERSION
+    assert index._conn.execute("SELECT COUNT(*) FROM index_meta").fetchone()[0] == 0
+    index.close()
+
+    reopened = SQLiteHashIndex(db)
+    try:
+        assert reopened.format_version == FINGERPRINT_FORMAT_VERSION
+        # The store was not poisoned: a fresh consistent corpus is still accepted.
+        reopened.add(make_fingerprint("c", [5, 6], version=1))
+        assert reopened.file_count == 1
+    finally:
+        reopened.close()
+
+
+def test_redis_rejected_cross_format_add_many_persists_no_version() -> None:
+    client = _fake_redis()
+    index = RedisHashIndex(client=client, key_prefix="rej")
+    with pytest.raises(FormatVersionMismatchError):
+        index.add_many(
+            [
+                make_fingerprint("a", [1, 2], version=2001),
+                make_fingerprint("b", [3, 4], version=3001),
+            ]
+        )
+    assert index.file_count == 0
+    assert client.get("rej:format_version") is None
+    assert RedisHashIndex(client=client, key_prefix="rej").format_version == FINGERPRINT_FORMAT_VERSION
 
 
 def test_empty_index_search_does_not_warn_on_any_version() -> None:
@@ -227,6 +316,120 @@ def test_from_dict_restores_format_version() -> None:
     }
     index = InMemoryHashIndex.from_dict(payload)
     assert index.format_version == 2001
+
+
+# --- F2: durable backends persist the format version across reopen ------------
+
+
+def test_sqlite_reopen_restores_non_default_format_version(tmp_path: Path) -> None:
+    # A SQLite store built with a NON-default config must report its version after
+    # being reopened -- not silently default to baseline (which would bypass the
+    # cross-format compatibility gate entirely after a restart).
+    db = tmp_path / "idx.sqlite3"
+    source = SQLiteHashIndex(db)
+    source.add(make_fingerprint("a", [1, 2, 3], version=1001))
+    assert source.format_version == 1001
+    source.close()
+
+    reopened = SQLiteHashIndex(db)
+    try:
+        assert reopened.format_version == 1001
+        # The gate now works after restart: a default-version query is a mismatch.
+        with pytest.raises(FormatVersionMismatchError):
+            reopened.search(
+                make_fingerprint("q", [1, 2, 3], version=1), strict_format=True
+            )
+    finally:
+        reopened.close()
+
+
+def test_sqlite_default_corpus_writes_no_meta_and_reopens_default(tmp_path: Path) -> None:
+    # A DEFAULT corpus records NOTHING in the meta table (absent == default), so a
+    # default store stays byte-identical and reopens at the baseline version.
+    db = tmp_path / "idx.sqlite3"
+    source = SQLiteHashIndex(db)
+    source.add(make_fingerprint("a", [1, 2, 3]))  # default version
+    meta_rows = source._conn.execute("SELECT COUNT(*) FROM index_meta").fetchone()[0]
+    source.close()
+    assert meta_rows == 0
+
+    reopened = SQLiteHashIndex(db)
+    try:
+        assert reopened.format_version == FINGERPRINT_FORMAT_VERSION
+    finally:
+        reopened.close()
+
+
+def test_sqlite_legacy_db_without_meta_table_opens_as_default(tmp_path: Path) -> None:
+    # A persistent DB written before index_meta existed must still open (the table
+    # is created transparently) and report the default until its next write.
+    import sqlite3
+
+    db = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE files (id INTEGER PRIMARY KEY, file_id TEXT UNIQUE NOT NULL, metadata TEXT NOT NULL);"
+        "CREATE TABLE postings (file_ref INTEGER NOT NULL, hash_code INTEGER NOT NULL, time_offset INTEGER NOT NULL);"
+    )
+    conn.commit()
+    conn.close()
+
+    index = SQLiteHashIndex(db)
+    try:
+        assert index.format_version == FINGERPRINT_FORMAT_VERSION
+        # The first non-default add now pins + persists, so a reopen would restore.
+        index.add(make_fingerprint("a", [1, 2, 3], version=1001))
+        assert index._conn.execute(
+            "SELECT value FROM index_meta WHERE key = ?", (SNAPSHOT_FORMAT_VERSION_KEY,)
+        ).fetchone()[0] == "1001"
+    finally:
+        index.close()
+
+
+def _fake_redis():
+    fakeredis = pytest.importorskip("fakeredis", exc_type=ImportError)
+    return fakeredis.FakeStrictRedis(decode_responses=True)
+
+
+def test_redis_reopen_restores_non_default_format_version() -> None:
+    client = _fake_redis()
+    source = RedisHashIndex(client=client, key_prefix="ver")
+    source.add(make_fingerprint("a", [1, 2, 3], version=1001))
+    assert source.format_version == 1001
+    assert client.get("ver:format_version") == "1001"
+
+    reopened = RedisHashIndex(client=client, key_prefix="ver")
+    assert reopened.format_version == 1001
+
+
+def test_redis_default_corpus_writes_no_version_key() -> None:
+    client = _fake_redis()
+    source = RedisHashIndex(client=client, key_prefix="ver")
+    source.add(make_fingerprint("a", [1, 2, 3]))  # default version
+    assert client.get("ver:format_version") is None
+    assert RedisHashIndex(client=client, key_prefix="ver").format_version == FINGERPRINT_FORMAT_VERSION
+
+
+def test_sqlite_non_default_add_many_persists_and_reopens(tmp_path: Path) -> None:
+    # The non-default bulk-ingest path (previously uncovered): a consistent
+    # non-default add_many pins + persists the version and survives reopen.
+    db = tmp_path / "idx.sqlite3"
+    index = SQLiteHashIndex(db)
+    index.add_many(
+        [
+            make_fingerprint("a", [1, 2], version=1001),
+            make_fingerprint("b", [3, 4], version=1001),
+        ]
+    )
+    assert index.format_version == 1001
+    assert index.file_count == 2
+    index.close()
+
+    reopened = SQLiteHashIndex(db)
+    try:
+        assert reopened.format_version == 1001
+    finally:
+        reopened.close()
 
 
 # --- 3. each opt-in hash-changer records a different effective version --------

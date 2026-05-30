@@ -18,7 +18,9 @@ import pytest
 from fingerprint_engine.core.fingerprinter import Fingerprinter
 from fingerprint_engine.core.index import InMemoryHashIndex
 from fingerprint_engine.handlers.archive_handler import (
+    DEFAULT_MAX_ARCHIVE_ENTRIES,
     DEFAULT_MAX_ARCHIVE_MEMBERS,
+    DEFAULT_MAX_TOTAL_CONTENT_BYTES,
     ArchiveFileHandler,
 )
 
@@ -228,6 +230,10 @@ def test_rejects_negative_caps() -> None:
         ArchiveFileHandler(max_members=-1)
     with pytest.raises(ValueError, match="max_member_content_bytes"):
         ArchiveFileHandler(max_member_content_bytes=-1)
+    with pytest.raises(ValueError, match="max_entries"):
+        ArchiveFileHandler(max_entries=-1)
+    with pytest.raises(ValueError, match="max_total_content_bytes"):
+        ArchiveFileHandler(max_total_content_bytes=-1)
 
 
 def test_empty_archive_loads_without_error(tmp_path: Path) -> None:
@@ -280,3 +286,124 @@ def test_content_changed_same_name_size_still_differs(tmp_path: Path) -> None:
     digest_a = handler.load(p_a).members[0].digest
     digest_b = handler.load(p_b).members[0].digest
     assert digest_a != digest_b
+
+
+# ---------------------------------------------------------------------------
+# F5: decompression-bomb bounds (aggregate budget + total-entry cap)
+# ---------------------------------------------------------------------------
+
+
+def test_default_new_caps_are_applied() -> None:
+    handler = ArchiveFileHandler()
+    assert handler.max_entries == DEFAULT_MAX_ARCHIVE_ENTRIES
+    assert handler.max_total_content_bytes == DEFAULT_MAX_TOTAL_CONTENT_BYTES
+
+
+def test_normal_archive_is_byte_identical_with_caps_default_vs_disabled(tmp_path: Path) -> None:
+    # The new bounds must not perturb a normal small archive: members, sizes, and
+    # content digests are identical with caps at their defaults vs fully disabled.
+    path = tmp_path / "normal.zip"
+    _make_zip(path, _base_members(12))
+
+    default = ArchiveFileHandler().load(path)
+    disabled = ArchiveFileHandler(
+        max_entries=0, max_total_content_bytes=0
+    ).load(path)
+
+    as_ids = [(m.name, m.size, m.digest) for m in default.members]
+    bs_ids = [(m.name, m.size, m.digest) for m in disabled.members]
+    assert as_ids == bs_ids
+    assert default.truncated is False
+    # And the produced signal is identical too (same downstream hashes).
+    handler = ArchiveFileHandler()
+    assert (handler.to_signal(default) == handler.to_signal(disabled)).all()
+
+
+def test_aggregate_content_budget_falls_back_to_identity_tokens(tmp_path: Path) -> None:
+    # Many small members whose TOTAL content exceeds the aggregate budget: the
+    # first members are content-digested (sha1, 40 hex chars), then the budget is
+    # exhausted and the rest fall back to CRC tokens -- never a multi-GiB read.
+    members = [(f"m{i}.bin", b"a" * (300 * 1024)) for i in range(6)]  # ~1.8 MiB total
+    path = tmp_path / "big.zip"
+    _make_zip(path, members)
+
+    payload = ArchiveFileHandler(max_total_content_bytes=400 * 1024).load(path)
+    sha1_members = [m for m in payload.members if len(m.digest) == 40]
+    crc_members = [m for m in payload.members if m.digest.startswith("crc:")]
+    assert sha1_members, "at least one member should be content-digested"
+    assert crc_members, "the budget should force a fallback for later members"
+    assert payload.truncated is True
+
+    # With the budget disabled every member is content-digested (no fallback).
+    uncapped = ArchiveFileHandler(max_total_content_bytes=0).load(path)
+    assert all(len(m.digest) == 40 for m in uncapped.members)
+    assert uncapped.truncated is False
+
+
+def test_tar_total_entry_cap_counts_non_file_entries(tmp_path: Path) -> None:
+    # The prior tar cap counted only regular files, so a flood of directory (or
+    # symlink) entries iterated unbounded. The total-entry cap now stops it.
+    path = tmp_path / "flood.tar"
+    with tarfile.open(path, "w") as archive:
+        for i in range(40):
+            directory = tarfile.TarInfo(f"d{i}/")
+            directory.type = tarfile.DIRTYPE
+            archive.addfile(directory)
+        data = b"hello world " * 50
+        member = tarfile.TarInfo("real.txt")
+        member.size = len(data)
+        archive.addfile(member, io.BytesIO(data))
+
+    capped = ArchiveFileHandler(max_entries=10).load(path)
+    # Iteration stopped within the directory flood, before the trailing file.
+    assert capped.truncated is True
+
+    # With a generous entry cap the single real file is found and digested.
+    full = ArchiveFileHandler(max_entries=1000).load(path)
+    assert [m.name for m in full.members] == ["real.txt"]
+    assert full.truncated is False
+
+
+def test_aggregate_budget_never_raises_on_pathological_archive(tmp_path: Path) -> None:
+    # Degrade-don't-abort: even when the aggregate budget trips, load() returns a
+    # valid (truncated) payload rather than raising, preserving the fail-soft
+    # contract. Members are content-eligible (<= per-member cap) but their TOTAL
+    # exceeds the aggregate budget, so the budget -- not the per-member cap -- bites.
+    members = [(f"m{i}.bin", b"z" * (50 * 1024)) for i in range(20)]
+    path = tmp_path / "pathological.zip"
+    _make_zip(path, members)
+    payload = ArchiveFileHandler(
+        max_total_content_bytes=128 * 1024, max_member_content_bytes=64 * 1024
+    ).load(path)
+    assert payload.members  # still produced a structural fingerprint
+    assert payload.truncated is True
+
+
+# ---------------------------------------------------------------------------
+# Routing: .npz is a numpy vector container (a zip), owned by the embedding
+# handler -- the generic archive handler must decline it despite the zip magic.
+# ---------------------------------------------------------------------------
+
+
+def test_npz_is_declined_by_archive_and_routes_to_embedding(tmp_path: Path) -> None:
+    import numpy as np  # core dependency, always available
+
+    npz = tmp_path / "vecs.npz"
+    np.savez(npz, a=np.arange(96, dtype=np.float32).reshape(12, 8))
+    sample = npz.read_bytes()[:16]
+    # .npz carries the zip magic, so the magic sniff WOULD score it 0.90 and
+    # out-rank the embedding handler's 0.80 -- the archive handler must decline.
+    assert sample.startswith(b"PK")
+    assert ArchiveFileHandler.can_handle(npz, sample=sample) == 0.0
+    # End-to-end: a real .npz routes to the embedding handler, not archive, so it
+    # gets the advertised vector-sequence fingerprint rather than a structural one.
+    fingerprint = Fingerprinter().fingerprint_file(npz)
+    assert fingerprint.handler == "embedding"
+
+
+def test_real_zip_still_routes_to_archive(tmp_path: Path) -> None:
+    # Regression guard: the .npz decline must not affect ordinary archives.
+    path = tmp_path / "real.zip"
+    _make_zip(path, _base_members(6))
+    assert ArchiveFileHandler.can_handle(path, sample=path.read_bytes()[:16]) > 0.0
+    assert Fingerprinter().fingerprint_file(path).handler == "archive"

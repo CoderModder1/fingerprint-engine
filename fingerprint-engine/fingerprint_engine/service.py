@@ -22,6 +22,11 @@ Concurrency contract
 ---------------------
 One :class:`Fingerprinter` is constructed at app startup and reused across all
 requests (fingerprinting is pure/stateless per call, so it is safe to share).
+Within a single process this is concurrency-safe even though Starlette dispatches
+the sync endpoint handlers to a threadpool: the in-memory backend's reads are
+lock-free and its writes lock-serialized, and the SQLite/PostgreSQL backends
+serialize ALL connection access under a per-index re-entrant lock (so concurrent
+``/search`` requests can no longer interleave the shared SQLite scratch table).
 The index follows the engine's Tier-2 concurrency contract: a SINGLE logical
 writer. ``POST /index`` mutates the index; the in-memory backend serializes
 mutations under its own re-entrant lock, while the SQLite/PostgreSQL backends
@@ -238,17 +243,40 @@ def create_app(
         is written to a NamedTemporaryFile, fingerprinted, then deleted. The
         original client filename is restored on the result so ``metadata`` /
         ``path`` reflect the upload rather than the throwaway temp name.
+
+        The ``max_file_size_bytes`` limit is enforced DURING the stream (F4): the
+        engine's stat-based guard only fires AFTER the whole body is on disk, so
+        without an in-loop check an oversized upload would fill temp disk and burn
+        worker time before being rejected. Here a running byte count aborts as soon
+        as the limit is exceeded, so at most ``limit`` bytes ever reach disk; the
+        same :class:`FileTooLargeError` is raised, mapped to 413 exactly as before.
+        For any in-limit upload the spooled bytes are identical, so the resulting
+        fingerprint is unchanged.
         """
 
+        limit = fingerprinter.config.max_file_size_bytes  # 0 = unlimited
         suffix = Path(upload.filename or "").suffix
         tmp = tempfile.NamedTemporaryFile(prefix="fp_upload_", suffix=suffix, delete=False)
         try:
             # Stream the body to disk in chunks so a large upload is never held
-            # fully in memory here (the size guard then runs against the file).
+            # fully in memory here, counting bytes so the size guard fires at
+            # ingest rather than after the whole (possibly hostile) body is spooled.
+            written = 0
             while True:
-                chunk = upload.file.read(1024 * 1024)
+                # Read no more than one byte past the limit so an over-limit upload
+                # is detected without pulling an extra full chunk into memory.
+                to_read = 1024 * 1024 if limit <= 0 else min(1024 * 1024, limit - written + 1)
+                chunk = upload.file.read(to_read)
                 if not chunk:
                     break
+                written += len(chunk)
+                if limit > 0 and written > limit:
+                    tmp.close()
+                    raise FileTooLargeError(
+                        f"upload exceeds max_file_size_bytes limit of {limit} bytes",
+                        size=written,
+                        limit=limit,
+                    )
                 tmp.write(chunk)
             tmp.flush()
             tmp.close()

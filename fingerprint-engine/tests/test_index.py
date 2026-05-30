@@ -713,6 +713,70 @@ def test_in_memory_concurrent_add_and_search_stay_consistent() -> None:
     assert {r.file_id for r in index.search(make_fingerprint("q", [1, 2, 3]), top_k=100)} == set(file_ids)
 
 
+def _fp_codes(file_id: str, codes: list[int]) -> Fingerprint:
+    """A fingerprint with EXPLICIT hash codes (so two files can be disjoint)."""
+
+    hashes = [
+        ConstellationHash(
+            hash_code=code,
+            time_offset=index,
+            anchor_time=index,
+            target_time=index + 1,
+            freq1=0,
+            freq2=0,
+            delta_t=1,
+        )
+        for index, code in enumerate(codes)
+    ]
+    return Fingerprint(
+        file_id=file_id,
+        path=f"/tmp/{file_id}",
+        handler="test",
+        size_bytes=len(codes),
+        content_sha256=file_id,
+        config={},
+        hashes=hashes,
+    )
+
+
+def test_sqlite_concurrent_search_is_consistent_and_uncorrupted() -> None:
+    # Regression for the connection-global ``_query`` TEMP TABLE: concurrent
+    # search() calls on one SQLite-backed index (exactly what the FastAPI
+    # threadpool issues against the shared active_index) must not interleave the
+    # DELETE/INSERT/SELECT steps into an InterfaceError or cross-contaminated
+    # rankings. Two files with DISJOINT hash spaces: a query that overlaps only
+    # one must NEVER return the other. Without the @_synchronized serialization
+    # this raises and/or returns the wrong file (reproduced live in review).
+    index = SQLiteHashIndex(":memory:")
+    index.add(_fp_codes("A", list(range(1000, 1100))))
+    index.add(_fp_codes("B", list(range(2000, 2100))))
+
+    errors: list[BaseException] = []
+    contaminated: list[tuple[str, str]] = []
+    n = 16
+    barrier = threading.Barrier(n)
+
+    def worker(which: str) -> None:
+        try:
+            barrier.wait()
+            codes = list(range(1000, 1100)) if which == "A" else list(range(2000, 2100))
+            for _ in range(25):
+                results = index.search(_fp_codes("q", codes), top_k=5)
+                if results and results[0].file_id != which:
+                    contaminated.append((which, results[0].file_id))
+        except BaseException as exc:  # noqa: BLE001 - surface any thread failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=("A" if i % 2 else "B",)) for i in range(n)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors, errors[:1]
+    assert not contaminated, contaminated[:3]
+
+
 def test_in_memory_concurrent_readd_remove_never_keyerrors_readers() -> None:
     # Reproduces the surrogate-deref concurrency regression: lock-free readers
     # (search()/query()) read a posting list and THEN dereference the surrogate

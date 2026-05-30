@@ -11,6 +11,8 @@ self-match, plus sane ``/list``, ``/dedup`` and ``/health`` JSON.
 from __future__ import annotations
 
 import sys
+import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from fingerprint_engine.core.exceptions import MissingDependencyError  # noqa: E402
 from fingerprint_engine.core.index import InMemoryHashIndex, SQLiteHashIndex  # noqa: E402
+from fingerprint_engine.core.models import FingerprintConfig  # noqa: E402
 from fingerprint_engine.service import build_index, create_app  # noqa: E402
 
 
@@ -199,6 +202,60 @@ def test_dedup_handles_featureless_upload_without_aborting() -> None:
     assert body["exact_cluster_count"] == 0
     assert body["near_duplicate_cluster_count"] == 0
     assert body["singletons"] == 2
+
+
+def _small_limit_client(limit: int) -> TestClient:
+    config = replace(FingerprintConfig(), max_file_size_bytes=limit)
+    return TestClient(create_app(index=InMemoryHashIndex(), config=config))
+
+
+def test_oversized_upload_is_rejected_with_413() -> None:
+    # F4: an upload larger than max_file_size_bytes must be rejected at ingest.
+    client = _small_limit_client(4096)
+    response = client.post("/fingerprint", files=_upload("big.bin", b"x" * (4096 * 8)))
+    assert response.status_code == 413
+
+
+def test_oversized_upload_is_not_fully_spooled_to_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    # F4: the guard must fire DURING the stream, so an oversized body never lands
+    # wholesale on temp disk -- at most ~limit bytes are written before the abort.
+    limit = 4096
+    written = {"total": 0}
+    real_ntf = tempfile.NamedTemporaryFile
+
+    class _CountingTemp:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._f = real_ntf(*args, **kwargs)
+            self.name = self._f.name
+
+        def write(self, data: bytes) -> int:
+            written["total"] += len(data)
+            return self._f.write(data)
+
+        def flush(self) -> None:
+            self._f.flush()
+
+        def close(self) -> None:
+            self._f.close()
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", _CountingTemp)
+    client = _small_limit_client(limit)
+    response = client.post("/fingerprint", files=_upload("big.bin", b"x" * (limit * 16)))
+    assert response.status_code == 413
+    # The whole 64 KiB body was never spooled; only up to the limit reached disk.
+    assert written["total"] <= limit
+
+
+def test_at_limit_upload_succeeds_and_no_temp_file_leaks(tmp_path: Path) -> None:
+    # A file exactly at the limit is accepted (matching the engine's '> limit'
+    # rule), and neither the success nor the reject path leaves a temp file behind.
+    leftovers_before = list(Path(tempfile.gettempdir()).glob("fp_upload_*"))
+    client = _small_limit_client(8192)
+    ok = client.post("/fingerprint", files=_upload("ok.py", _featured_lines(seed=42)[:8192]))
+    assert ok.status_code == 200
+    client.post("/fingerprint", files=_upload("big.bin", b"x" * 65536))  # rejected
+    leftovers_after = list(Path(tempfile.gettempdir()).glob("fp_upload_*"))
+    assert leftovers_after == leftovers_before
 
 
 def test_index_round_trip_with_sqlite_backend(tmp_path: Path) -> None:

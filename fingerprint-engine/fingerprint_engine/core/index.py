@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -12,9 +13,9 @@ import time
 import warnings
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
 from .exceptions import FormatVersionMismatchError, InvalidSnapshotError
 from .models import (
@@ -94,6 +95,30 @@ def _in_hash_range(hash_code: int) -> bool:
     return _HASH_CODE_MIN <= hash_code <= _HASH_CODE_MAX
 
 
+_BackendMethod = TypeVar("_BackendMethod", bound=Callable[..., Any])
+
+
+def _synchronized(method: _BackendMethod) -> _BackendMethod:
+    """Run a backend method while holding ``self._lock`` (the per-index RLock).
+
+    Used by the SQL backends (F3): a single shared DB connection is one serial
+    command stream, so concurrent FastAPI-threadpool requests would otherwise
+    interleave the multi-statement critical sections -- the SQLite ``_query`` temp
+    table, the write transactions -- and corrupt results or raise ``InterfaceError``.
+    Serializing every connection-touching method closes that race. The lock is
+    re-entrant (``RLock``), so a method that calls another synchronized method
+    (``add`` -> ``remove``, ``to_dict`` -> ``_metadata_for``) never self-deadlocks,
+    and it is uncontended on the single-threaded path so output is byte-identical.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return cast(_BackendMethod, wrapper)
+
+
 class HashIndex(ABC):
     """Storage-agnostic contract for searchable fingerprint postings."""
 
@@ -105,6 +130,14 @@ class HashIndex(ABC):
     # independent of the storage backend.
     _format_version: int = FINGERPRINT_FORMAT_VERSION
     _format_version_pinned: bool = False
+    # Cross-format ADD policy (F1). ``False`` (the default) FAILS CLOSED: adding a
+    # fingerprint whose hash format version differs from this index's pinned
+    # version raises :class:`FormatVersionMismatchError`, so postings from an
+    # incompatible code space can never silently contaminate the index. Set
+    # ``True`` to restore the legacy fail-soft behaviour (a :class:`RuntimeWarning`,
+    # first-writer-wins). A default single-config corpus reports one version, so
+    # neither branch is ever reached for it and the add path stays byte-identical.
+    allow_format_mixing: bool = False
 
     @property
     def format_version(self) -> int:
@@ -123,29 +156,107 @@ class HashIndex(ABC):
     def _record_format_version(self, fingerprint: Fingerprint) -> None:
         """Pin (or check against) the index's format version from a fingerprint.
 
-        The first recorded fingerprint pins the index's format version. A later
+        The first recorded fingerprint pins the index's format version, and -- for
+        a NON-default version on a durable backend -- persists it via
+        :meth:`_persist_format_version` so reopening the store restores the corpus
+        version instead of silently defaulting to the engine baseline (F2). A later
         fingerprint whose recorded version DIFFERS is an attempt to mix
-        incompatible hash derivations in one index (their codes do not share a
-        space), so it is surfaced as a :class:`RuntimeWarning` -- loud but
-        non-fatal, mirroring the engine's fail-soft ingest -- and the index
-        keeps its pinned version (the first writer wins), so a stray cross-format
-        add never silently re-stamps the whole corpus.
+        incompatible hash derivations in one index: their codes do not share a
+        space, so any later "match" between them is invalid, not merely weak. By
+        default this FAILS CLOSED (F1) -- it raises
+        :class:`FormatVersionMismatchError` so the contaminating postings never
+        enter the index. Setting :attr:`allow_format_mixing` restores the legacy
+        fail-soft behaviour (a :class:`RuntimeWarning`, first-writer-wins). A
+        default single-config corpus reports one version, so neither the persist
+        nor the mismatch branch is ever reached and the add path is byte-identical.
         """
 
         incoming = fingerprint.format_version
         if not self._format_version_pinned:
             self._format_version = incoming
             self._format_version_pinned = True
+            # The default version needs no durable record: an absent meta is read
+            # back AS the default (see _load_persisted_format_version), so only a
+            # non-default corpus writes the meta -- keeping the default path's
+            # storage and commit pattern byte-identical.
+            if incoming != FINGERPRINT_FORMAT_VERSION:
+                self._persist_format_version(incoming)
             return
         if incoming != self._format_version:
-            warnings.warn(
-                f"adding a fingerprint with hash format version {incoming} to an "
-                f"index built at version {self._format_version}; their hash codes "
-                "do not share a code space, so matches between them are invalid. "
-                "Re-index with a single, consistent FingerprintConfig.",
-                RuntimeWarning,
-                stacklevel=3,
+            message = self._format_mismatch_message(incoming, self._format_version)
+            if self.allow_format_mixing:
+                warnings.warn(message, RuntimeWarning, stacklevel=3)
+                return
+            raise FormatVersionMismatchError(
+                message, query_version=incoming, index_version=self._format_version
             )
+
+    @staticmethod
+    def _format_mismatch_message(incoming: int, index_version: int) -> str:
+        return (
+            f"adding a fingerprint with hash format version {incoming} to an "
+            f"index built at version {index_version}; their hash codes "
+            "do not share a code space, so matches between them are invalid. "
+            "Re-index with a single, consistent FingerprintConfig."
+        )
+
+    def _validate_batch_format(self, fingerprints: list[Fingerprint]) -> None:
+        """Fail-closed PRE-CHECK for :meth:`add_many`: verify the whole batch.
+
+        Confirms every member shares ONE format version and matches the index's
+        pinned version (the first member sets the tentative version for an as-yet
+        unpinned index), WITHOUT pinning or persisting anything. Calling it before
+        any mutation makes ``add_many`` truly all-or-nothing on a cross-format
+        batch: a rejected batch leaves the index -- and its DURABLE version stamp
+        -- completely untouched, instead of pinning/persisting the first member's
+        version off a batch that then rolls back. A no-op when
+        :attr:`allow_format_mixing` is set (that legacy path warns per member
+        during the write and proceeds, first-writer-wins).
+        """
+
+        if self.allow_format_mixing:
+            return
+        reference = self._format_version if self._format_version_pinned else None
+        for fingerprint in fingerprints:
+            incoming = fingerprint.format_version
+            if reference is None:
+                reference = incoming
+                continue
+            if incoming != reference:
+                raise FormatVersionMismatchError(
+                    self._format_mismatch_message(incoming, reference),
+                    query_version=incoming,
+                    index_version=reference,
+                )
+
+    def _persist_format_version(self, version: int) -> None:  # noqa: B027 - intentional no-op hook
+        """Hook: durably record the just-pinned NON-default format version.
+
+        Default no-op: the in-memory backend has no durable store of its own (its
+        version travels with the JSON snapshot via :meth:`save` /
+        :meth:`load_snapshot`). Durable backends (SQLite/Redis/Postgres) override
+        this to write the version into a side meta table/key so a reopen restores
+        the corpus version. Only ever called for a non-default version, so it never
+        touches storage on the default path.
+        """
+
+    def _load_persisted_format_version(self, raw: object) -> None:
+        """Pin the format version a durable backend read back when it opened.
+
+        Mirrors :func:`_snapshot_format_version`'s tolerant rule: a parseable int
+        pins that version; an absent/garbage value leaves the index at the unpinned
+        engine default, so a legacy store written before the meta existed behaves
+        exactly as today until its next write re-pins (and persists) the version.
+        """
+
+        if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+            return
+        try:
+            version = int(raw)
+        except ValueError:
+            return
+        self._format_version = version
+        self._format_version_pinned = True
 
     @property
     @abstractmethod
@@ -879,7 +990,14 @@ class InMemoryHashIndex(HashIndex):
         # observes the batch half-applied; the per-add() effect is otherwise
         # identical to the sequential default.
         with self._write_lock:
-            for fingerprint in fingerprints:
+            materialized = list(fingerprints)
+            # Fail-closed (F1): validate the WHOLE batch up front WITHOUT pinning
+            # or persisting, so a cross-format batch raises BEFORE any mutation and
+            # leaves the index (and its version) untouched -- true all-or-nothing,
+            # like the single-transaction SQL backends. A no-op under
+            # allow_format_mixing, where per-item add() warns and proceeds instead.
+            self._validate_batch_format(materialized)
+            for fingerprint in materialized:
                 self.add(fingerprint)
 
     def remove(self, file_id: str) -> None:
@@ -1100,6 +1218,10 @@ class RedisHashIndex(HashIndex):
         <p>:f:<file_id>      LIST of "<hash_code>:<time_offset>" (removal + export)
         <p>:m:<file_id>      STRING json metadata
         <p>:npostings        INT  total posting count
+        <p>:format_version   STRING corpus hash-format version (only if non-default)
+
+    Concurrency: a ``redis-py`` client and its pipelines are thread-safe, so this
+    backend needs no extra lock (unlike the single-connection SQL backends).
     """
 
     def __init__(
@@ -1121,6 +1243,19 @@ class RedisHashIndex(HashIndex):
                 ) from exc
             client_kwargs.setdefault("decode_responses", True)
             self._redis = redis.Redis.from_url(url, **client_kwargs)
+        # F2: restore the corpus hash-format version from its durable key so a
+        # reopen against the same store reports the right version instead of
+        # silently defaulting to baseline. Absent (a fresh store, or one built by
+        # an older version / a default corpus) -> stay at the unpinned default.
+        raw = self._redis.get(self._key("format_version"))
+        if raw is not None:
+            self._load_persisted_format_version(self._text(raw))
+
+    def _persist_format_version(self, version: int) -> None:
+        # F2: stamp the pinned (non-default) version under a dedicated key so a
+        # reopen restores it. Only ever called once, on first pin of a non-default
+        # corpus, so the default path never writes this key.
+        self._redis.set(self._key("format_version"), str(version))
 
     def _key(self, *parts: str) -> str:
         return ":".join((self.key_prefix, *parts))
@@ -1177,6 +1312,10 @@ class RedisHashIndex(HashIndex):
         per file.
         """
 
+        # Fail-closed PRE-CHECK (no pin/persist) so a cross-format batch raises
+        # before any write OR version stamp -- true all-or-nothing (F1).
+        fingerprints = list(fingerprints)
+        self._validate_batch_format(fingerprints)
         # Collapse to the surviving (last) fingerprint per file_id, preserving
         # the order in which each file_id first appeared for deterministic ops.
         survivors: dict[str, Fingerprint] = {}
@@ -1363,6 +1502,15 @@ class SQLiteHashIndex(HashIndex):
         database: str | Path = "fingerprint_index.sqlite3",
         connection: sqlite3.Connection | None = None,
     ) -> None:
+        # Serializes access to the single shared connection (F3). The connection
+        # is opened check_same_thread=False so the FastAPI threadpool can touch it
+        # from many threads; a SQLite connection is one serial command stream, so
+        # the multi-statement critical sections (the _aggregate temp table, the
+        # write transactions) MUST be serialized or concurrent requests interleave
+        # and corrupt results. RLock (not Lock) because add() calls remove() and
+        # _record_format_version(), and search() composes query_many()+_aggregate().
+        # Uncontended in the single-threaded path, so output is byte-identical.
+        self._lock = threading.RLock()
         if connection is not None:
             self._conn = connection
         else:
@@ -1402,9 +1550,38 @@ class SQLiteHashIndex(HashIndex):
             );
             CREATE INDEX IF NOT EXISTS idx_postings_hash ON postings(hash_code);
             CREATE INDEX IF NOT EXISTS idx_postings_file ON postings(file_ref);
+            -- Side table recording the corpus hash-format version (F2). A row is
+            -- written only for a NON-default corpus (see _persist_format_version);
+            -- absent => default version, so a default store has an empty meta and
+            -- is byte-identical to before. Never read by to_dict/search.
+            CREATE TABLE IF NOT EXISTS index_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         self._conn.commit()
+        # Restore the durably-stored hash format version (F2) so a reopened store
+        # reports the corpus version rather than silently defaulting to baseline.
+        # Absent (a fresh DB, or a legacy DB written before this table) -> stay at
+        # the unpinned default, matching prior behaviour until the next add.
+        row = self._conn.execute(
+            "SELECT value FROM index_meta WHERE key = ?", (SNAPSHOT_FORMAT_VERSION_KEY,)
+        ).fetchone()
+        if row is not None:
+            self._load_persisted_format_version(row[0])
+
+    def _persist_format_version(self, version: int) -> None:
+        # F2: stamp the pinned (non-default) version into the side meta table so a
+        # reopen restores it. Self-contained commit (only ever runs once, on first
+        # pin of a non-default corpus) so it survives even if the triggering add
+        # later fails, and never leaves a dangling transaction.
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+                (SNAPSHOT_FORMAT_VERSION_KEY, str(version)),
+            )
+            self._conn.commit()
 
     def _postings_columns(self) -> set[str]:
         """Column names of the existing ``postings`` table (empty set if absent)."""
@@ -1490,13 +1667,16 @@ class SQLiteHashIndex(HashIndex):
         return int(stored) + cls._SIGNED_OFFSET
 
     @property
+    @_synchronized
     def file_count(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
 
     @property
+    @_synchronized
     def posting_count(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) FROM postings").fetchone()[0])
 
+    @_synchronized
     def add(self, fingerprint: Fingerprint) -> None:
         self._record_format_version(fingerprint)
         self.remove(fingerprint.file_id)
@@ -1527,6 +1707,7 @@ class SQLiteHashIndex(HashIndex):
         )
         self._conn.commit()
 
+    @_synchronized
     def add_many(self, fingerprints: Iterable[Fingerprint]) -> None:
         """Ingest the whole batch in ONE transaction (one commit, not per file).
 
@@ -1538,6 +1719,12 @@ class SQLiteHashIndex(HashIndex):
         ``executemany`` for all postings is the bulk-ingest win.
         """
 
+        # Fail-closed PRE-CHECK (no pin/persist) so a cross-format batch raises
+        # before any write OR version stamp -- true all-or-nothing (F1). Without
+        # it the first member would pin+persist the version off a batch that then
+        # rolls back, leaving an empty store reporting a non-default version.
+        fingerprints = list(fingerprints)
+        self._validate_batch_format(fingerprints)
         # Last-wins per file_id: a sequential add() of a repeated file_id removes
         # the earlier copy, so only the final fingerprint survives. Collapsing
         # here also avoids the files PRIMARY KEY conflict a naive re-insert hits.
@@ -1611,6 +1798,7 @@ class SQLiteHashIndex(HashIndex):
             raise
         self._conn.commit()
 
+    @_synchronized
     def remove(self, file_id: str) -> None:
         # Resolve the surrogate first so postings (keyed by file_ref) can be
         # deleted, then drop the files row. A subselect keeps it one round-trip.
@@ -1621,6 +1809,7 @@ class SQLiteHashIndex(HashIndex):
         self._conn.execute("DELETE FROM files WHERE file_id = ?", (file_id,))
         self._conn.commit()
 
+    @_synchronized
     def query(self, hash_code: int) -> list[IndexPosting]:
         code = int(hash_code)
         # JOIN postings -> files to recover the original str file_id from the
@@ -1635,6 +1824,7 @@ class SQLiteHashIndex(HashIndex):
             for row in rows
         ]
 
+    @_synchronized
     def query_many(self, hash_codes: Iterable[int]) -> dict[int, list[IndexPosting]]:
         codes = list({int(c) for c in hash_codes})
         results: dict[int, list[IndexPosting]] = {code: [] for code in codes}
@@ -1657,6 +1847,7 @@ class SQLiteHashIndex(HashIndex):
                 )
         return results
 
+    @_synchronized
     def _aggregate(
         self,
         fingerprint: Fingerprint,
@@ -1664,6 +1855,13 @@ class SQLiteHashIndex(HashIndex):
         candidates: set[str] | None = None,
     ) -> dict[str, tuple[int, int, int, int]]:
         """Aggregate the offset histogram server-side via a single SQL pass.
+
+        Re-entrancy/concurrency (F3): the shared ``_query`` temp table below is a
+        connection-global scratch space, so this whole method is serialized by the
+        per-index ``RLock`` (via ``@_synchronized``) -- without it, two threads in
+        the FastAPI threadpool would interleave the DELETE/INSERT/SELECT steps on
+        the one connection and cross-contaminate or corrupt rankings. The lock is
+        uncontended single-threaded, so the produced rows are byte-identical.
 
         Loads the query's (hash_code, offset) pairs into a temp table, joins to
         the postings, and groups by (file_ref, delta) -- so only per-file
@@ -1754,6 +1952,7 @@ class SQLiteHashIndex(HashIndex):
             for file_id, delta, votes, total, uniq in rows
         }
 
+    @_synchronized
     def prune_stop_hashes(self, max_df_ratio: float = 0.1) -> int:
         file_total = self.file_count
         if file_total == 0:
@@ -1788,6 +1987,7 @@ class SQLiteHashIndex(HashIndex):
         self._conn.commit()
         return removed
 
+    @_synchronized
     def _metadata_for(self, file_id: str) -> dict:
         row = self._conn.execute(
             "SELECT metadata FROM files WHERE file_id = ?", (file_id,)
@@ -1800,6 +2000,7 @@ class SQLiteHashIndex(HashIndex):
             return {}
         return data if isinstance(data, dict) else {}
 
+    @_synchronized
     def list_files(self) -> list[str]:
         # ORDER BY in SQL gives the same ascending order as the base sorted()
         # contract without a Python-side sort of the whole id set.
@@ -1808,12 +2009,14 @@ class SQLiteHashIndex(HashIndex):
             for row in self._conn.execute("SELECT file_id FROM files ORDER BY file_id").fetchall()
         ]
 
+    @_synchronized
     def contains(self, file_id: str) -> bool:
         row = self._conn.execute(
             "SELECT 1 FROM files WHERE file_id = ? LIMIT 1", (file_id,)
         ).fetchone()
         return row is not None
 
+    @_synchronized
     def to_dict(self) -> dict[str, object]:
         files: dict[str, list[list[int]]] = {}
         metadata: dict[str, dict] = {}
@@ -1884,6 +2087,13 @@ class PostgresHashIndex(HashIndex):
             raise ValueError("table_prefix must be a valid SQL identifier")
         self._files_table = f"{table_prefix}_files"
         self._postings_table = f"{table_prefix}_postings"
+        self._meta_table = f"{table_prefix}_meta"
+        # Serializes the single shared psycopg connection (F3). A psycopg
+        # connection is not safe for concurrent use across threads, so the FastAPI
+        # threadpool sharing one active_index would otherwise race; mirroring the
+        # SQLite backend, every connection-touching method holds this re-entrant
+        # lock. Uncontended single-threaded, so output is byte-identical.
+        self._lock = threading.RLock()
         if connection is not None:
             self._conn = connection
         else:
@@ -1920,7 +2130,35 @@ class PostgresHashIndex(HashIndex):
                 f"CREATE INDEX IF NOT EXISTS {self._postings_table}_file_idx "
                 f"ON {self._postings_table}(file_ref)"
             )
+            # Side table recording the corpus hash-format version (F2): a row is
+            # written only for a NON-default corpus, so a default store keeps an
+            # empty meta and is byte-identical. Never read by to_dict/search.
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS {self._meta_table} "
+                "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            cur.execute(
+                f"SELECT value FROM {self._meta_table} WHERE key = %s",
+                (SNAPSHOT_FORMAT_VERSION_KEY,),
+            )
+            row = cur.fetchone()
         self._conn.commit()
+        # Restore the durably-stored version (F2); absent -> unpinned default.
+        if row is not None:
+            self._load_persisted_format_version(row[0])
+
+    def _persist_format_version(self, version: int) -> None:
+        # F2: upsert the pinned (non-default) version into the side meta table so
+        # a reopen restores it. Self-contained commit (only on first pin of a
+        # non-default corpus) so it never leaves a dangling transaction.
+        with self._lock:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO {self._meta_table} (key, value) VALUES (%s, %s) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    (SNAPSHOT_FORMAT_VERSION_KEY, str(version)),
+                )
+            self._conn.commit()
 
     def _migrate_legacy_schema_if_present(self) -> None:
         """One-time, transactional, in-place upgrade of an OLD-schema table set.
@@ -1988,6 +2226,7 @@ class PostgresHashIndex(HashIndex):
         return int(stored) + cls._SIGNED_OFFSET
 
     @property
+    @_synchronized
     def file_count(self) -> int:
         try:
             with self._conn.cursor() as cur:
@@ -1998,6 +2237,7 @@ class PostgresHashIndex(HashIndex):
         return count
 
     @property
+    @_synchronized
     def posting_count(self) -> int:
         try:
             with self._conn.cursor() as cur:
@@ -2007,6 +2247,7 @@ class PostgresHashIndex(HashIndex):
             self._conn.rollback()  # release the implicit read transaction even on error
         return count
 
+    @_synchronized
     def add(self, fingerprint: Fingerprint) -> None:
         self._record_format_version(fingerprint)
         self.remove(fingerprint.file_id)
@@ -2039,6 +2280,7 @@ class PostgresHashIndex(HashIndex):
             )
         self._conn.commit()
 
+    @_synchronized
     def add_many(self, fingerprints: Iterable[Fingerprint]) -> None:
         """Ingest the whole batch in ONE transaction, streaming postings via COPY.
 
@@ -2050,6 +2292,10 @@ class PostgresHashIndex(HashIndex):
         INSERT); metadata goes via ``executemany``; everything commits once.
         """
 
+        # Fail-closed PRE-CHECK (no pin/persist) so a cross-format batch raises
+        # before any write OR version stamp -- true all-or-nothing (F1).
+        fingerprints = list(fingerprints)
+        self._validate_batch_format(fingerprints)
         # Last-wins per file_id (a sequential add() of a repeated id removes the
         # earlier copy), which also avoids the files PRIMARY KEY conflict.
         survivors: dict[str, Fingerprint] = {}
@@ -2115,6 +2361,7 @@ class PostgresHashIndex(HashIndex):
             raise
         self._conn.commit()
 
+    @_synchronized
     def remove(self, file_id: str) -> None:
         with self._conn.cursor() as cur:
             # Postings are keyed by the surrogate; delete by the file's file_ref
@@ -2127,6 +2374,7 @@ class PostgresHashIndex(HashIndex):
             cur.execute(f"DELETE FROM {self._files_table} WHERE file_id = %s", (file_id,))
         self._conn.commit()
 
+    @_synchronized
     def query(self, hash_code: int) -> list[IndexPosting]:
         code = int(hash_code)
         try:
@@ -2145,6 +2393,7 @@ class PostgresHashIndex(HashIndex):
             for row in rows
         ]
 
+    @_synchronized
     def query_many(self, hash_codes: Iterable[int]) -> dict[int, list[IndexPosting]]:
         codes = list({int(c) for c in hash_codes})
         results: dict[int, list[IndexPosting]] = {code: [] for code in codes}
@@ -2169,6 +2418,7 @@ class PostgresHashIndex(HashIndex):
             self._conn.rollback()  # release the implicit read transaction even on error
         return results
 
+    @_synchronized
     def _aggregate(
         self,
         fingerprint: Fingerprint,
@@ -2259,6 +2509,7 @@ class PostgresHashIndex(HashIndex):
             for file_id, delta, votes, total, uniq in rows
         }
 
+    @_synchronized
     def prune_stop_hashes(self, max_df_ratio: float = 0.1) -> int:
         file_total = self.file_count
         if file_total == 0:
@@ -2291,6 +2542,7 @@ class PostgresHashIndex(HashIndex):
         self._conn.commit()
         return removed
 
+    @_synchronized
     def _metadata_for(self, file_id: str) -> dict:
         try:
             with self._conn.cursor() as cur:
@@ -2310,6 +2562,7 @@ class PostgresHashIndex(HashIndex):
                 return {}
         return data if isinstance(data, dict) else {}
 
+    @_synchronized
     def list_files(self) -> list[str]:
         try:
             with self._conn.cursor() as cur:
@@ -2320,6 +2573,7 @@ class PostgresHashIndex(HashIndex):
             self._conn.rollback()  # release the implicit read transaction even on error
         return file_ids
 
+    @_synchronized
     def contains(self, file_id: str) -> bool:
         try:
             with self._conn.cursor() as cur:
@@ -2331,6 +2585,7 @@ class PostgresHashIndex(HashIndex):
             self._conn.rollback()  # release the implicit read transaction even on error
         return row is not None
 
+    @_synchronized
     def to_dict(self) -> dict[str, object]:
         files: dict[str, list[list[int]]] = {}
         metadata: dict[str, dict] = {}
