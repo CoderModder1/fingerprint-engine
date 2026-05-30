@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from pathlib import Path
+from typing import Any
 
 from .exceptions import InvalidSnapshotError
 from .models import Calibration, ConstellationHash, Fingerprint, IndexPosting, SearchResult
@@ -161,6 +162,8 @@ class HashIndex(ABC):
         fingerprint: Fingerprint,
         top_k: int = 10,
         calibration: Calibration | None = None,
+        offset_tolerance: int | None = None,
+        candidate_limit: int | None = None,
     ) -> list[SearchResult]:
         """Return ranked matches via Shazam-style offset-histogram alignment.
 
@@ -171,10 +174,53 @@ class HashIndex(ABC):
         ``confidence`` in [0, 1] (aligned votes / the smaller fingerprint's hash
         count); when a :class:`Calibration` is supplied, results below its
         per-handler threshold are dropped.
+
+        ``offset_tolerance`` is OPT-IN and DEFAULT-OFF. When it resolves to ``0``
+        (the default -- left ``None`` with no calibration, or a
+        :class:`Calibration` whose ``offset_tolerance`` is ``0``) the winning
+        offset bin is the single exact-delta histogram peak and the returned
+        rankings/scores/offsets are BYTE-IDENTICAL to behaviour before this
+        option existed. When it resolves to ``> 0`` the winning bin's
+        ``aligned_votes`` sums the votes of every delta bin within
+        ``+-offset_tolerance`` of a candidate centre delta; the centre that
+        maximises that banded sum wins (ties broken by the SMALLER centre delta,
+        matching the exact-bin tie-break). Banding recovers recall on multi-edit
+        near-duplicates whose aligned votes otherwise fragment across adjacent
+        delta bins (each inserted/deleted run shifts the absolute frame index of
+        everything after it). An explicit argument here overrides the
+        calibration's field.
+
+        ``candidate_limit`` is OPT-IN and DEFAULT-OFF (``None``). When ``None``
+        (the default) the FULL exact search runs: every file sharing any query
+        hash is offset-voted, and the returned rankings/scores/offsets are
+        BYTE-IDENTICAL to behaviour before this option existed -- the prefilter
+        code below is never entered. When set to a positive integer it caps the
+        cost of large-corpus search with a cheap, sublinear-in-corpus candidate
+        prefilter: files are first ranked by SHARED-HASH COUNT (how many distinct
+        query hash codes touch each file -- a single batched posting lookup, no
+        per-posting offset arithmetic), and only the top ``candidate_limit`` files
+        proceed to the exact offset-histogram aggregation and scoring.
+
+        Exactness/recall trade-off: shared-hash count is a monotone UPPER BOUND on
+        a file's aligned votes (a hash can only vote at the winning offset if it
+        is shared at all), so for a high-overlap match -- a self-match, a
+        near-duplicate -- the true file is guaranteed to be among the highest
+        shared-hash-count files and thus in the candidate set. When the candidate
+        set is a SUPERSET of the true top-``top_k`` (the normal case for a
+        generous ``candidate_limit``), the final ranking is IDENTICAL to full
+        search: scoring runs unchanged on the surviving files and the dropped
+        files could never have out-ranked them. The only files a too-tight limit
+        can drop are *low*-overlap ones -- weak partial matches that share few
+        hashes but happen to align coherently -- so set ``candidate_limit``
+        comfortably above ``top_k`` to keep recall at 1.0 for genuine matches.
+        Ties in shared-hash count at the cut boundary are broken deterministically
+        (count DESC, then file_id ASC) so the candidate set is reproducible.
         """
 
+        resolved_tolerance = self._resolve_offset_tolerance(offset_tolerance, calibration)
+        candidates = self._select_candidates(fingerprint, candidate_limit)
         started = time.perf_counter()
-        aggregates = self._aggregate(fingerprint)
+        aggregates = self._aggregate(fingerprint, resolved_tolerance, candidates)
         results = self._finalize(fingerprint, aggregates, top_k, calibration)
         logger.debug(
             "search: %d query hashes -> %d candidates -> %d results in %.3f ms",
@@ -185,12 +231,150 @@ class HashIndex(ABC):
         )
         return results
 
-    def _aggregate(self, fingerprint: Fingerprint) -> dict[str, tuple[int, int, int, int]]:
+    def _select_candidates(
+        self, fingerprint: Fingerprint, candidate_limit: int | None
+    ) -> set[str] | None:
+        """Cheap shared-hash candidate prefilter; ``None`` (default) = OFF.
+
+        Returns ``None`` when ``candidate_limit`` is ``None`` (the default) so the
+        caller runs the full exact search on every file -- the byte-identical
+        legacy path. When ``candidate_limit`` is a non-negative int, returns the
+        set of the top-``candidate_limit`` ``file_id`` ranked by SHARED-HASH COUNT
+        (the number of distinct query hash codes whose posting list contains the
+        file). This count is computed from the SAME batched :meth:`query_many`
+        fetch the exact aggregation would do, but without any per-posting offset
+        arithmetic, and -- crucially -- is a monotone upper bound on a file's
+        aligned votes, so a high-overlap match (self / near-dup) is always
+        retained. The cut is deterministic: shared-hash count DESC, then file_id
+        ASC, so a boundary tie is resolved reproducibly.
+
+        ``candidate_limit == 0`` selects no files (an explicit empty search). A
+        negative limit is rejected so the cut is always well defined.
+        """
+
+        if candidate_limit is None:
+            return None
+        if candidate_limit < 0:
+            raise ValueError("candidate_limit must be non-negative or None (None = off)")
+        shared: Counter[str] = Counter()
+        postings_by_code = self.query_many({qh.hash_code for qh in fingerprint.hashes})
+        for postings in postings_by_code.values():
+            # One vote per (file) per distinct query code: a code present in the
+            # query that hits this file contributes exactly one to its shared
+            # count, regardless of how many times it occurs in the file.
+            for file_id in {posting.file_id for posting in postings}:
+                shared[file_id] += 1
+        if len(shared) <= candidate_limit:
+            return set(shared)
+        # count DESC, then file_id ASC -- deterministic, independent of insertion
+        # order, so the boundary cut is reproducible across backends.
+        ranked = sorted(shared.items(), key=lambda item: (-item[1], item[0]))
+        return {file_id for file_id, _count in ranked[:candidate_limit]}
+
+    @staticmethod
+    def _resolve_offset_tolerance(
+        offset_tolerance: int | None, calibration: Calibration | None
+    ) -> int:
+        """Resolve the effective banding tolerance (explicit arg wins over calibration).
+
+        ``None`` (the search default) defers to the calibration's
+        ``offset_tolerance`` if one was supplied, else ``0`` (OFF). A negative
+        tolerance is rejected so the banded window is always well-defined.
+        """
+
+        if offset_tolerance is None:
+            tolerance = calibration.offset_tolerance if calibration is not None else 0
+        else:
+            tolerance = int(offset_tolerance)
+        if tolerance < 0:
+            raise ValueError("offset_tolerance must be non-negative (0 = off/exact)")
+        return tolerance
+
+    @staticmethod
+    def _banded_winner(
+        histogram: dict[int, int] | Counter[int], offset_tolerance: int
+    ) -> tuple[int, int]:
+        """Return the winning ``(centre_delta, banded_votes)`` for one file.
+
+        With ``offset_tolerance == 0`` this is the exact-bin peak -- the bin with
+        the most votes, ties broken by smallest delta -- IDENTICAL to the legacy
+        ``max(histogram.items(), key=lambda kv: (kv[1], -kv[0]))``. With
+        ``offset_tolerance > 0`` the banded vote count of a candidate centre
+        delta ``c`` is the sum of votes over the inclusive window
+        ``[c - tol, c + tol]``; the centre maximising that sum wins, ties broken
+        by the smaller centre delta. Only deltas actually present in the
+        histogram are considered as centres (an empty band can never win), so the
+        result stays deterministic and independent of histogram iteration order.
+        """
+
+        if offset_tolerance <= 0:
+            offset, votes = max(histogram.items(), key=lambda kv: (kv[1], -kv[0]))
+            return int(offset), int(votes)
+        best_delta = 0
+        best_votes = -1
+        for centre in histogram:
+            banded = sum(
+                votes
+                for delta, votes in histogram.items()
+                if centre - offset_tolerance <= delta <= centre + offset_tolerance
+            )
+            # votes DESC, then delta ASC -- same deterministic tie-break as the
+            # exact-bin path so a degenerate (single-bin) histogram is unchanged.
+            if banded > best_votes or (banded == best_votes and centre < best_delta):
+                best_votes = banded
+                best_delta = centre
+        return int(best_delta), int(best_votes)
+
+    @classmethod
+    def _reduce_banded_rows(
+        cls,
+        rows: Iterable[tuple[Any, Any, Any, Any, Any]],
+        offset_tolerance: int,
+    ) -> dict[str, tuple[int, int, int, int]]:
+        """Reduce per-(file, delta, votes) histogram rows to banded aggregates.
+
+        Shared by the SQL backends' banded path: each backend computes the
+        compact per-(file, delta) histogram server-side, then this folds it into
+        the banded winner via :meth:`_banded_winner` -- the SAME Python code the
+        in-memory backend uses -- so the banded ``(offset, aligned_votes)`` is
+        cross-backend parity-identical. ``total_votes`` and ``unique_hashes`` are
+        carried through unchanged (they are per-file, not per-bin).
+        """
+
+        histograms: dict[str, dict[int, int]] = defaultdict(dict)
+        totals: dict[str, tuple[int, int]] = {}
+        for file_id, delta, votes, total, uniq in rows:
+            key = str(file_id)
+            histograms[key][int(delta)] = int(votes)
+            totals[key] = (int(total), int(uniq))
+        aggregates: dict[str, tuple[int, int, int, int]] = {}
+        for file_id, histogram in histograms.items():
+            offset, aligned = cls._banded_winner(histogram, offset_tolerance)
+            total, uniq = totals[file_id]
+            aggregates[file_id] = (offset, aligned, total, uniq)
+        return aggregates
+
+    def _aggregate(
+        self,
+        fingerprint: Fingerprint,
+        offset_tolerance: int = 0,
+        candidates: set[str] | None = None,
+    ) -> dict[str, tuple[int, int, int, int]]:
         """Per-file ``(offset, aligned_votes, total_votes, unique_hashes)``.
 
         Default in-memory aggregation over a batched :meth:`query_many` fetch.
-        The winning offset is the bin with the most votes, ties broken by
-        smallest offset -- a deterministic rule SQL backends replicate exactly.
+        The winning offset is chosen by :meth:`_banded_winner` -- with
+        ``offset_tolerance == 0`` (the default) the exact-bin peak (most votes,
+        ties broken by smallest offset), a deterministic rule SQL backends
+        replicate exactly; with ``> 0`` the banded peak over +-tolerance bins.
+
+        ``candidates`` is the OPT-IN prefilter set from :meth:`_select_candidates`:
+        ``None`` (the default) aggregates EVERY file sharing a query hash, which
+        is byte-identical to before the prefilter existed; a set restricts the
+        offset-voting to those ``file_id`` only. Skipping a non-candidate's
+        postings cannot change the aggregate of any retained file (votes are
+        accumulated per file independently), so a candidate set that is a
+        superset of the true top-k yields the identical ranking.
         """
 
         offset_histograms: dict[str, Counter[int]] = defaultdict(Counter)
@@ -200,6 +384,8 @@ class HashIndex(ABC):
         postings_by_code = self.query_many({qh.hash_code for qh in fingerprint.hashes})
         for query_hash in fingerprint.hashes:
             for posting in postings_by_code.get(query_hash.hash_code, ()):
+                if candidates is not None and posting.file_id not in candidates:
+                    continue
                 offset = posting.time_offset - query_hash.time_offset
                 offset_histograms[posting.file_id][offset] += 1
                 total_votes[posting.file_id] += 1
@@ -209,7 +395,7 @@ class HashIndex(ABC):
         for file_id, histogram in offset_histograms.items():
             if not histogram:
                 continue
-            offset, aligned = max(histogram.items(), key=lambda kv: (kv[1], -kv[0]))
+            offset, aligned = self._banded_winner(histogram, offset_tolerance)
             aggregates[file_id] = (offset, aligned, total_votes[file_id], len(unique_hashes[file_id]))
         return aggregates
 
@@ -424,15 +610,90 @@ class InMemoryHashIndex(HashIndex):
     interleave and a concurrent reader can never observe a half-applied
     add/remove. This is a single logical writer model: parallel writes are
     safe but run one at a time.
+
+    Storage layout (internal, output-preserving): the 64-char SHA-256
+    ``file_id`` is the dominant per-posting cost when stored verbatim on every
+    posting. Instead each ``file_id`` is interned to a compact non-negative
+    integer surrogate (``_intern_file_id``) and the posting lists store
+    ``(file_surrogate, time_offset)`` int pairs rather than full
+    :class:`IndexPosting` objects holding a 64-char string reference. The
+    surrogate is mapped back to the original ``file_id`` string at the query
+    boundary (:meth:`query` / :meth:`query_many` rebuild real
+    :class:`IndexPosting` objects) and at the aggregation boundary
+    (:meth:`_aggregate` keys its result by the original ``file_id``), so
+    :meth:`search`, :meth:`to_dict`, :meth:`list_files`, :meth:`iter_metadata`,
+    :meth:`query`, :meth:`query_many`, and cross-backend parity are all
+    BYTE-IDENTICAL to storing the string verbatim. This is a pure footprint
+    optimization with no observable effect: ``_file_entries`` / ``_metadata``
+    remain keyed by the original ``file_id`` string (one entry per file, not per
+    posting -- already compact, and returned directly by the snapshot methods).
+
+    Surrogate allocation is monotonic and append-only within a process: a
+    brand-new ``file_id`` gets a fresh surrogate, and a re-added ``file_id``
+    REUSES its existing surrogate (so re-indexing the same file never grows the
+    maps). Crucially, :meth:`remove` does NOT delete a file's surrogate
+    mappings -- it leaves ``_id_to_fid`` / ``_fid_to_id`` intact -- so a
+    lock-free reader that has already read a posting referencing that surrogate
+    can still dereference it to the correct ``file_id`` instead of racing a
+    concurrent ``del`` and raising ``KeyError``. This upholds the read contract
+    above: a concurrent reader can never observe a half-applied add/remove.
+
+    The deliberate price of lock-free reads is that surrogates for files which
+    are removed and NEVER re-added are retained: ``_id_to_fid`` / ``_fid_to_id``
+    form a bounded, monotonic set whose size is the total number of DISTINCT
+    ``file_id`` ever seen (not the live file count). This is harmless for
+    correctness -- a retired surrogate has no postings, so it never appears in
+    any query/search/aggregate output -- and bounded by the workload's distinct
+    id count. A future compaction could reclaim retired surrogates under the
+    write lock (once no reader can hold a posting referencing them); it is NOT
+    implemented here. Because surrogates are an internal detail never exposed,
+    their concrete values are not part of any contract.
     """
 
     def __init__(self) -> None:
-        self._postings: defaultdict[int, list[IndexPosting]] = defaultdict(list)
+        # Posting lists store (file_surrogate:int, time_offset:int) pairs; the
+        # surrogate is mapped back to the str file_id only at the query/aggregate
+        # boundary. Storing the small int per posting (instead of an IndexPosting
+        # carrying a 64-char file_id string) is the footprint win.
+        self._postings: defaultdict[int, list[tuple[int, int]]] = defaultdict(list)
         self._file_entries: dict[str, list[tuple[int, int]]] = {}
         self._metadata: dict[str, dict[str, object]] = {}
+        # Bidirectional file_id <-> integer surrogate maps. ``_id_to_fid`` maps a
+        # surrogate to its str file_id; ``_fid_to_id`` is the inverse. These are
+        # APPEND-ONLY: a surrogate is allocated once per distinct file_id and is
+        # never deleted (not even on remove()) and never reused, so a surrogate
+        # uniquely and permanently identifies one file_id for the lifetime of the
+        # index. remove() deliberately leaves these intact (see class docstring)
+        # so a lock-free reader can always resolve a just-removed posting's
+        # surrogate instead of racing a concurrent del and raising KeyError.
+        self._id_to_fid: dict[int, str] = {}
+        self._fid_to_id: dict[str, int] = {}
+        self._next_surrogate = 0
         # Re-entrant so remove() called from within add() under the same lock
         # does not deadlock.
         self._write_lock = threading.RLock()
+
+    def _intern_file_id(self, file_id: str) -> int:
+        """Return the stable integer surrogate for ``file_id``.
+
+        Called only under :attr:`_write_lock` from :meth:`add` /
+        :meth:`from_dict`. Surrogates are append-only and stable per ``file_id``:
+        if this ``file_id`` already has a surrogate (it was added before, then
+        possibly removed -- :meth:`remove` keeps the mapping), that SAME surrogate
+        is reused, so re-indexing a file never grows the maps. Only a brand-new
+        ``file_id`` allocates a fresh monotonic surrogate. A surrogate is never
+        reused for a different ``file_id``, so a stale surrogate can never
+        silently alias another file.
+        """
+
+        existing = self._fid_to_id.get(file_id)
+        if existing is not None:
+            return existing
+        surrogate = self._next_surrogate
+        self._next_surrogate += 1
+        self._id_to_fid[surrogate] = file_id
+        self._fid_to_id[file_id] = surrogate
+        return surrogate
 
     @property
     def file_count(self) -> int:
@@ -457,14 +718,11 @@ class InMemoryHashIndex(HashIndex):
                 "landmark_count": fingerprint.landmark_count,
                 **fingerprint.metadata,
             }
+            surrogate = self._intern_file_id(fingerprint.file_id)
             for hash_code, time_offset in entries:
-                self._postings[hash_code].append(
-                    IndexPosting(
-                        file_id=fingerprint.file_id,
-                        hash_code=hash_code,
-                        time_offset=time_offset,
-                    )
-                )
+                # Store the compact (surrogate, time_offset) int pair; the str
+                # file_id is recovered from the surrogate at the query boundary.
+                self._postings[hash_code].append((surrogate, time_offset))
 
     def add_many(self, fingerprints: Iterable[Fingerprint]) -> None:
         # Hold the write lock once for the whole batch (re-entrant, so the
@@ -480,20 +738,109 @@ class InMemoryHashIndex(HashIndex):
             if file_id not in self._file_entries:
                 return
 
+            surrogate = self._fid_to_id[file_id]
             for hash_code, _time_offset in self._file_entries[file_id]:
                 self._postings[hash_code] = [
                     posting
                     for posting in self._postings[hash_code]
-                    if posting.file_id != file_id
+                    if posting[0] != surrogate
                 ]
                 if not self._postings[hash_code]:
                     del self._postings[hash_code]
 
             del self._file_entries[file_id]
             self._metadata.pop(file_id, None)
+            # Deliberately DO NOT delete the surrogate mappings. A lock-free
+            # reader (query()/_aggregate()) may have already read a posting that
+            # references this surrogate and is about to dereference it via
+            # _id_to_fid; deleting the entry here would race that read into a
+            # KeyError. Leaving the (postings-less) surrogate in place keeps the
+            # read contract -- a reader can never observe a half-applied remove --
+            # and lets a re-add of this file_id reuse the SAME surrogate. The
+            # retained mappings are bounded/monotonic (one per distinct file_id
+            # ever seen); reclaiming them is left to a future compaction pass.
 
     def query(self, hash_code: int) -> list[IndexPosting]:
-        return list(self._postings.get(int(hash_code), []))
+        # Map each stored (surrogate, time_offset) pair back to a real
+        # IndexPosting carrying the original str file_id -- the public return
+        # type and values are identical to storing IndexPosting verbatim. The
+        # list is rebuilt in stored order, so query() ordering is unchanged.
+        code = int(hash_code)
+        id_to_fid = self._id_to_fid
+        return [
+            IndexPosting(
+                file_id=id_to_fid[surrogate],
+                hash_code=code,
+                time_offset=time_offset,
+            )
+            for surrogate, time_offset in self._postings.get(code, ())
+        ]
+
+    def _aggregate(
+        self,
+        fingerprint: Fingerprint,
+        offset_tolerance: int = 0,
+        candidates: set[str] | None = None,
+    ) -> dict[str, tuple[int, int, int, int]]:
+        """Surrogate-keyed in-memory aggregation, output-identical to the base.
+
+        Equivalent to :meth:`HashIndex._aggregate` but accumulates the per-file
+        offset histogram / vote tallies keyed by the compact integer surrogate
+        (read straight off the stored ``(surrogate, time_offset)`` posting pairs)
+        instead of the 64-char ``file_id`` string, then maps each surviving
+        surrogate back to its ``file_id`` only when building the final result
+        dict. This avoids both materializing an :class:`IndexPosting` per posting
+        and hashing the long ``file_id`` string in the hot loop, while producing
+        the IDENTICAL per-file ``(offset, aligned_votes, total_votes,
+        unique_hashes)`` aggregates the base produces -- so :meth:`search`
+        rankings are byte-identical.
+
+        Iteration matches the base exactly: query hashes are walked in
+        ``fingerprint.hashes`` order (duplicates included, so ``total_votes``
+        counts repeats), and for each its posting list is read directly from
+        ``self._postings``. The ``candidates`` set (of ``file_id`` strings) is
+        translated once to a surrogate set so the per-posting membership test is
+        an int comparison; a non-candidate ``file_id`` (or one with no live
+        surrogate) is skipped, exactly as the base skips a non-candidate posting.
+        """
+
+        postings = self._postings
+        id_to_fid = self._id_to_fid
+
+        candidate_surrogates: set[int] | None = None
+        if candidates is not None:
+            fid_to_id = self._fid_to_id
+            candidate_surrogates = {
+                fid_to_id[fid] for fid in candidates if fid in fid_to_id
+            }
+
+        offset_histograms: dict[int, Counter[int]] = defaultdict(Counter)
+        total_votes: Counter[int] = Counter()
+        unique_hashes: dict[int, set[int]] = defaultdict(set)
+
+        for query_hash in fingerprint.hashes:
+            hash_code = query_hash.hash_code
+            query_offset = query_hash.time_offset
+            for surrogate, time_offset in postings.get(hash_code, ()):
+                if candidate_surrogates is not None and surrogate not in candidate_surrogates:
+                    continue
+                offset = time_offset - query_offset
+                offset_histograms[surrogate][offset] += 1
+                total_votes[surrogate] += 1
+                unique_hashes[surrogate].add(hash_code)
+
+        aggregates: dict[str, tuple[int, int, int, int]] = {}
+        for surrogate, histogram in offset_histograms.items():
+            if not histogram:
+                continue
+            offset, aligned = self._banded_winner(histogram, offset_tolerance)
+            aggregates[id_to_fid[surrogate]] = (
+                offset,
+                aligned,
+                total_votes[surrogate],
+                len(unique_hashes[surrogate]),
+            )
+        return aggregates
 
     def prune_stop_hashes(self, max_df_ratio: float = 0.1) -> int:
         with self._write_lock:
@@ -501,10 +848,13 @@ class InMemoryHashIndex(HashIndex):
             if file_total == 0:
                 return 0
             threshold = max_df_ratio * file_total
+            # Distinct files touching a code == distinct surrogates in its
+            # posting list (each surrogate maps 1:1 to a file_id), so this is
+            # the same document-frequency test as counting distinct file_ids.
             stop = {
                 code
                 for code, postings in self._postings.items()
-                if len({posting.file_id for posting in postings}) > threshold
+                if len({posting[0] for posting in postings}) > threshold
             }
             if not stop:
                 return 0
@@ -551,6 +901,10 @@ class InMemoryHashIndex(HashIndex):
             normalized_entries: list[tuple[int, int]] = []
             if not isinstance(entries, list):
                 continue
+            # Allocate the surrogate once per file, then store compact
+            # (surrogate, time_offset) pairs -- identical postings to building
+            # IndexPosting objects, but with the str file_id stored once.
+            surrogate = index._intern_file_id(str(file_id))
             for entry in entries:
                 if not isinstance(entry, list | tuple) or len(entry) != 2:
                     continue
@@ -559,13 +913,7 @@ class InMemoryHashIndex(HashIndex):
                 if not _in_hash_range(hash_code):
                     continue
                 normalized_entries.append((hash_code, time_offset))
-                index._postings[hash_code].append(
-                    IndexPosting(
-                        file_id=str(file_id),
-                        hash_code=hash_code,
-                        time_offset=time_offset,
-                    )
-                )
+                index._postings[hash_code].append((surrogate, time_offset))
             index._file_entries[str(file_id)] = normalized_entries
         return index
 
@@ -1009,49 +1357,90 @@ class SQLiteHashIndex(HashIndex):
                 )
         return results
 
-    def _aggregate(self, fingerprint: Fingerprint) -> dict[str, tuple[int, int, int, int]]:
+    def _aggregate(
+        self,
+        fingerprint: Fingerprint,
+        offset_tolerance: int = 0,
+        candidates: set[str] | None = None,
+    ) -> dict[str, tuple[int, int, int, int]]:
         """Aggregate the offset histogram server-side via a single SQL pass.
 
         Loads the query's (hash_code, offset) pairs into a temp table, joins to
         the postings, and groups by (file_id, delta) -- so only per-file
-        aggregates cross the boundary, not millions of postings. The winning bin
-        is votes DESC then delta ASC, matching the base in-memory tie-break.
+        aggregates cross the boundary, not millions of postings.
+
+        With ``offset_tolerance == 0`` (the default) the winning bin is picked
+        server-side as votes DESC then delta ASC, matching the base in-memory
+        tie-break exactly -- this path is unchanged and BYTE-IDENTICAL to before
+        the option existed. With ``> 0`` the SQL still groups to per-(file, delta)
+        bins server-side (only the compact histogram crosses the boundary, never
+        raw postings), but the banded winner is chosen in Python via the shared
+        :meth:`_banded_winner`, so every backend bands identically.
+
+        ``candidates`` is the OPT-IN prefilter set: ``None`` (the default) returns
+        the aggregate for every matched file, byte-identical to before the
+        prefilter existed; a set keeps only those ``file_id``. The restriction is
+        applied to the per-file aggregate rows (their grouping is per-file, so
+        dropping a non-candidate never alters a retained file's row), so a
+        candidate superset of the true top-k yields the identical ranking.
         """
 
         pairs = [(self._encode(h.hash_code), int(h.time_offset)) for h in fingerprint.hashes]
         if not pairs:
             return {}
+        banded = offset_tolerance > 0
         try:
             self._conn.execute("CREATE TEMP TABLE IF NOT EXISTS _query (hash_code INTEGER, qoff INTEGER)")
             self._conn.execute("DELETE FROM _query")
             self._conn.executemany("INSERT INTO _query (hash_code, qoff) VALUES (?, ?)", pairs)
-            rows = self._conn.execute(
-                """
-                WITH matches AS (
-                    SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
-                    FROM postings p JOIN _query q ON p.hash_code = q.hash_code
-                ),
-                bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
-                ranked AS (
-                    SELECT file_id, delta, votes,
-                           ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY votes DESC, delta ASC) AS rn
-                    FROM bins
-                ),
-                totals AS (
-                    SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
-                    FROM matches GROUP BY file_id
-                )
-                SELECT r.file_id, r.delta, r.votes, t.total_votes, t.uniq
-                FROM ranked r JOIN totals t ON r.file_id = t.file_id
-                WHERE r.rn = 1
-                """
-            ).fetchall()
+            if banded:
+                rows = self._conn.execute(
+                    """
+                    WITH matches AS (
+                        SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
+                        FROM postings p JOIN _query q ON p.hash_code = q.hash_code
+                    ),
+                    bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
+                    totals AS (
+                        SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
+                        FROM matches GROUP BY file_id
+                    )
+                    SELECT b.file_id, b.delta, b.votes, t.total_votes, t.uniq
+                    FROM bins b JOIN totals t ON b.file_id = t.file_id
+                    """
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    WITH matches AS (
+                        SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
+                        FROM postings p JOIN _query q ON p.hash_code = q.hash_code
+                    ),
+                    bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
+                    ranked AS (
+                        SELECT file_id, delta, votes,
+                               ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY votes DESC, delta ASC) AS rn
+                        FROM bins
+                    ),
+                    totals AS (
+                        SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
+                        FROM matches GROUP BY file_id
+                    )
+                    SELECT r.file_id, r.delta, r.votes, t.total_votes, t.uniq
+                    FROM ranked r JOIN totals t ON r.file_id = t.file_id
+                    WHERE r.rn = 1
+                    """
+                ).fetchall()
             self._conn.execute("DELETE FROM _query")
         finally:
             # The DML above (CREATE TEMP/DELETE/INSERT) opens an implicit write
             # transaction; commit so this read-only path never leaves the
             # connection holding a write lock for the rest of its lifetime.
             self._conn.commit()
+        if candidates is not None:
+            rows = [row for row in rows if str(row[0]) in candidates]
+        if banded:
+            return self._reduce_banded_rows(rows, offset_tolerance)
         return {
             file_id: (int(delta), int(votes), int(total), int(uniq))
             for file_id, delta, votes, total, uniq in rows
@@ -1358,47 +1747,83 @@ class PostgresHashIndex(HashIndex):
             self._conn.rollback()  # release the implicit read transaction even on error
         return results
 
-    def _aggregate(self, fingerprint: Fingerprint) -> dict[str, tuple[int, int, int, int]]:
+    def _aggregate(
+        self,
+        fingerprint: Fingerprint,
+        offset_tolerance: int = 0,
+        candidates: set[str] | None = None,
+    ) -> dict[str, tuple[int, int, int, int]]:
         """Aggregate the offset histogram server-side in one round-trip.
 
         The query's (hash_code, offset) pairs are passed as two arrays and
         unnested into a derived table, joined to the postings, then grouped by
-        (file_id, delta). Only per-file aggregates return. Winning bin is votes
-        DESC then delta ASC, matching the base in-memory tie-break.
+        (file_id, delta). Only per-file aggregates return.
+
+        With ``offset_tolerance == 0`` (the default) the winning bin is picked
+        server-side as votes DESC then delta ASC, matching the base in-memory
+        tie-break -- unchanged and BYTE-IDENTICAL to before the option existed.
+        With ``> 0`` the compact per-(file, delta) histogram is returned and the
+        banded winner is chosen by the shared :meth:`_banded_winner` so every
+        backend bands identically.
+
+        ``candidates`` is the OPT-IN prefilter set: ``None`` (the default) returns
+        the aggregate for every matched file, byte-identical to before the
+        prefilter existed; a set keeps only those ``file_id`` (filtered on the
+        per-file aggregate rows, so a retained file's row is never altered), so a
+        candidate superset of the true top-k yields the identical ranking.
         """
 
         if not fingerprint.hashes:
             return {}
         codes = [self._encode(h.hash_code) for h in fingerprint.hashes]
         offsets = [int(h.time_offset) for h in fingerprint.hashes]
+        banded = offset_tolerance > 0
+        if banded:
+            sql = f"""
+                WITH q(hash_code, qoff) AS (SELECT * FROM unnest(%s::bigint[], %s::int[])),
+                matches AS (
+                    SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
+                    FROM {self._postings_table} p JOIN q ON p.hash_code = q.hash_code
+                ),
+                bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
+                totals AS (
+                    SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
+                    FROM matches GROUP BY file_id
+                )
+                SELECT b.file_id, b.delta, b.votes, t.total_votes, t.uniq
+                FROM bins b JOIN totals t ON b.file_id = t.file_id
+                """
+        else:
+            sql = f"""
+                WITH q(hash_code, qoff) AS (SELECT * FROM unnest(%s::bigint[], %s::int[])),
+                matches AS (
+                    SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
+                    FROM {self._postings_table} p JOIN q ON p.hash_code = q.hash_code
+                ),
+                bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
+                ranked AS (
+                    SELECT file_id, delta, votes,
+                           ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY votes DESC, delta ASC) AS rn
+                    FROM bins
+                ),
+                totals AS (
+                    SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
+                    FROM matches GROUP BY file_id
+                )
+                SELECT r.file_id, r.delta, r.votes, t.total_votes, t.uniq
+                FROM ranked r JOIN totals t ON r.file_id = t.file_id
+                WHERE r.rn = 1
+                """
         try:
             with self._conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    WITH q(hash_code, qoff) AS (SELECT * FROM unnest(%s::bigint[], %s::int[])),
-                    matches AS (
-                        SELECT p.file_id AS file_id, (p.time_offset - q.qoff) AS delta, p.hash_code AS hc
-                        FROM {self._postings_table} p JOIN q ON p.hash_code = q.hash_code
-                    ),
-                    bins AS (SELECT file_id, delta, COUNT(*) AS votes FROM matches GROUP BY file_id, delta),
-                    ranked AS (
-                        SELECT file_id, delta, votes,
-                               ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY votes DESC, delta ASC) AS rn
-                        FROM bins
-                    ),
-                    totals AS (
-                        SELECT file_id, COUNT(*) AS total_votes, COUNT(DISTINCT hc) AS uniq
-                        FROM matches GROUP BY file_id
-                    )
-                    SELECT r.file_id, r.delta, r.votes, t.total_votes, t.uniq
-                    FROM ranked r JOIN totals t ON r.file_id = t.file_id
-                    WHERE r.rn = 1
-                    """,
-                    (codes, offsets),
-                )
+                cur.execute(sql, (codes, offsets))
                 rows = cur.fetchall()
         finally:
             self._conn.rollback()  # release the implicit read transaction even on error
+        if candidates is not None:
+            rows = [row for row in rows if str(row[0]) in candidates]
+        if banded:
+            return self._reduce_banded_rows(rows, offset_tolerance)
         return {
             file_id: (int(delta), int(votes), int(total), int(uniq))
             for file_id, delta, votes, total, uniq in rows

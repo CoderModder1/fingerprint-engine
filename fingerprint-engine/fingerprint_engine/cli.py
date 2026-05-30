@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
+import platform
 import sys
 from pathlib import Path
 from typing import Any
 
+from fingerprint_engine import __version__
 from fingerprint_engine.core.dedup import DEFAULT_MIN_CONFIDENCE, find_duplicates
 from fingerprint_engine.core.exceptions import (
     FileTooLargeError,
@@ -104,6 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="near-duplicate confidence cutoff in [0,1] "
                             f"(default {DEFAULT_MIN_CONFIDENCE}; higher = stricter)")
 
+    subparsers.add_parser(
+        "doctor",
+        help="Report Python/engine versions and which optional extras (and the "
+             "handlers/backends they enable) are importable in this environment",
+    )
+
     return parser
 
 
@@ -168,9 +177,109 @@ def summarize_fingerprint(fingerprint: Fingerprint, full: bool = False) -> dict[
     }
 
 
+# Optional extras: which import probe(s) gate each extra, and what
+# handlers/backends become usable once it is installed. Kept as data so the
+# `doctor` report and the diagnosis stay in lock-step with pyproject's
+# [project.optional-dependencies]. Each entry maps the extra name to the
+# importable module names it requires (ALL must import for the extra to be
+# usable) and the human-readable capabilities it unlocks. The core install
+# (numpy only) always provides the binary/text/archive handlers and the
+# in-memory + SQLite backends, reported separately under "core".
+_EXTRA_PROBES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("image", ("PIL",), ("handler:image",)),
+    # The audio handler needs scipy for WAV and pydub (+ffmpeg) for MP3; both
+    # ship in the single `audio` extra, so the handler is only fully usable when
+    # both import.
+    ("audio", ("scipy", "pydub"), ("handler:audio",)),
+    ("pdf", ("pypdf",), ("handler:pdf",)),
+    ("redis", ("redis",), ("backend:redis",)),
+    ("postgres", ("psycopg",), ("backend:postgres",)),
+    # python-multipart is required by Starlette to parse uploads; its canonical
+    # import name is ``python_multipart`` (the legacy ``multipart`` alias emits a
+    # PendingDeprecationWarning), so probe the canonical name.
+    ("service", ("fastapi", "uvicorn", "python_multipart"), ("service:http",)),
+)
+
+# Capabilities available with only the core runtime dependency (numpy).
+_CORE_HANDLERS: tuple[str, ...] = ("binary", "text", "archive")
+_CORE_BACKENDS: tuple[str, ...] = ("memory", "sqlite")
+
+
+def _probe_module(module: str) -> dict[str, Any]:
+    """Attempt to import ``module``; report success and (on failure) the reason.
+
+    Read-only: the import is the diagnosis. Any import-time failure (the package
+    is absent, or present but broken) is caught and surfaced as ``ok: False`` with
+    the error string, so ``doctor`` never raises -- it reports.
+    """
+
+    try:
+        importlib.import_module(module)
+    except Exception as exc:  # noqa: BLE001 - doctor reports every failure mode
+        return {"module": module, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {"module": module, "ok": True}
+
+
+def _doctor_report() -> dict[str, Any]:
+    """Build the environment diagnosis emitted by the ``doctor`` command.
+
+    Reports the interpreter and engine versions, the always-available core
+    capabilities, and, for each optional extra, whether its dependency imports
+    succeed and which handlers/backends are therefore available. Pure
+    introspection -- it imports candidate modules to test availability but never
+    fingerprints, opens an index, or mutates anything.
+    """
+
+    extras: dict[str, Any] = {}
+    available_handlers: list[str] = list(_CORE_HANDLERS)
+    available_backends: list[str] = list(_CORE_BACKENDS)
+    for extra, modules, capabilities in _EXTRA_PROBES:
+        probes = [_probe_module(module) for module in modules]
+        available = all(probe["ok"] for probe in probes)
+        handlers = sorted(
+            cap.split(":", 1)[1] for cap in capabilities if cap.startswith("handler:")
+        )
+        backends = sorted(
+            cap.split(":", 1)[1] for cap in capabilities if cap.startswith("backend:")
+        )
+        services = sorted(
+            cap.split(":", 1)[1] for cap in capabilities if cap.startswith("service:")
+        )
+        if available:
+            available_handlers.extend(handlers)
+            available_backends.extend(backends)
+        extras[extra] = {
+            "available": available,
+            "requires": list(modules),
+            "probes": probes,
+            "handlers": handlers,
+            "backends": backends,
+            "services": services,
+        }
+    return {
+        "python_version": platform.python_version(),
+        "fingerprint_engine_version": __version__,
+        "core": {
+            "requires": ["numpy"],
+            "handlers": list(_CORE_HANDLERS),
+            "backends": list(_CORE_BACKENDS),
+        },
+        "extras": extras,
+        "available_handlers": sorted(set(available_handlers)),
+        "available_backends": sorted(set(available_backends)),
+    }
+
+
 def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """Run the selected command. Raises library exceptions to ``main`` to be
     mapped onto clean stderr messages and distinct exit codes."""
+
+    if args.command == "doctor":
+        # Pure environment diagnosis: no Fingerprinter, no index, no I/O on the
+        # corpus. Always succeeds (exit 0) -- unavailable extras are reported,
+        # not errors.
+        print(json.dumps(_doctor_report(), indent=2, sort_keys=True))
+        return 0
 
     fingerprinter = Fingerprinter(config_from_args(args))
     index_path = Path(args.index_path)

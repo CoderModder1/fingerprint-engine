@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import sys
 from pathlib import Path
 
@@ -392,3 +393,103 @@ def test_add_non_incremental_default_reindexes_existing(
     assert second["counts"]["newly_indexed"] == 3
     assert second["counts"]["skipped_existing"] == 0
     assert second["file_count"] == 3
+
+
+def test_doctor_exits_0_and_reports_versions_and_capabilities(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The deps doctor is a pure environment diagnosis: it never touches a
+    # backend, so it runs without --index-path/--backend and always exits 0.
+    code, out, err = _run(["doctor"], capsys)
+
+    assert code == 0
+    assert err == ""
+    payload = json.loads(out)
+
+    # Versions: the running interpreter and the installed engine version.
+    from fingerprint_engine import __version__
+
+    assert payload["python_version"] == platform.python_version()
+    assert payload["fingerprint_engine_version"] == __version__
+
+    # Core capabilities are always available (numpy-only install).
+    assert payload["core"]["requires"] == ["numpy"]
+    assert set(payload["core"]["handlers"]) == {"binary", "text", "archive"}
+    assert set(payload["core"]["backends"]) == {"memory", "sqlite"}
+    # The core handlers/backends are always reported as available.
+    assert {"binary", "text", "archive"}.issubset(set(payload["available_handlers"]))
+    assert {"memory", "sqlite"}.issubset(set(payload["available_backends"]))
+
+
+def test_doctor_reports_every_optional_extra(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Every extra declared in pyproject's optional-dependencies (minus the
+    # aggregate `all`/`dev`) must appear with a stable shape: an availability
+    # flag, the modules it requires, per-module import probes, and the
+    # handlers/backends/services it unlocks.
+    code, out, _err = _run(["doctor"], capsys)
+    assert code == 0
+    extras = json.loads(out)["extras"]
+
+    assert set(extras) == {"image", "audio", "pdf", "redis", "postgres", "service"}
+    for name, report in extras.items():
+        assert set(report) == {
+            "available",
+            "requires",
+            "probes",
+            "handlers",
+            "backends",
+            "services",
+        }
+        assert isinstance(report["available"], bool)
+        assert report["requires"], f"{name} must list its required modules"
+        # One probe per required module, each with a stable shape.
+        assert [probe["module"] for probe in report["probes"]] == report["requires"]
+        for probe in report["probes"]:
+            assert isinstance(probe["ok"], bool)
+            if not probe["ok"]:
+                assert probe["error"]  # a failed probe explains why
+        # available iff every probe imported successfully.
+        assert report["available"] == all(probe["ok"] for probe in report["probes"])
+
+    # The capability mapping is correct: these extras unlock these names.
+    assert extras["image"]["handlers"] == ["image"]
+    assert extras["audio"]["handlers"] == ["audio"]
+    assert extras["pdf"]["handlers"] == ["pdf"]
+    assert extras["redis"]["backends"] == ["redis"]
+    assert extras["postgres"]["backends"] == ["postgres"]
+    assert extras["service"]["services"] == ["http"]
+
+
+def test_doctor_capability_lists_follow_availability(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Force every optional import to fail: the doctor must still exit 0 and
+    # report ONLY the core handlers/backends as available, with each extra
+    # marked unavailable and carrying the import error.
+    real_import = cli.importlib.import_module
+    optional = {
+        "PIL", "scipy", "pydub", "pypdf", "redis", "psycopg",
+        "fastapi", "uvicorn", "python_multipart",
+    }
+
+    def _fake_import(name: str, *args: object, **kwargs: object) -> object:
+        if name in optional:
+            raise ModuleNotFoundError(f"No module named {name!r}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(cli.importlib, "import_module", _fake_import)
+
+    code, out, err = _run(["doctor"], capsys)
+
+    assert code == 0
+    assert err == ""
+    payload = json.loads(out)
+    # With no extras importable, only the core capabilities remain available.
+    assert payload["available_handlers"] == sorted({"binary", "text", "archive"})
+    assert payload["available_backends"] == sorted({"memory", "sqlite"})
+    for name, report in payload["extras"].items():
+        assert report["available"] is False, f"{name} must be unavailable when its deps fail to import"
+        assert all(probe["ok"] is False and probe["error"] for probe in report["probes"])

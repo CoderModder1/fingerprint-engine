@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import warnings
 from collections.abc import Iterable
+from dataclasses import replace
 
 import numpy as np
 
@@ -181,8 +182,13 @@ class FFTFingerprintPipeline:
 
         Mirrors what :meth:`spectrogram` computes internally; recorded in
         fingerprint metadata so adaptive windowing is transparent and auditable.
+        When the multi-resolution window bank is active there is no single
+        window, so the smallest bank window's effective (window, hop) is
+        reported -- purely informational metadata, not load-bearing for matching.
         """
 
+        if self.config.window_bank:
+            return self._bank_pipeline(min(self.config.window_bank)).effective_params(signal)
         return self._effective_window_hop(self.normalize_signal(signal).size)
 
     def spectrogram(self, signal: np.ndarray | Iterable[float]) -> np.ndarray:
@@ -276,8 +282,19 @@ class FFTFingerprintPipeline:
         peaks.sort(key=lambda item: (item.time_index, item.frequency_bin, -item.magnitude))
         return peaks
 
-    def build_hashes(self, peaks: list[LandmarkPoint]) -> list[ConstellationHash]:
-        """Build constellation pairs and hash them into compact integer codes."""
+    def build_hashes(
+        self,
+        peaks: list[LandmarkPoint],
+        *,
+        window_tag: int | None = None,
+    ) -> list[ConstellationHash]:
+        """Build constellation pairs and hash them into compact integer codes.
+
+        ``window_tag`` is forwarded to :meth:`hash_pair`. ``None`` (the default)
+        is the byte-identical single-window path; a window size folds that window
+        into every code so it only collides with same-window codes (the
+        multi-resolution window bank, see :meth:`fingerprint_signal`).
+        """
 
         ordered = sorted(peaks, key=lambda item: (item.time_index, item.frequency_bin))
         hashes: list[ConstellationHash] = []
@@ -300,7 +317,9 @@ class FFTFingerprintPipeline:
             )
             for target in targets[: self.config.constellation_fanout]:
                 delta_t = target.time_index - anchor.time_index
-                hash_code = self.hash_pair(anchor.frequency_bin, target.frequency_bin, delta_t)
+                hash_code = self.hash_pair(
+                    anchor.frequency_bin, target.frequency_bin, delta_t, window_tag=window_tag
+                )
                 hashes.append(
                     ConstellationHash(
                         hash_code=hash_code,
@@ -316,27 +335,106 @@ class FFTFingerprintPipeline:
         hashes.sort(key=lambda item: (item.time_offset, item.hash_code, item.freq1, item.freq2))
         return hashes
 
-    def hash_pair(self, freq1: int, freq2: int, delta_t: int) -> int:
-        """Hash a peak-pair tuple into the configured number of bits."""
+    def hash_pair(self, freq1: int, freq2: int, delta_t: int, *, window_tag: int | None = None) -> int:
+        """Hash a peak-pair tuple into the configured number of bits.
 
+        When ``config.freq_quantization`` is 1 (the default) the exact
+        ``(freq1, freq2, delta_t)`` tuple is hashed -- byte-identical to the
+        behaviour before the flag existed. When it is >1 the two frequency bins
+        are snapped to a coarser grid (``bin // freq_quantization``) before
+        packing, so peaks that drift by less than one coarse band (e.g. from a
+        JPEG re-encode or a small text edit) hash to the same code and the true
+        match survives the shift. ``delta_t`` is left untouched. The packed
+        ``freq1``/``freq2`` therefore carry a *band index*, not a raw bin, when
+        quantization is enabled.
+
+        ``window_tag`` is the multi-resolution window-bank fold (see
+        :meth:`fingerprint_signal` and :attr:`FingerprintConfig.window_bank`).
+        When ``None`` (the default and the entire single-window path) the
+        payload is exactly the three packed fields above -- byte-identical to the
+        pre-bank hash. When a window size is supplied, it is appended to the
+        payload before hashing, so a code derived at window ``w`` can only
+        collide with another code derived at window ``w`` (codes from different
+        bank windows live in disjoint regions of the hash space).
+        """
+
+        quant = self.config.freq_quantization
+        if quant > 1:
+            freq1 = int(freq1) // quant
+            freq2 = int(freq2) // quant
         payload = (
             int(freq1).to_bytes(4, "big", signed=False)
             + int(freq2).to_bytes(4, "big", signed=False)
             + int(delta_t).to_bytes(4, "big", signed=False)
         )
+        if window_tag is not None:
+            payload += int(window_tag).to_bytes(4, "big", signed=False)
         digest = hashlib.blake2b(payload, digest_size=8).digest()
         value = int.from_bytes(digest, "big", signed=False)
         if self.config.hash_bits == 64:
             return value
         return value & ((1 << self.config.hash_bits) - 1)
 
+    def _bank_hop(self, window: int) -> int:
+        """Per-bank-window hop preserving the configured window:hop overlap ratio.
+
+        The single-window overlap (e.g. 4096/1024 == 4) is applied to each bank
+        window so all bank resolutions share the same fractional frame stride;
+        clamped to >= 1.
+        """
+
+        ratio = self.config.window_size / max(1, self.config.hop_size)
+        return max(1, round(window / ratio))
+
+    def _bank_pipeline(self, window: int) -> FFTFingerprintPipeline:
+        """A single-window sub-pipeline pinned to one bank window.
+
+        Built with ``window_bank=None`` (so it runs the ordinary single-window
+        path) and ``fixed_window=True`` (the bank window is authoritative: it is
+        not shrunk as a function of per-file length, which is exactly what keeps
+        the same content comparable across lengths at a given resolution). The
+        hop preserves the configured overlap ratio.
+        """
+
+        sub_config = replace(
+            self.config,
+            window_size=window,
+            hop_size=self._bank_hop(window),
+            window_bank=None,
+        )
+        return FFTFingerprintPipeline(sub_config, fixed_window=True)
+
     def fingerprint_signal(
         self,
         signal: np.ndarray | Iterable[float],
     ) -> tuple[list[LandmarkPoint], list[ConstellationHash]]:
-        """Convenience wrapper for the full signal-to-hash flow."""
+        """Convenience wrapper for the full signal-to-hash flow.
 
-        matrix = self.spectrogram(signal)
-        peaks = self.extract_peaks(matrix)
-        hashes = self.build_hashes(peaks)
-        return peaks, hashes
+        With ``config.window_bank`` unset (the default) this is the single-window
+        path -- byte-identical to before the bank existed. With a bank set, the
+        signal is fingerprinted once per bank window through a per-window
+        sub-pipeline, and each window's size is folded into its hashes (so
+        window-w codes only collide with window-w codes). The per-window landmark
+        lists and hash lists are concatenated; landmarks are returned in
+        ascending bank-window order and the hashes are deterministically sorted,
+        so the output is reproducible for a given signal and config. A bank of N
+        windows produces roughly N times the postings of the single-window path.
+        """
+
+        if not self.config.window_bank:
+            matrix = self.spectrogram(signal)
+            peaks = self.extract_peaks(matrix)
+            hashes = self.build_hashes(peaks)
+            return peaks, hashes
+
+        all_peaks: list[LandmarkPoint] = []
+        all_hashes: list[ConstellationHash] = []
+        for window in sorted(self.config.window_bank):
+            sub = self._bank_pipeline(window)
+            matrix = sub.spectrogram(signal)
+            peaks = sub.extract_peaks(matrix)
+            hashes = sub.build_hashes(peaks, window_tag=window)
+            all_peaks.extend(peaks)
+            all_hashes.extend(hashes)
+        all_hashes.sort(key=lambda item: (item.time_offset, item.hash_code, item.freq1, item.freq2))
+        return all_peaks, all_hashes

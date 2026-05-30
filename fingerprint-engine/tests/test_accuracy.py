@@ -32,6 +32,7 @@ from benchmarks.accuracy import (  # noqa: E402 - after sys.path bootstrap
     threshold_sweep,
 )
 from fingerprint_engine.core.fingerprinter import Fingerprinter  # noqa: E402 - after sys.path bootstrap
+from fingerprint_engine.core.models import FingerprintConfig  # noqa: E402 - after sys.path bootstrap
 
 SEED = 1234
 TEXT_CORPUS = 24
@@ -174,3 +175,62 @@ def test_audio_exact_recall_and_separation(tmp_path: Path) -> None:
     for name in ("clip_prefix_60pct", "excerpt_mid"):
         recall = _mutation(report, name)["recall_at_1"]
         assert 0.0 <= recall <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# OPT-IN multi-resolution window bank: the key experiment. The default single-
+# window matcher scores ~0 on audio excerpts/clips (whole-signal re-normalisation
+# shifts the global time grid). Fingerprinting at a BANK of windows -- with the
+# window folded into each hash so window-w only collides with window-w -- lets a
+# query align at whatever window survives the excerpt, fixing that 0-recall while
+# leaving exact recall and the impostor separation intact (at an N-fold posting
+# cost). These tests pin the OFF->ON improvement and the no-regression guards.
+# ---------------------------------------------------------------------------
+
+_AUDIO_WINDOW_BANK = (512, 1024, 2048, 4096)
+
+
+def test_window_bank_fixes_audio_excerpt_recall(tmp_path: Path) -> None:
+    pytest.importorskip("scipy")
+    bank_cfg = FingerprintConfig(window_bank=_AUDIO_WINDOW_BANK)
+
+    # OFF: the documented baseline -- excerpt/clip recall is at the floor.
+    off = evaluate_audio(Fingerprinter(), np.random.default_rng(SEED), AUDIO_CORPUS, tmp_path)
+    off_clip = _mutation(off, "clip_prefix_60pct")["recall_at_1"]
+    off_excerpt = _mutation(off, "excerpt_mid")["recall_at_1"]
+
+    # ON: the same corpus and mutations, fingerprinted at the window bank.
+    on = evaluate_audio(
+        Fingerprinter(config=bank_cfg), np.random.default_rng(SEED), AUDIO_CORPUS, tmp_path
+    )
+    on_clip = _mutation(on, "clip_prefix_60pct")["recall_at_1"]
+    on_excerpt = _mutation(on, "excerpt_mid")["recall_at_1"]
+
+    # The bank must strictly improve at least one excerpt/clip case, and not
+    # regress the other -- the headline result.
+    assert (on_clip > off_clip) or (on_excerpt > off_excerpt)
+    assert on_clip >= off_clip
+    assert on_excerpt >= off_excerpt
+
+    # No-regression guards: exact self-match and the true-vs-impostor separation
+    # must survive the bank (it adds resolutions, it does not blur identity).
+    assert on.exact_recall_at_1 == 1.0
+    assert on.mean_true_confidence >= 0.5
+    assert on.mean_impostor_confidence < 0.05
+
+    # The bank ~N-folds postings (one constellation per window). Confirm the cost
+    # is real and bounded near the bank size, not a free lunch.
+    multiplier = on.avg_hashes_per_file / max(1.0, off.avg_hashes_per_file)
+    assert multiplier > 1.5
+
+
+def test_window_bank_preserves_text_recall(tmp_path: Path) -> None:
+    # The bank must not regress the already-strong text near-dup recall while it
+    # opens the cross-length resolutions.
+    bank_cfg = FingerprintConfig(window_bank=_AUDIO_WINDOW_BANK)
+    rng = np.random.default_rng(SEED)
+    report, _index, _fps = evaluate_text(Fingerprinter(config=bank_cfg), rng, TEXT_CORPUS, tmp_path)
+    assert report.exact_recall_at_1 == 1.0
+    for name in ("append", "truncate_prefix", "front_insert", "char_edit_2pct", "char_edit_5pct"):
+        assert _mutation(report, name)["recall_at_1"] == 1.0, f"{name} regressed under the bank"
+    assert report.mean_impostor_confidence < 0.05

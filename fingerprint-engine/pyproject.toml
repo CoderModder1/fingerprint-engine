@@ -35,13 +35,40 @@ dependencies = ["numpy>=1.23"]
 image = ["Pillow>=9.0"]
 audio = ["scipy>=1.9", "pydub>=0.25"]
 pdf = ["pypdf>=3.0"]
+# Video keyframe fingerprinting: PyAV (ffmpeg bindings) decodes frames and
+# Pillow canonicalizes each keyframe to the shared 256x256 grayscale grid. Both
+# are lazily imported by VideoFileHandler, so a core-only install never needs
+# them and importing the package never pulls them in.
+video = ["av>=10.0", "Pillow>=9.0"]
+# Embedding-sequence fingerprinting: the precomputed-vector path (.npy/.jsonl)
+# is numpy-only (the one core dep) and always available. This extra provides a
+# default encoder for the optional encode-on-load path; it is lazily imported
+# only when a concrete Embedder is wired in.
+embeddings = ["sentence-transformers>=2.2"]
 redis = ["redis>=4.0"]
 postgres = ["psycopg[binary]>=3.1"]
-all = ["Pillow>=9.0", "scipy>=1.9", "pydub>=0.25", "pypdf>=3.0", "redis>=4.0", "psycopg[binary]>=3.1"]
+# HTTP service (fingerprint_engine.service): the FastAPI app + the ASGI server
+# to run it. python-multipart is required by Starlette to parse file uploads.
+# All lazily imported, so a core-only install never needs these.
+service = ["fastapi>=0.100", "uvicorn>=0.23", "python-multipart>=0.0.6"]
+all = [
+    "Pillow>=9.0",
+    "scipy>=1.9",
+    "pydub>=0.25",
+    "pypdf>=3.0",
+    "av>=10.0",
+    "sentence-transformers>=2.2",
+    "redis>=4.0",
+    "psycopg[binary]>=3.1",
+    "fastapi>=0.100",
+    "uvicorn>=0.23",
+    "python-multipart>=0.0.6",
+]
 dev = [
     "fingerprint-engine[all]",
     "pytest>=7.0",
     "fakeredis>=2.0",
+    "httpx>=0.24",
     "ruff>=0.5",
     "mypy>=1.8",
 ]
@@ -66,6 +93,12 @@ select = ["E", "F", "I", "W", "UP", "B"]
 # tests and benchmarks bootstrap sys.path before importing the package.
 "tests/*" = ["E402"]
 "benchmarks/*" = ["E402"]
+# The HTTP service uses FastAPI's request-parameter dependency markers
+# (File(...)/Query(...)) as argument defaults. That is the framework's intended,
+# documented idiom -- FastAPI introspects these defaults to build the request
+# schema -- so B008 ("no function call in argument defaults") is a false
+# positive here and is ignored only for this module.
+"fingerprint_engine/service.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.10"

@@ -185,8 +185,12 @@ built at 1024. Two design choices keep that window stable across size changes:
   — but note a short audio *excerpt* does **not** reliably match its full track
   (global signal normalisation and the global peak threshold both shift when
   computed over a sub-segment), so audio excerpt/clip matching is a known
-  limitation, unlike the text/PDF prefix case above. See `benchmarks/accuracy.py`,
-  which measures this.
+  limitation of the **default single-window mode**, unlike the text/PDF prefix
+  case above. It is **mitigated by the opt-in multi-resolution `window_bank`**
+  config (e.g. `FingerprintConfig(window_bank=(512, 1024, 2048, 4096))`), which
+  raises audio excerpt recall@1 from ~0 to 1.0 at the cost of ~3.4× more hashes
+  per file (index and query indexes must share the same `window_bank`). See
+  `benchmarks/accuracy.py`, which measures both.
 - **Canonical image normalisation.** Every image is resampled to a fixed
   256×256 grayscale grid before the signal is built, so the *same picture at a
   different resolution* (or after lossy re-encoding) maps to a comparable signal.

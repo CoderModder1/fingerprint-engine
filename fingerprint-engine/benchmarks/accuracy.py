@@ -381,9 +381,30 @@ def evaluate_image(
         images[i].save(buffer, format="JPEG", quality=40)
         return buffer.getvalue()
 
+    def _crop(i: int) -> bytes:
+        # Trim a 10% border off every edge. A raster row-major signal is wrecked
+        # by this (every row shifts after the canonical resize); a DCT pHash, a
+        # low-frequency global descriptor, is far more tolerant. Disclaimed as a
+        # raster limitation in the README -- measured here for the phash compare.
+        image = images[i]
+        width, height = image.size
+        box = (int(width * 0.1), int(height * 0.1), int(width * 0.9), int(height * 0.9))
+        buffer = io.BytesIO()
+        image.crop(box).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def _rotate(i: int) -> bytes:
+        # A small 5-degree rotation (expand so nothing is clipped). Same story as
+        # crop: catastrophic for the raster row signal, gentler on the pHash.
+        buffer = io.BytesIO()
+        images[i].rotate(5, expand=True, fillcolor=128).save(buffer, format="PNG")
+        return buffer.getvalue()
+
     mutations = [
         _measure_mutation("resize_downscale", index, fingerprinter, workdir, fingerprints, _resized, ".png"),
         _measure_mutation("jpeg_q40", index, fingerprinter, workdir, fingerprints, _jpeg, ".jpg"),
+        _measure_mutation("crop_border_10pct", index, fingerprinter, workdir, fingerprints, _crop, ".png"),
+        _measure_mutation("rotate_5deg", index, fingerprinter, workdir, fingerprints, _rotate, ".png"),
     ]
     return _build_report("image", fingerprints, recall, true_conf, impostor_conf, mutations)
 

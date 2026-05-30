@@ -20,7 +20,12 @@ from fingerprint_engine.core.index import (
     RedisHashIndex,
     SQLiteHashIndex,
 )
-from fingerprint_engine.core.models import Calibration, ConstellationHash, Fingerprint
+from fingerprint_engine.core.models import (
+    Calibration,
+    ConstellationHash,
+    Fingerprint,
+    IndexPosting,
+)
 
 
 def _fake_redis():
@@ -708,6 +713,83 @@ def test_in_memory_concurrent_add_and_search_stay_consistent() -> None:
     assert {r.file_id for r in index.search(make_fingerprint("q", [1, 2, 3]), top_k=100)} == set(file_ids)
 
 
+def test_in_memory_concurrent_readd_remove_never_keyerrors_readers() -> None:
+    # Reproduces the surrogate-deref concurrency regression: lock-free readers
+    # (search()/query()) read a posting list and THEN dereference the surrogate
+    # -> file_id map. With delete-on-remove, a concurrent remove()/re-add() of an
+    # OVERLAPPING id set retires that surrogate in between, so the reader hits a
+    # KeyError. The fix keeps surrogate mappings alive across remove(), so the
+    # deref always resolves. Writers churn an overlapping id set under contention
+    # while readers search()/query() the same hash codes; assert NO reader raises.
+    index = InMemoryHashIndex()
+    # Overlapping id set: writers add/remove/re-add the SAME pool of ids, so a
+    # surrogate a reader just observed is the one a writer is retiring/replacing.
+    shared_ids = [f"shared-{i}" for i in range(12)]
+    # The query hash codes (1000, 1001, 1002) match make_fingerprint's codes, so
+    # every reader fetch touches the churning postings -- maximal deref pressure.
+    query = make_fingerprint("q", [0, 1, 2])
+    hash_codes = [item.hash_code for item in query.hashes]
+
+    n_writers = 4
+    n_readers = 4
+    iterations = 300
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(n_writers + n_readers)
+    stop = threading.Event()
+
+    def writer(seed: int) -> None:
+        try:
+            barrier.wait()
+            for i in range(iterations):
+                fid = shared_ids[(seed + i) % len(shared_ids)]
+                index.add(make_fingerprint(fid, [0, 1, 2]))
+                index.remove(fid)
+                index.add(make_fingerprint(fid, [0, 1, 2]))  # re-add same id
+        except BaseException as exc:  # noqa: BLE001 - surface any thread failure
+            errors.append(exc)
+        finally:
+            stop.set()
+
+    def reader() -> None:
+        try:
+            barrier.wait()
+            # Spin reads until writers finish; a KeyError here is the regression.
+            while not stop.is_set():
+                index.search(query, top_k=10)
+                for code in hash_codes:
+                    index.query(code)
+        except BaseException as exc:  # noqa: BLE001 - surface any thread failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(s,)) for s in range(n_writers)]
+    threads += [threading.Thread(target=reader) for _ in range(n_readers)]
+    # Force frequent thread switches so the (GIL-protected but multi-bytecode)
+    # window between a reader capturing a posting list and dereferencing its
+    # surrogate is reliably interleaved with a writer's remove(). On the buggy
+    # delete-on-remove code this surfaces the KeyError every run; restored in
+    # finally so the tight interval never leaks into other tests.
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(previous_interval)
+
+    # No reader (or writer) raised -- in particular no surrogate-deref KeyError.
+    assert not errors, errors
+    # Final state is self-consistent: every surviving file has live postings and
+    # posting_count equals the sum over surviving files (no orphaned/lost rows).
+    surviving = index.list_files()
+    expected_postings = sum(len(index._file_entries[fid]) for fid in surviving)
+    assert index.posting_count == expected_postings
+    assert index.file_count == len(surviving)
+    # Surviving ids resolve cleanly through a final search (no stale surrogate).
+    assert set(r.file_id for r in index.search(query, top_k=100)) <= set(surviving)
+
+
 # ---------------------------------------------------------------------------
 # Cross-backend invariant parity (Task 4)
 #
@@ -1278,3 +1360,565 @@ def test_pg_add_many_preserves_replace_semantics(pg_index) -> None:
             cur.execute(f"DROP TABLE IF EXISTS {reference._postings_table}, {reference._files_table}")
         reference._conn.commit()
         reference.close()
+
+
+# ---------------------------------------------------------------------------
+# OPT-IN offset-tolerant voting (item 2 -- multi-edit near-dups)
+#
+# search(offset_tolerance>0) sums the winning bin's votes over +-tolerance
+# adjacent delta bins so multi-edit near-dups whose votes fragment across
+# adjacent deltas recover their score. The default (0 / unset) MUST stay
+# byte-identical to exact-bin voting, and any tolerance MUST band identically
+# across every backend (the SQL backends band the server-side histogram in the
+# shared Python reducer, the in-memory backend bands its own histogram).
+# ---------------------------------------------------------------------------
+
+
+def _fragmented_corpus_and_query() -> tuple[list[Fingerprint], Fingerprint]:
+    """A multi-edit query whose true match fragments across THREE delta bins.
+
+    ``doc`` is codes 1..12 at consecutive offsets. The query reproduces all 12
+    codes but in three 4-code fragments shifted by 0, +1, +2 frames (as three
+    insertions would shift the absolute frame index of everything after them),
+    so the true offset histogram for ``doc`` is {0: 4, 1: 4, 2: 4} -- max single
+    bin 4. ``decoy`` shares six codes that all align in ONE bin (6 votes), so it
+    beats the fragmented true match at exact-bin (tolerance 0) voting. A
+    tolerance that spans the three fragments recombines them to 12 and recovers
+    ``doc`` as the rank-1 match.
+    """
+
+    doc = fp_with_hashes("doc", [(code, code - 1) for code in range(1, 13)])
+    decoy = fp_with_hashes("decoy", [(100 + i, i) for i in range(6)])
+    pairs = (
+        [(code, code - 1) for code in range(1, 5)]        # fragment A: delta 0
+        + [(code, (code - 1) - 1) for code in range(5, 9)]   # fragment B: delta +1
+        + [(code, (code - 1) - 2) for code in range(9, 13)]  # fragment C: delta +2
+        + [(100 + i, i) for i in range(6)]                   # decoy codes, delta 0
+    )
+    return [doc, decoy], fp_with_hashes("q", pairs)
+
+
+def test_offset_tolerance_default_is_byte_identical_across_backends() -> None:
+    # DEFAULT-PRESERVING: an unset / explicit-0 offset_tolerance, and a default
+    # Calibration (offset_tolerance 0), must all reproduce the EXACT same ranked
+    # (file_id, offset, aligned_votes, score) tuples as the legacy exact-bin
+    # search -- on a corpus that has a genuine multi-bin histogram.
+    corpus, query = _fragmented_corpus_and_query()
+    for name, index in _parity_backends():
+        for fingerprint in corpus:
+            index.add(fingerprint)
+        baseline = _search_tuples(index, query, top_k=10)
+        # The fragmented true match loses to the single-bin decoy at exact bins.
+        assert baseline[0][0] == "decoy", name
+        # Every spelling of "off" yields the identical ranking.
+        assert _search_tuples(index, query, top_k=10) == baseline, name
+        assert [
+            (r.file_id, r.offset, r.aligned_votes, r.score)
+            for r in index.search(query, top_k=10, offset_tolerance=0)
+        ] == baseline, name
+        assert [
+            (r.file_id, r.offset, r.aligned_votes, r.score)
+            for r in index.search(query, top_k=10, calibration=Calibration())
+        ] == baseline, name
+        assert [
+            (r.file_id, r.offset, r.aligned_votes, r.score)
+            for r in index.search(query, top_k=10, calibration=Calibration(offset_tolerance=0))
+        ] == baseline, name
+
+
+def test_offset_tolerance_recovers_multi_edit_and_is_parity_identical() -> None:
+    # tolerance>0 recovers the fragmented true match AND every backend bands
+    # identically (full ranked-tuple parity), at tolerance 1 and 2.
+    corpus, query = _fragmented_corpus_and_query()
+    per_tolerance: dict[int, dict[str, list[tuple[str, int, int, float]]]] = {1: {}, 2: {}}
+    for name, index in _parity_backends():
+        for fingerprint in corpus:
+            index.add(fingerprint)
+        # tolerance 0 fails to rank the true match first...
+        assert index.search(query, top_k=1, offset_tolerance=0)[0].file_id == "decoy", name
+        for tolerance in (1, 2):
+            results = index.search(query, top_k=10, offset_tolerance=tolerance)
+            top = results[0]
+            # ...tolerance recombines the three 4-vote fragments into 12 votes.
+            assert top.file_id == "doc", (name, tolerance)
+            assert top.aligned_votes == 12, (name, tolerance)
+            assert top.confidence == 1.0, (name, tolerance)
+            per_tolerance[tolerance][name] = [
+                (r.file_id, r.offset, r.aligned_votes, r.score) for r in results
+            ]
+
+    # Cross-backend parity: every backend produced the identical banded ranking.
+    for tolerance, by_backend in per_tolerance.items():
+        reference = by_backend["in_memory"]
+        for name, tuples in by_backend.items():
+            assert tuples == reference, (tolerance, name, tuples, reference)
+    # Documented band-centre behaviour: tol=1's winning centre is delta 1 (its
+    # band [0, 2] covers all three fragments); tol=2 picks the SMALLER centre 0
+    # (its band [-2, 2] also covers them) per the votes-DESC, delta-ASC rule.
+    assert per_tolerance[1]["in_memory"][0][1] == 1
+    assert per_tolerance[2]["in_memory"][0][1] == 0
+
+
+def test_offset_tolerance_via_calibration_field_and_explicit_arg_precedence() -> None:
+    # The Calibration.offset_tolerance field drives banding when no explicit arg
+    # is given; an explicit search(offset_tolerance=...) overrides the field.
+    corpus, query = _fragmented_corpus_and_query()
+    index = InMemoryHashIndex()
+    for fingerprint in corpus:
+        index.add(fingerprint)
+
+    # Field alone (no explicit arg) bands and recovers the true match.
+    via_field = index.search(query, top_k=1, calibration=Calibration(offset_tolerance=1))
+    assert via_field[0].file_id == "doc"
+
+    # Explicit 0 overrides a banding calibration -> back to exact-bin (decoy).
+    overridden = index.search(
+        query, top_k=1, calibration=Calibration(offset_tolerance=2), offset_tolerance=0
+    )
+    assert overridden[0].file_id == "decoy"
+
+    # Explicit tolerance overrides a zero-tolerance calibration -> bands.
+    forced = index.search(
+        query, top_k=1, calibration=Calibration(offset_tolerance=0), offset_tolerance=1
+    )
+    assert forced[0].file_id == "doc"
+
+
+def test_offset_tolerance_negative_is_rejected() -> None:
+    corpus, query = _fragmented_corpus_and_query()
+    index = InMemoryHashIndex()
+    for fingerprint in corpus:
+        index.add(fingerprint)
+    with pytest.raises(ValueError, match="offset_tolerance"):
+        index.search(query, offset_tolerance=-1)
+    with pytest.raises(ValueError, match="offset_tolerance"):
+        Calibration(offset_tolerance=-1)
+
+
+def test_banded_winner_matches_exact_bin_when_tolerance_zero() -> None:
+    # Unit-level: with tolerance 0 the banded winner equals the legacy
+    # max(items, key=(votes, -delta)) for a histogram with a genuine tie.
+    histogram = {100: 2, 200: 2, 50: 1}
+    assert InMemoryHashIndex._banded_winner(histogram, 0) == (100, 2)  # votes tie -> smaller delta
+    # A clear single winner is returned exactly.
+    assert InMemoryHashIndex._banded_winner({5: 1, 6: 3, 7: 1}, 0) == (6, 3)
+
+
+def test_banded_winner_sums_adjacent_bins_and_breaks_ties_by_smaller_centre() -> None:
+    # Two fragments at deltas 10 and 11 (3 votes each) plus an isolated 6-vote
+    # bin at delta 40. At tolerance 0 the 40-bin wins (6 > 3). At tolerance 1 the
+    # band around centre 10 (or 11) sums to 6, tying the 40-bin; the smaller
+    # centre (10) wins the tie.
+    histogram = {10: 3, 11: 3, 40: 6}
+    assert InMemoryHashIndex._banded_winner(histogram, 0) == (40, 6)
+    assert InMemoryHashIndex._banded_winner(histogram, 1) == (10, 6)
+    # A wider band that also pulls in the 40-bin only at a far centre still
+    # prefers the densest, smallest-centre window.
+    assert InMemoryHashIndex._banded_winner({10: 3, 11: 3, 12: 3}, 1) == (11, 9)
+
+
+def test_offset_tolerance_does_not_change_a_clean_self_match() -> None:
+    # A coherent (single-bin) match is unaffected by banding: a self-search still
+    # aligns all votes in one bin, so the offset / aligned_votes / score are the
+    # SAME at tolerance 0, 1 and 2 (banding only ADDS neighbouring bins, of which
+    # there are none here). Guards against banding perturbing the common case.
+    index = InMemoryHashIndex()
+    index.add(make_fingerprint("aligned", [10, 20, 30, 40]))
+    index.add(make_fingerprint("scattered", [2, 40, 99, 125]))
+    query = make_fingerprint("query", [3, 13, 23, 33])
+
+    exact = _search_tuples(index, query, top_k=5)
+    assert exact[0][0] == "aligned" and exact[0][2] == 4
+    for tolerance in (1, 2):
+        assert _search_tuples(index, query, top_k=5) == exact  # unset default
+        banded = [
+            (r.file_id, r.offset, r.aligned_votes, r.score)
+            for r in index.search(query, top_k=5, offset_tolerance=tolerance)
+        ]
+        # The coherent winner is unchanged; "scattered" may gain banded votes but
+        # must never overtake the clean full-confidence match.
+        assert banded[0] == exact[0], tolerance
+
+
+# ---------------------------------------------------------------------------
+# OPT-IN ANN/LSH-style candidate prefilter (candidate_limit). Default None =
+# OFF = full exact search, byte-identical. A generous limit (>= top_k, and a
+# superset of the true matches) must leave the ranking identical.
+# ---------------------------------------------------------------------------
+
+
+def _prefilter_corpus() -> list[Fingerprint]:
+    """A corpus with a clear shared-hash gradient between files.
+
+    Query uses codes 1..6 at offset 0. "alpha" shares all six coherently
+    (strongest, highest shared-hash count); "beta" shares five; "gamma" three;
+    "delta" two; "noise" shares none of the query codes (uses codes 90..92), so
+    it is never a candidate. This makes the shared-hash ranking unambiguous so a
+    prefilter cut at a known boundary is deterministic.
+    """
+
+    return [
+        fp_with_hashes("alpha", [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)]),
+        fp_with_hashes("beta", [(1, 5), (2, 6), (3, 7), (4, 8), (5, 9)]),
+        fp_with_hashes("gamma", [(1, 100), (2, 7), (3, 30)]),
+        fp_with_hashes("delta", [(1, 3), (2, 99)]),
+        fp_with_hashes("noise", [(90, 1), (91, 2), (92, 3)]),
+    ]
+
+
+def _prefilter_query() -> Fingerprint:
+    return fp_with_hashes("q", [(1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0)])
+
+
+def test_candidate_limit_none_is_byte_identical_full_search_across_backends() -> None:
+    # DEFAULT-PRESERVING: candidate_limit=None (the default) must be the full
+    # exact search -- byte-identical to omitting the argument entirely -- on
+    # every backend.
+    corpus = _prefilter_corpus()
+    query = _prefilter_query()
+    for name, index in _parity_backends():
+        for fingerprint in corpus:
+            index.add(fingerprint)
+        full = _search_tuples(index, query, top_k=10)
+        explicit_none = [
+            (r.file_id, r.offset, r.aligned_votes, r.score)
+            for r in index.search(query, top_k=10, candidate_limit=None)
+        ]
+        assert explicit_none == full, name
+        # Sanity: every shared-hash file ranked, "noise" (no shared code) absent.
+        ranked_ids = {row[0] for row in full}
+        assert "alpha" in ranked_ids and "noise" not in ranked_ids, name
+
+
+def test_candidate_limit_superset_keeps_ranking_identical_across_backends() -> None:
+    # When the candidate set is a SUPERSET of the true top-k, the final ranking
+    # is identical to full search. There are four shared-hash files; a limit of
+    # 4 (or more) retains them all, so the ranking must match the full search
+    # byte-for-byte on every backend.
+    corpus = _prefilter_corpus()
+    query = _prefilter_query()
+    for name, index in _parity_backends():
+        for fingerprint in corpus:
+            index.add(fingerprint)
+        full = _search_tuples(index, query, top_k=10)
+        for limit in (4, 5, 10, 100):
+            limited = [
+                (r.file_id, r.offset, r.aligned_votes, r.score)
+                for r in index.search(query, top_k=10, candidate_limit=limit)
+            ]
+            assert limited == full, (name, limit)
+
+
+def test_candidate_limit_keeps_self_match_recall_for_high_overlap() -> None:
+    # A self/near-dup query has maximal shared-hash count, so even a TIGHT limit
+    # (1) keeps the true top-1. recall@1 stays 1.0 for the strongest match.
+    corpus = _prefilter_corpus()
+    query = _prefilter_query()
+    for name, index in _parity_backends():
+        for fingerprint in corpus:
+            index.add(fingerprint)
+        top1 = index.search(query, top_k=1, candidate_limit=1)
+        assert top1 and top1[0].file_id == "alpha", name
+
+
+def test_candidate_limit_reduces_candidate_set_below_corpus() -> None:
+    # The speed proxy: a tight limit aggregates strictly fewer files than the
+    # full search would. With four shared-hash files, limit=2 yields exactly two
+    # results (the two strongest), proving the candidate set is smaller than the
+    # set the full search scores.
+    corpus = _prefilter_corpus()
+    query = _prefilter_query()
+    for name, index in _parity_backends():
+        for fingerprint in corpus:
+            index.add(fingerprint)
+        full = index.search(query, top_k=10)
+        limited = index.search(query, top_k=10, candidate_limit=2)
+        assert len(full) == 4, name  # alpha, beta, gamma, delta all share a code
+        assert len(limited) == 2, name  # only the top-2 shared-hash files scored
+        assert [r.file_id for r in limited] == ["alpha", "beta"], name
+
+
+def test_candidate_limit_zero_returns_no_results_across_backends() -> None:
+    corpus = _prefilter_corpus()
+    query = _prefilter_query()
+    for name, index in _parity_backends():
+        for fingerprint in corpus:
+            index.add(fingerprint)
+        assert index.search(query, top_k=10, candidate_limit=0) == [], name
+
+
+def test_candidate_limit_negative_is_rejected() -> None:
+    index = InMemoryHashIndex()
+    index.add(fp_with_hashes("alpha", [(1, 10), (2, 20)]))
+    query = fp_with_hashes("q", [(1, 0), (2, 0)])
+    with pytest.raises(ValueError, match="candidate_limit"):
+        index.search(query, top_k=5, candidate_limit=-1)
+
+
+def test_candidate_prefilter_recall_on_harness_corpus() -> None:
+    # MEASUREMENT-as-test: on the deterministic accuracy harness corpus, a
+    # generous candidate_limit keeps exact self-match recall@1 at 1.0 and the
+    # candidate set strictly smaller than the corpus for a self-query.
+    import tempfile
+
+    import numpy as np
+
+    from benchmarks.accuracy import _write_text_corpus
+    from fingerprint_engine.core.fingerprinter import Fingerprinter
+
+    fingerprinter = Fingerprinter()
+    rng = np.random.default_rng(1234)
+    with tempfile.TemporaryDirectory(prefix="fp_prefilter_") as tmp:
+        paths, _texts = _write_text_corpus(rng, 36, Path(tmp))
+        fingerprints = [fingerprinter.fingerprint_file(p) for p in paths]
+    index = InMemoryHashIndex()
+    index.add_many(fingerprints)
+
+    corpus_size = len(fingerprints)
+    hits_full = 0
+    hits_pref = 0
+    candidate_sizes: list[int] = []
+    for fingerprint in fingerprints:
+        full = index.search(fingerprint, top_k=1)
+        pref = index.search(fingerprint, top_k=1, candidate_limit=10)
+        if full and full[0].file_id == fingerprint.file_id:
+            hits_full += 1
+        if pref and pref[0].file_id == fingerprint.file_id:
+            hits_pref += 1
+        candidate_sizes.append(len(index._select_candidates(fingerprint, 10)))  # type: ignore[arg-type]
+
+    # Full and prefiltered exact recall@1 are both perfect for self-matches.
+    assert hits_full == corpus_size
+    assert hits_pref == corpus_size
+    # The prefilter caps the candidate set well below the corpus size (the speed
+    # proxy): a self-query never expands the candidate set beyond the limit.
+    assert max(candidate_sizes) <= 10 < corpus_size
+
+
+# --------------------------------------------------------------------------- #
+# Integer file_id surrogate key (internal storage optimization).
+#
+# InMemoryHashIndex stores a compact integer surrogate per posting instead of
+# the 64-char SHA-256 file_id, mapping back to the str file_id only at the
+# query/aggregate boundary. These tests pin that the optimization is fully
+# OUTPUT-PRESERVING: search rankings, to_dict snapshots, list_files,
+# iter_metadata, query, and query_many are byte-identical to storing the str
+# verbatim, plus the internal surrogate invariants (retire-not-reuse) hold.
+# --------------------------------------------------------------------------- #
+
+# Realistic 64-hex-char SHA-256-shaped file_ids (the value the surrogate replaces).
+_SURROGATE_CORPUS = [
+    ("a" * 64, [(1000, 10), (1001, 20), (1002, 30), (1003, 40)]),
+    ("b" * 64, [(1000, 2), (1001, 40), (1004, 99), (1005, 125)]),
+    ("c" * 64, [(1001, 21), (1002, 31), (1006, 7)]),
+    ("d" * 64, [(1000, 11), (1001, 22), (1002, 33), (1003, 44), (1007, 88)]),
+]
+
+
+def _build_surrogate_index() -> InMemoryHashIndex:
+    index = InMemoryHashIndex()
+    for file_id, code_offsets in _SURROGATE_CORPUS:
+        index.add(fp_with_hashes(file_id, code_offsets))
+    return index
+
+
+def _reference_postings() -> dict[int, list[tuple[str, int]]]:
+    """The (file_id, time_offset) posting lists a str-storing index would hold.
+
+    Recomputed straight from the corpus definition, in add() insertion order,
+    so it is an independent oracle for what query()/query_many() must return.
+    """
+
+    expected: dict[int, list[tuple[str, int]]] = {}
+    for file_id, code_offsets in _SURROGATE_CORPUS:
+        for code, offset in code_offsets:
+            expected.setdefault(code, []).append((file_id, offset))
+    return expected
+
+
+def test_surrogate_query_returns_str_file_ids_in_stored_order() -> None:
+    # query() maps each surrogate back to the original str file_id, preserving
+    # the public IndexPosting return type/values and the stored posting order.
+    index = _build_surrogate_index()
+    expected = _reference_postings()
+    for code, expected_postings in expected.items():
+        got = index.query(code)
+        assert [(p.file_id, p.time_offset) for p in got] == expected_postings
+        assert all(p.hash_code == code for p in got)
+        assert all(isinstance(p.file_id, str) and len(p.file_id) == 64 for p in got)
+
+
+def test_surrogate_query_many_matches_per_code_query() -> None:
+    # query_many is parity-identical to per-code query() (the base contract),
+    # which must survive the surrogate mapping unchanged.
+    index = _build_surrogate_index()
+    codes = [code for code, _ in _reference_postings().items()]
+    batched = index.query_many(codes + [999999])  # include a miss
+    for code in codes:
+        assert sorted((p.file_id, p.time_offset) for p in batched[code]) == \
+               sorted((p.file_id, p.time_offset) for p in index.query(code))
+    assert batched[999999] == []
+
+
+def test_surrogate_postings_store_no_file_id_strings() -> None:
+    # The actual footprint win: every stored posting is a compact (int, int)
+    # pair -- no 64-char file_id string is held per posting.
+    index = _build_surrogate_index()
+    for postings in index._postings.values():
+        for posting in postings:
+            assert isinstance(posting, tuple) and len(posting) == 2
+            assert isinstance(posting[0], int)   # surrogate, not a str file_id
+            assert isinstance(posting[1], int)   # time_offset
+    # Every live surrogate resolves back to a real file_id and round-trips.
+    assert set(index._id_to_fid.values()) == {fid for fid, _ in _SURROGATE_CORPUS}
+    assert index._fid_to_id == {fid: sid for sid, fid in index._id_to_fid.items()}
+
+
+def test_surrogate_search_to_dict_list_files_iter_metadata_identical() -> None:
+    # OUTPUT-PRESERVING PROOF: every observable matches a reference index built
+    # from the SAME fingerprints. (Both use the surrogate storage, but the
+    # reference is reconstructed via the public to_dict/from_dict round-trip,
+    # exercising the full encode/decode path independent of the live add path.)
+    index = _build_surrogate_index()
+    reference = InMemoryHashIndex.from_dict(index.to_dict())
+
+    query = fp_with_hashes("q" * 64, [(1000, 0), (1001, 0), (1002, 0), (1003, 0)])
+    assert _search_tuples(index, query, top_k=10) == _search_tuples(reference, query, top_k=10)
+    # Full SearchResult equality (score, votes, offset, confidence, metadata).
+    assert index.search(query, top_k=10) == reference.search(query, top_k=10)
+
+    assert index.to_dict() == reference.to_dict()
+    assert index.list_files() == reference.list_files()
+    assert list(index.iter_metadata()) == list(reference.iter_metadata())
+    assert [index._metadata_for(fid) for fid in index.list_files()] == \
+           [reference._metadata_for(fid) for fid in reference.list_files()]
+    assert index.file_count == reference.file_count
+    assert index.posting_count == reference.posting_count
+
+
+def test_surrogate_to_dict_keys_are_str_file_ids() -> None:
+    # The snapshot is keyed by the original 64-char file_id (NOT the surrogate),
+    # so snapshots stay portable and cross-backend identical.
+    index = _build_surrogate_index()
+    snapshot = index.to_dict()
+    assert set(snapshot["files"]) == {fid for fid, _ in _SURROGATE_CORPUS}
+    assert set(snapshot["metadata"]) == {fid for fid, _ in _SURROGATE_CORPUS}
+    # The corpus's first file: stored entries are (hash_code, time_offset) pairs
+    # with the real hash codes, never surrogate ints. (InMemory.to_dict returns
+    # _file_entries verbatim as tuples -- pre-existing behaviour, unchanged by
+    # the surrogate work; the JSON snapshot round-trip normalizes them to lists.)
+    first_id, first_pairs = _SURROGATE_CORPUS[0]
+    assert snapshot["files"][first_id] == [(c, o) for c, o in first_pairs]
+
+
+def test_surrogate_retained_on_remove_and_reused_on_readd() -> None:
+    # remove() deliberately KEEPS the surrogate mappings alive (so a lock-free
+    # reader can always resolve a just-removed posting's surrogate instead of
+    # racing into a KeyError), and a re-added file_id REUSES that same surrogate
+    # (re-indexing never grows the maps). The retained surrogate is postings-less,
+    # so it is invisible to every query/search.
+    index = InMemoryHashIndex()
+    index.add(fp_with_hashes("x" * 64, [(1, 10), (2, 20)]))
+    first_surrogate = index._fid_to_id["x" * 64]
+    index.remove("x" * 64)
+    # Mappings retained across remove() -- still resolvable, never KeyError.
+    assert index._fid_to_id["x" * 64] == first_surrogate
+    assert index._id_to_fid[first_surrogate] == "x" * 64
+    assert index.query(1) == []  # postings gone (the observable effect)
+
+    index.add(fp_with_hashes("x" * 64, [(1, 10), (2, 20)]))
+    second_surrogate = index._fid_to_id["x" * 64]
+    assert second_surrogate == first_surrogate  # reused, not a fresh allocation
+    # query() still resolves to the right str file_id after the surrogate churn.
+    assert [(p.file_id, p.time_offset) for p in index.query(1)] == [("x" * 64, 10)]
+
+
+def test_surrogate_replace_keeps_output_correct() -> None:
+    # add() of an existing file_id replaces it: old postings are gone, the new
+    # ones resolve correctly, counts are exact, and the file's surrogate is
+    # REUSED (replace re-interns the same id -> same surrogate, maps don't grow).
+    index = InMemoryHashIndex()
+    index.add(fp_with_hashes("a" * 64, [(1, 1), (2, 2), (3, 3)]))
+    index.add(fp_with_hashes("b" * 64, [(1, 5)]))
+    old_a = index._fid_to_id["a" * 64]
+    index.add(fp_with_hashes("a" * 64, [(9, 99)]))  # replace a
+    new_a = index._fid_to_id["a" * 64]
+    assert new_a == old_a  # reused across replace
+    assert index._id_to_fid[old_a] == "a" * 64  # mapping still valid
+    assert index.file_count == 2
+    assert index.posting_count == 2  # a:1 + b:1
+    assert index.query(1) == [IndexPosting(file_id="b" * 64, hash_code=1, time_offset=5)]
+    assert index.query(9) == [IndexPosting(file_id="a" * 64, hash_code=9, time_offset=99)]
+    assert index.query(2) == []  # old a posting removed
+
+
+def test_surrogate_prune_stop_hashes_output_identical() -> None:
+    # prune_stop_hashes uses distinct surrogates as the document-frequency
+    # measure; the result (removed count, remaining postings, recalibrated
+    # hash_count, search) matches a from_dict reconstruction of the same state.
+    index = InMemoryHashIndex()
+    # code 1000 appears in all 4 files (df=1.0 -> stop at ratio 0.5); others rare.
+    for i in range(4):
+        fid = chr(ord("a") + i) * 64
+        index.add(fp_with_hashes(fid, [(1000, i), (2000 + i, i * 2)]))
+    removed = index.prune_stop_hashes(max_df_ratio=0.5)
+    assert removed == 4  # the 4 postings of code 1000
+    assert index.query(1000) == []
+    # Each file keeps exactly its one rare posting; hash_count recalibrated.
+    for i in range(4):
+        fid = chr(ord("a") + i) * 64
+        assert index._metadata_for(fid)["hash_count"] == 1
+        assert [(p.file_id, p.time_offset) for p in index.query(2000 + i)] == [(fid, i * 2)]
+    # A from_dict reconstruction of the pruned snapshot is output-identical.
+    reference = InMemoryHashIndex.from_dict(index.to_dict())
+    assert index.to_dict() == reference.to_dict()
+    assert list(index.iter_metadata()) == list(reference.iter_metadata())
+
+
+def test_surrogate_cross_backend_parity_with_sqlite() -> None:
+    # The surrogate-backed in-memory search must still be byte-identical to the
+    # SQLite backend (which stores the str file_id verbatim) for the same corpus.
+    mem = _build_surrogate_index()
+    sql = SQLiteHashIndex(":memory:")
+    try:
+        for file_id, code_offsets in _SURROGATE_CORPUS:
+            sql.add(fp_with_hashes(file_id, code_offsets))
+        query = fp_with_hashes("q" * 64, [(1000, 0), (1001, 0), (1002, 0), (1003, 0)])
+        assert _search_tuples(mem, query, top_k=10) == _search_tuples(sql, query, top_k=10)
+        assert mem.list_files() == sql.list_files()
+        # The snapshot files map is parity-identical once normalized through
+        # JSON (InMemory keeps tuples, SQL lists -- the round-trip the save/load
+        # path always applies); compare via that canonical form.
+        assert json.loads(json.dumps(mem.to_dict()["files"])) == \
+               json.loads(json.dumps(sql.to_dict()["files"]))
+    finally:
+        sql.close()
+
+
+def test_surrogate_per_posting_memory_drop() -> None:
+    # MEASUREMENT: the surrogate (int, int) pair is far smaller than an
+    # IndexPosting holding a 64-char file_id string. Compare the per-posting
+    # footprint of the stored representation against the old representation.
+    posting_tuple = (123, 45)  # (surrogate, time_offset) as stored now
+    old_posting = IndexPosting(file_id="a" * 64, hash_code=1000, time_offset=45)
+    file_id_str = "a" * 64
+
+    # Old per-posting cost: the IndexPosting object PLUS the 64-char file_id it
+    # references (the dominant cost the surrogate eliminates -- the str is held
+    # once now, not per posting).
+    old_bytes = sys.getsizeof(old_posting) + sys.getsizeof(file_id_str)
+    new_bytes = sys.getsizeof(posting_tuple) + 2 * sys.getsizeof(123)
+    assert new_bytes < old_bytes  # strictly smaller per posting
+
+    # Whole-index sanity at a few-thousand-posting scale: building a 200-file x
+    # 30-posting index stores 6000 compact pairs and zero per-posting file_id
+    # strings (each 64-char id is held once in the surrogate maps).
+    index = InMemoryHashIndex()
+    for i in range(200):
+        fid = f"{i:064x}"
+        index.add(fp_with_hashes(fid, [(1000 + j, j) for j in range(30)]))
+    assert index.posting_count == 6000
+    # Exactly one file_id string per file is retained (in the surrogate map),
+    # never one per posting.
+    assert len(index._id_to_fid) == 200
+    assert len(index._fid_to_id) == 200

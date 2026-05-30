@@ -15,7 +15,16 @@ from __future__ import annotations
 import subprocess
 import sys
 
-OPTIONAL_DEPS = ("PIL", "scipy", "pydub", "pypdf", "redis", "psycopg")
+OPTIONAL_DEPS = (
+    "PIL",
+    "scipy",
+    "pydub",
+    "pypdf",
+    "av",
+    "sentence_transformers",
+    "redis",
+    "psycopg",
+)
 
 
 def test_importing_package_pulls_no_optional_dependency() -> None:

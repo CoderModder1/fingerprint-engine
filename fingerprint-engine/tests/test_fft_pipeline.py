@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -319,3 +320,251 @@ def test_fixed_window_falls_back_and_warns_for_tiny_signal() -> None:
 
     with pytest.warns(RuntimeWarning, match="fixed window"):
         fixed.spectrogram(np.linspace(0.0, 1.0, 200, dtype=np.float32))
+
+
+def _reference_hash_pair(freq1: int, freq2: int, delta_t: int, hash_bits: int = 64) -> int:
+    """Verbatim transcription of the ORIGINAL (pre-quantization) hash_pair.
+
+    Independent oracle: the default ``freq_quantization == 1`` path MUST stay
+    byte-identical to this. Do not refactor -- it must remain an exact copy of
+    the exact-tuple hashing that existed before the opt-in flag.
+    """
+
+    payload = (
+        int(freq1).to_bytes(4, "big", signed=False)
+        + int(freq2).to_bytes(4, "big", signed=False)
+        + int(delta_t).to_bytes(4, "big", signed=False)
+    )
+    value = int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "big", signed=False)
+    if hash_bits == 64:
+        return value
+    return value & ((1 << hash_bits) - 1)
+
+
+def _reference_hash_pair_with_window(
+    freq1: int, freq2: int, delta_t: int, window: int, hash_bits: int = 64
+) -> int:
+    """Reference for a window-bank tagged hash: the exact tuple + window suffix.
+
+    Mirrors the documented fold in ``hash_pair`` (the four packed big-endian
+    uint32 fields). A tagged code must equal this so window-w codes only ever
+    collide with window-w codes.
+    """
+
+    payload = (
+        int(freq1).to_bytes(4, "big", signed=False)
+        + int(freq2).to_bytes(4, "big", signed=False)
+        + int(delta_t).to_bytes(4, "big", signed=False)
+        + int(window).to_bytes(4, "big", signed=False)
+    )
+    value = int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "big", signed=False)
+    if hash_bits == 64:
+        return value
+    return value & ((1 << hash_bits) - 1)
+
+
+def test_freq_quantization_defaults_to_one_and_validates() -> None:
+    # The flag defaults to 1 (off) and rejects values below 1.
+    assert FingerprintConfig().freq_quantization == 1
+    FingerprintConfig(freq_quantization=1).validate()
+    FingerprintConfig(freq_quantization=8).validate()
+    with pytest.raises(ValueError, match="freq_quantization"):
+        FingerprintConfig(freq_quantization=0).validate()
+    with pytest.raises(ValueError, match="freq_quantization"):
+        FingerprintConfig(freq_quantization=-3).validate()
+
+
+def test_default_freq_quantization_hashes_are_byte_identical() -> None:
+    # DEFAULT-PRESERVING gate: with freq_quantization == 1 (the default) every
+    # hash_pair output must equal the pre-flag exact-tuple reference, bit for
+    # bit, across raw 64-bit and a narrowed hash_bits width.
+    pipeline = FFTFingerprintPipeline(FingerprintConfig())  # default q == 1
+    narrow = FFTFingerprintPipeline(FingerprintConfig(hash_bits=24))
+    for freq1 in range(0, 400, 13):
+        for freq2 in range(0, 400, 17):
+            for delta_t in (1, 5, 17, 48):
+                assert pipeline.hash_pair(freq1, freq2, delta_t) == _reference_hash_pair(
+                    freq1, freq2, delta_t
+                )
+                assert narrow.hash_pair(freq1, freq2, delta_t) == _reference_hash_pair(
+                    freq1, freq2, delta_t, hash_bits=24
+                )
+
+
+def test_default_freq_quantization_full_signal_hashes_unchanged() -> None:
+    # End-to-end default-preserving proof: the constellation hash codes produced
+    # by the full signal->hash pipeline at the default q == 1 must equal the
+    # pre-flag reference applied to each pair's (freq1, freq2, delta_t).
+    config = FingerprintConfig(window_size=512, hop_size=128)  # q defaults to 1
+    pipeline = FFTFingerprintPipeline(config)
+    rng = np.random.default_rng(7)
+    x = np.linspace(0, 40 * np.pi, 16000, dtype=np.float32)
+    signal = (np.sin(x) + 0.3 * np.sin(2.7 * x) + 0.05 * rng.standard_normal(16000)).astype(
+        np.float32
+    )
+
+    _, hashes = pipeline.fingerprint_signal(signal)
+    assert hashes, "case must produce hashes to be a meaningful gate"
+    for item in hashes:
+        assert item.hash_code == _reference_hash_pair(item.freq1, item.freq2, item.delta_t)
+
+
+def test_freq_quantization_snaps_bins_to_a_coarser_grid() -> None:
+    # With q > 1, hash_pair packs the BAND index (bin // q), so any two bins in
+    # the same band collide while bins in different bands stay distinct.
+    pipeline = FFTFingerprintPipeline(FingerprintConfig(freq_quantization=4))
+    # 100..103 share band 25; 104 is band 26.
+    base = pipeline.hash_pair(100, 200, 5)
+    assert pipeline.hash_pair(101, 201, 5) == base  # both bins snap into the same bands
+    assert pipeline.hash_pair(103, 203, 5) == base
+    assert pipeline.hash_pair(104, 200, 5) != base  # freq1 crosses into the next band
+    # The band-index value matches an exact hash of the snapped bins.
+    assert base == _reference_hash_pair(100 // 4, 200 // 4, 5)
+
+
+def test_freq_quantization_changes_hashes_but_still_self_matches() -> None:
+    # q > 1 changes the produced hash codes relative to the default, yet remains
+    # deterministic, so a file still matches itself.
+    config = FingerprintConfig(window_size=512, hop_size=128)
+    rng = np.random.default_rng(11)
+    x = np.linspace(0, 50 * np.pi, 16000, dtype=np.float32)
+    signal = (np.sin(x) + 0.4 * np.sin(3.1 * x) + 0.05 * rng.standard_normal(16000)).astype(
+        np.float32
+    )
+
+    exact = FFTFingerprintPipeline(config)  # q == 1
+    quantized = FFTFingerprintPipeline(FingerprintConfig(window_size=512, hop_size=128, freq_quantization=2))
+
+    _, exact_hashes = exact.fingerprint_signal(signal)
+    _, quant_hashes = quantized.fingerprint_signal(signal)
+    _, quant_hashes_again = quantized.fingerprint_signal(signal)
+
+    exact_codes = [item.hash_code for item in exact_hashes]
+    quant_codes = [item.hash_code for item in quant_hashes]
+    assert exact_codes  # the default path produced hashes
+    assert quant_codes != exact_codes  # quantization actually changed the codes
+    # Self-match: re-fingerprinting the same signal at q=2 is identical.
+    assert quant_codes == [item.hash_code for item in quant_hashes_again]
+
+
+# ---------------------------------------------------------------------------
+# OPT-IN multi-resolution window bank.
+# ---------------------------------------------------------------------------
+
+
+def test_window_bank_defaults_to_none_and_validates() -> None:
+    # The flag defaults to None (off) and validates the bank shape when set.
+    assert FingerprintConfig().window_bank is None
+    FingerprintConfig().validate()
+    FingerprintConfig(window_bank=(512, 1024, 2048, 4096)).validate()
+    FingerprintConfig(window_bank=(64,)).validate()  # min_window_size default is 16
+    with pytest.raises(ValueError, match="non-empty"):
+        FingerprintConfig(window_bank=()).validate()
+    with pytest.raises(ValueError, match="distinct"):
+        FingerprintConfig(window_bank=(512, 512)).validate()
+    with pytest.raises(ValueError, match="below min_window_size"):
+        FingerprintConfig(window_bank=(8,), min_window_size=16).validate()
+    with pytest.raises(ValueError, match="max_window_bank_size"):
+        FingerprintConfig(window_bank=(64, 128, 256, 512, 1024, 2048, 4096)).validate()
+    with pytest.raises(ValueError, match="max_signal_samples"):
+        FingerprintConfig(window_bank=(8192,), max_signal_samples=4096).validate()
+
+
+def test_window_tag_is_byte_identical_when_none() -> None:
+    # DEFAULT-PRESERVING gate at the hash level: window_tag=None (the single-
+    # window path) must equal the pre-bank exact-tuple reference, and equal the
+    # no-keyword call, bit for bit.
+    pipeline = FFTFingerprintPipeline(FingerprintConfig())
+    for freq1 in range(0, 300, 11):
+        for freq2 in range(0, 300, 19):
+            for delta_t in (1, 7, 48):
+                base = pipeline.hash_pair(freq1, freq2, delta_t)
+                assert base == pipeline.hash_pair(freq1, freq2, delta_t, window_tag=None)
+                assert base == _reference_hash_pair(freq1, freq2, delta_t)
+
+
+def test_window_tag_isolates_codes_per_window() -> None:
+    # A tagged code differs from the untagged one and from a code tagged with a
+    # different window, so window-w hashes only ever collide with window-w
+    # hashes; the same tag is deterministic.
+    pipeline = FFTFingerprintPipeline(FingerprintConfig())
+    untagged = pipeline.hash_pair(10, 20, 5)
+    tag_512 = pipeline.hash_pair(10, 20, 5, window_tag=512)
+    tag_1024 = pipeline.hash_pair(10, 20, 5, window_tag=1024)
+    assert tag_512 != untagged
+    assert tag_512 != tag_1024
+    assert tag_512 == pipeline.hash_pair(10, 20, 5, window_tag=512)
+    # The tagged code is an exact hash of the packed payload + window suffix.
+    assert tag_512 == _reference_hash_pair_with_window(10, 20, 5, 512)
+
+
+def test_window_bank_off_is_byte_identical_to_single_window() -> None:
+    # End-to-end DEFAULT-PRESERVING proof: with window_bank=None the full
+    # signal->hash pipeline is identical to the path before the bank existed.
+    config = FingerprintConfig(window_size=512, hop_size=128)  # window_bank defaults to None
+    pipeline = FFTFingerprintPipeline(config)
+    rng = np.random.default_rng(7)
+    x = np.linspace(0, 40 * np.pi, 16000, dtype=np.float32)
+    signal = (np.sin(x) + 0.3 * np.sin(2.7 * x) + 0.05 * rng.standard_normal(16000)).astype(
+        np.float32
+    )
+
+    peaks, hashes = pipeline.fingerprint_signal(signal)
+    assert hashes, "case must produce hashes to be a meaningful gate"
+    # Every code equals the pre-bank, single-window exact reference (no window
+    # folded in), and equals the explicit single-window build_hashes path.
+    for item in hashes:
+        assert item.hash_code == _reference_hash_pair(item.freq1, item.freq2, item.delta_t)
+    matrix = pipeline.spectrogram(signal)
+    direct = pipeline.build_hashes(pipeline.extract_peaks(matrix))
+    assert hashes == direct
+
+
+def test_window_bank_produces_matchable_per_window_hashes() -> None:
+    # With a bank set, the pipeline emits hashes for EACH bank window, each code
+    # folded with its window so a query at the same bank re-collides per window.
+    bank = (256, 512, 1024)
+    config = FingerprintConfig(window_size=512, hop_size=128, window_bank=bank)
+    pipeline = FFTFingerprintPipeline(config)
+    rng = np.random.default_rng(13)
+    x = np.linspace(0, 50 * np.pi, 16000, dtype=np.float32)
+    signal = (np.sin(x) + 0.4 * np.sin(3.1 * x) + 0.05 * rng.standard_normal(16000)).astype(
+        np.float32
+    )
+
+    _, bank_hashes = pipeline.fingerprint_signal(signal)
+    _, bank_hashes_again = pipeline.fingerprint_signal(signal)
+    bank_codes = {item.hash_code for item in bank_hashes}
+    assert bank_hashes, "bank must produce hashes"
+    # Deterministic: re-fingerprinting the same signal at the same bank matches.
+    assert [h.hash_code for h in bank_hashes] == [h.hash_code for h in bank_hashes_again]
+
+    # The bank yields strictly more hashes than any single window alone (it is
+    # the union over the bank), and the per-window codes are disjoint from the
+    # single-window (untagged) codes of any one window.
+    single = FFTFingerprintPipeline(FingerprintConfig(window_size=512, hop_size=128))
+    _, single_hashes = single.fingerprint_signal(signal)
+    single_codes = {item.hash_code for item in single_hashes}
+    assert len(bank_hashes) > len(single_hashes)
+    assert bank_codes.isdisjoint(single_codes)  # untagged vs window-tagged never collide
+
+    # A query fingerprinted at the SAME bank shares codes back (self-match works
+    # through the window fold); a query at a DIFFERENT bank shares none.
+    same_bank = FFTFingerprintPipeline(config)
+    _, same_hashes = same_bank.fingerprint_signal(signal)
+    assert {h.hash_code for h in same_hashes} & bank_codes
+    other = FFTFingerprintPipeline(
+        FingerprintConfig(window_size=512, hop_size=128, window_bank=(2048,))
+    )
+    _, other_hashes = other.fingerprint_signal(signal)
+    assert not ({h.hash_code for h in other_hashes} & bank_codes)
+
+
+def test_window_bank_effective_params_reports_smallest_window() -> None:
+    # effective_params (recorded in fingerprint metadata) reports the smallest
+    # bank window's resolution when the bank is active -- informational only.
+    config = FingerprintConfig(window_bank=(512, 1024, 2048))
+    pipeline = FFTFingerprintPipeline(config)
+    signal = np.linspace(0.0, 1.0, 16000, dtype=np.float32)
+    window, _hop = pipeline.effective_params(signal)
+    assert window == 512
