@@ -66,7 +66,7 @@ class FingerprintConfig:
         return asdict(self)
 
 
-@dataclass(frozen=True, order=True)
+@dataclass(frozen=True, order=True, slots=True)
 class LandmarkPoint:
     """A peak in the spectrogram-like signal space."""
 
@@ -90,7 +90,7 @@ class LandmarkPoint:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ConstellationHash:
     """A searchable code derived from a pair of landmark peaks."""
 
@@ -190,7 +190,7 @@ class Fingerprint:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class IndexPosting:
     """One occurrence of a constellation hash in an indexed file."""
 

@@ -10,7 +10,185 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from fingerprint_engine.core.fft_pipeline import FFTFingerprintPipeline
-from fingerprint_engine.core.models import FingerprintConfig
+from fingerprint_engine.core.models import FingerprintConfig, LandmarkPoint
+
+
+def _reference_extract_peaks(
+    pipeline: FFTFingerprintPipeline, spectrogram: np.ndarray
+) -> list[LandmarkPoint]:
+    """Verbatim copy of the ORIGINAL pre-vectorization extract_peaks algorithm.
+
+    Kept here as an independent oracle so the vectorized production
+    implementation can be asserted byte-identical to the scalar one. Do not
+    "optimize" this -- it must stay an exact transcription of the old loop.
+    """
+
+    matrix = np.asarray(spectrogram, dtype=np.float32)
+    if matrix.ndim != 2 or matrix.size == 0 or float(matrix.max()) <= 0.0:
+        return []
+
+    mean = float(matrix.mean())
+    std = float(matrix.std())
+    percentile = float(np.percentile(matrix, pipeline.config.peak_percentile))
+    threshold = max(mean + pipeline.config.peak_threshold * std, percentile)
+
+    peaks: list[LandmarkPoint] = []
+    time_count, freq_count = matrix.shape
+    for time_index in range(time_count):
+        frame_candidates: list[LandmarkPoint] = []
+        row = matrix[time_index]
+        candidate_bins = np.flatnonzero(row >= threshold)
+        for frequency_bin in candidate_bins:
+            magnitude = float(row[frequency_bin])
+            t0 = max(0, time_index - 1)
+            t1 = min(time_count, time_index + 2)
+            f0 = max(0, int(frequency_bin) - 1)
+            f1 = min(freq_count, int(frequency_bin) + 2)
+            neighborhood = matrix[t0:t1, f0:f1]
+            if magnitude >= float(neighborhood.max()) and magnitude > 0.0:
+                frame_candidates.append(
+                    LandmarkPoint(
+                        time_index=time_index,
+                        frequency_bin=int(frequency_bin),
+                        magnitude=round(magnitude, 6),
+                    )
+                )
+
+        frame_candidates.sort(key=lambda item: (-item.magnitude, item.frequency_bin))
+        peaks.extend(frame_candidates[: pipeline.config.max_peaks_per_frame])
+
+    peaks.sort(key=lambda item: (item.time_index, item.frequency_bin, -item.magnitude))
+    return peaks
+
+
+def _assert_identical(actual: list[LandmarkPoint], expected: list[LandmarkPoint]) -> None:
+    assert len(actual) == len(expected)
+    for got, want in zip(actual, expected, strict=True):
+        assert got.time_index == want.time_index
+        assert got.frequency_bin == want.frequency_bin
+        # magnitude is the stored round(.,6) value; require exact equality.
+        assert got.magnitude == want.magnitude
+
+
+def test_vectorized_extract_peaks_matches_oracle_on_random_matrices() -> None:
+    # Equivalence gate (a): the vectorized extract_peaks must be byte-identical
+    # to the original scalar oracle across many seeded random matrices spanning
+    # awkward shapes, plateaus, all-zero, clamped-negative, and tie cases.
+    config = FingerprintConfig(
+        window_size=64,
+        hop_size=16,
+        peak_threshold=0.5,
+        peak_percentile=80.0,
+        max_peaks_per_frame=4,
+        constellation_fanout=3,
+        max_delta_t=12,
+    )
+    pipeline = FFTFingerprintPipeline(config)
+    rng = np.random.default_rng(20240529)
+
+    shapes = [
+        (1, 1),
+        (1, 7),
+        (7, 1),
+        (2, 2),
+        (3, 3),
+        (5, 9),
+        (9, 5),
+        (16, 33),
+        (33, 16),
+        (1, 64),
+        (64, 1),
+    ]
+    for _ in range(50):
+        shapes.append((int(rng.integers(1, 20)), int(rng.integers(1, 40))))
+
+    matrices: list[np.ndarray] = []
+    for shape in shapes:
+        # Generic positive-ish spectrogram-like values.
+        matrices.append(np.abs(rng.standard_normal(shape)) * 3.0)
+        # Values with negatives (extract_peaks clamps via the > 0 predicate).
+        matrices.append(rng.standard_normal(shape) * 2.0)
+        # All-equal plateau (every cell is its own neighborhood max -> ties).
+        matrices.append(np.full(shape, 1.5))
+        # All zero (max <= 0 -> empty).
+        matrices.append(np.zeros(shape))
+        # All negative (clamped to no peaks via > 0).
+        matrices.append(np.full(shape, -1.0))
+        # Quantized values to force exact magnitude ties across bins/frames.
+        matrices.append(np.round(rng.standard_normal(shape) * 2.0, 1))
+
+    for raw in matrices:
+        matrix = raw.astype(np.float32)
+        _assert_identical(
+            pipeline.extract_peaks(matrix),
+            _reference_extract_peaks(pipeline, matrix),
+        )
+
+    assert len(matrices) > 50
+
+
+def test_vectorized_extract_peaks_matches_oracle_on_handler_spectrograms() -> None:
+    # Equivalence gate (b): on the REAL spectrograms produced by each handler's
+    # signal, the vectorized peaks AND the full constellation hashes must match
+    # the oracle path exactly.
+    from fingerprint_engine.handlers.binary_handler import BinaryFileHandler
+    from fingerprint_engine.handlers.text_handler import TextFileHandler
+
+    signals: list[tuple[str, np.ndarray, FingerprintConfig]] = []
+
+    # Text handler signal from real source-like text.
+    text_payload = (
+        "def vectorize(matrix):\n"
+        "    # compute a 3x3 local max\n"
+        "    return matrix.max()\n"
+    ) * 40
+    text_signal = TextFileHandler().to_signal(text_payload)
+    signals.append(
+        ("text", text_signal, FingerprintConfig(window_size=512, hop_size=128))
+    )
+
+    # Binary handler signal from raw bytes.
+    binary_bytes = bytes((i * 37 + 11) % 256 for i in range(8000))
+    binary_signal = BinaryFileHandler().to_signal(binary_bytes)
+    signals.append(
+        ("binary", binary_signal, FingerprintConfig(window_size=512, hop_size=128))
+    )
+
+    # Image-like handler signal: a 2D raster flattened to 1D (matches how the
+    # image handler reduces a canonical-resized image to a signal); generated
+    # without PIL so this case always runs.
+    rng = np.random.default_rng(99)
+    raster = rng.integers(0, 256, size=(64, 64)).astype(np.float32)
+    image_like = ((raster.ravel() - 127.5) / 127.5).astype(np.float32)
+    signals.append(("image_like", image_like, FingerprintConfig()))
+
+    # Audio-like handler signal: a tone-plus-harmonics waveform like decoded PCM.
+    t = np.linspace(0, 30 * np.pi, 16000, dtype=np.float32)
+    audio_like = (np.sin(t) + 0.4 * np.sin(2.5 * t) + 0.2 * np.sin(5.1 * t)).astype(
+        np.float32
+    )
+    signals.append(("audio_like", audio_like, FingerprintConfig()))
+
+    for name, signal, config in signals:
+        pipeline = FFTFingerprintPipeline(config)
+        matrix = pipeline.spectrogram(signal)
+
+        new_peaks = pipeline.extract_peaks(matrix)
+        oracle_peaks = _reference_extract_peaks(pipeline, matrix)
+        _assert_identical(new_peaks, oracle_peaks)
+        assert new_peaks, f"{name} produced no peaks; case is not exercising the path"
+
+        # Full hash chain must be byte-identical via the production path vs the
+        # oracle peaks fed through the same hash builder.
+        new_hashes = pipeline.build_hashes(new_peaks)
+        oracle_hashes = pipeline.build_hashes(oracle_peaks)
+        assert new_hashes == oracle_hashes
+
+        # And fingerprint_signal (which calls the vectorized extract_peaks) must
+        # match the oracle path end to end.
+        fp_peaks, fp_hashes = pipeline.fingerprint_signal(signal)
+        _assert_identical(fp_peaks, oracle_peaks)
+        assert fp_hashes == oracle_hashes
 
 
 def test_pipeline_is_deterministic_for_same_signal() -> None:

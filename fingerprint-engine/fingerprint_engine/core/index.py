@@ -73,6 +73,21 @@ class HashIndex(ABC):
     def add(self, fingerprint: Fingerprint) -> None:
         """Add or replace a fingerprint in the index."""
 
+    def add_many(self, fingerprints: Iterable[Fingerprint]) -> None:
+        """Add or replace many fingerprints, equivalently to per-item :meth:`add`.
+
+        The default fans out to :meth:`add` in order, so the result is exactly as
+        if each fingerprint were added sequentially -- same remove-then-insert
+        replace semantics (a later fingerprint sharing an earlier ``file_id`` wins),
+        same postings, same metadata, same search results. Storage backends SHOULD
+        override this to batch the writes into a single transaction/round-trip
+        (per-:meth:`add` commits are fsync-bound), but the *observable* outcome MUST
+        stay identical to this sequential default.
+        """
+
+        for fingerprint in fingerprints:
+            self.add(fingerprint)
+
     @abstractmethod
     def remove(self, file_id: str) -> None:
         """Remove all postings for a file."""
@@ -410,6 +425,15 @@ class InMemoryHashIndex(HashIndex):
                     )
                 )
 
+    def add_many(self, fingerprints: Iterable[Fingerprint]) -> None:
+        # Hold the write lock once for the whole batch (re-entrant, so the
+        # per-item add() re-acquire is free) so a concurrent reader never
+        # observes the batch half-applied; the per-add() effect is otherwise
+        # identical to the sequential default.
+        with self._write_lock:
+            for fingerprint in fingerprints:
+                self.add(fingerprint)
+
     def remove(self, file_id: str) -> None:
         with self._write_lock:
             if file_id not in self._file_entries:
@@ -589,6 +613,76 @@ class RedisHashIndex(HashIndex):
             pipe.incrby(self._key("npostings"), len(entries))
         pipe.execute()
 
+    def add_many(self, fingerprints: Iterable[Fingerprint]) -> None:
+        """Batch the whole ingest into one read + one write pipeline.
+
+        Equivalent to per-item :meth:`add`. A sequential ``add()`` of a duplicate
+        ``file_id`` removes the earlier copy (its just-inserted postings) before
+        inserting the later one, so the last fingerprint for each ``file_id``
+        wins and the file's *pre-batch* postings are removed exactly once. We
+        replicate that directly: keep the last fingerprint per ``file_id`` (in
+        first-seen order is irrelevant -- only the survivor matters for state),
+        read each file's existing postings once, then issue all removals and
+        inserts in a single pipeline so the batch costs two round-trips, not two
+        per file.
+        """
+
+        # Collapse to the surviving (last) fingerprint per file_id, preserving
+        # the order in which each file_id first appeared for deterministic ops.
+        survivors: dict[str, Fingerprint] = {}
+        for fingerprint in fingerprints:
+            survivors[fingerprint.file_id] = fingerprint
+        if not survivors:
+            return
+
+        # One pipeline to read every target file's existing postings (drives the
+        # remove() decision without a per-file round-trip).
+        read_pipe = self._redis.pipeline()
+        for file_id in survivors:
+            read_pipe.lrange(self._key("f", file_id), 0, -1)
+        existing_raw = read_pipe.execute()
+
+        pipe = self._redis.pipeline()
+        net_delta = 0
+        for (file_id, fingerprint), raw in zip(survivors.items(), existing_raw, strict=True):
+            # --- remove() effect for the pre-batch state of this file_id ---
+            if raw:
+                seen: set[tuple[str, str]] = set()
+                for item in raw:
+                    rem_code, rem_off = self._text(item).rsplit(":", 1)
+                    if (rem_code, rem_off) in seen:
+                        continue
+                    seen.add((rem_code, rem_off))
+                    pipe.lrem(self._key("h", rem_code), 0, f"{file_id}:{rem_off}")
+                pipe.delete(self._key("f", file_id))
+                net_delta -= len(raw)
+            pipe.delete(self._key("m", file_id))
+            # srem is harmless for a not-yet-member id; sadd below re-adds it.
+            pipe.srem(self._key("files"), file_id)
+
+            # --- add() effect for the surviving fingerprint ---
+            entries = [(item.hash_code, item.time_offset) for item in fingerprint.hashes]
+            metadata = {
+                "file_id": file_id,
+                "path": fingerprint.path,
+                "handler": fingerprint.handler,
+                "size_bytes": fingerprint.size_bytes,
+                "content_sha256": fingerprint.content_sha256,
+                "hash_count": fingerprint.hash_count,
+                "landmark_count": fingerprint.landmark_count,
+                **fingerprint.metadata,
+            }
+            pipe.sadd(self._key("files"), file_id)
+            pipe.set(self._key("m", file_id), json.dumps(metadata, sort_keys=True))
+            for hash_code, time_offset in entries:
+                pipe.rpush(self._key("h", str(hash_code)), f"{file_id}:{time_offset}")
+                pipe.rpush(self._key("f", file_id), f"{hash_code}:{time_offset}")
+            net_delta += len(entries)
+
+        if net_delta:
+            pipe.incrby(self._key("npostings"), net_delta)
+        pipe.execute()
+
     def remove(self, file_id: str) -> None:
         raw = self._redis.lrange(self._key("f", file_id), 0, -1)
         if not raw:
@@ -703,6 +797,11 @@ class SQLiteHashIndex(HashIndex):
         # when a writer briefly contends with another connection.
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # synchronous=NORMAL is the recommended durable pairing with WAL: the
+        # WAL still guarantees crash consistency, only losing the very last
+        # committed transaction on an OS/power crash (never corruption). This
+        # cuts the fsync-per-commit cost that bottlenecks bulk add_many.
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS files (
@@ -759,6 +858,67 @@ class SQLiteHashIndex(HashIndex):
                 for item in fingerprint.hashes
             ],
         )
+        self._conn.commit()
+
+    def add_many(self, fingerprints: Iterable[Fingerprint]) -> None:
+        """Ingest the whole batch in ONE transaction (one commit, not per file).
+
+        Equivalent to per-item :meth:`add`: each ``file_id`` is removed before it
+        is (re)inserted, so a duplicate ``file_id`` within the batch keeps only
+        the LAST fingerprint and any pre-batch rows for it are deleted exactly
+        once -- identical resulting postings, metadata, and search results. The
+        single commit (instead of one fsync-bound commit per file) plus a single
+        ``executemany`` for all postings is the bulk-ingest win.
+        """
+
+        # Last-wins per file_id: a sequential add() of a repeated file_id removes
+        # the earlier copy, so only the final fingerprint survives. Collapsing
+        # here also avoids the files PRIMARY KEY conflict a naive re-insert hits.
+        survivors: dict[str, Fingerprint] = {}
+        for fingerprint in fingerprints:
+            survivors[fingerprint.file_id] = fingerprint
+        if not survivors:
+            return
+
+        file_rows: list[tuple[str, str]] = []
+        posting_rows: list[tuple[str, int, int]] = []
+        for file_id, fingerprint in survivors.items():
+            metadata = {
+                "file_id": file_id,
+                "path": fingerprint.path,
+                "handler": fingerprint.handler,
+                "size_bytes": fingerprint.size_bytes,
+                "content_sha256": fingerprint.content_sha256,
+                "hash_count": fingerprint.hash_count,
+                "landmark_count": fingerprint.landmark_count,
+                **fingerprint.metadata,
+            }
+            file_rows.append((file_id, json.dumps(metadata, sort_keys=True)))
+            posting_rows.extend(
+                (file_id, self._encode(item.hash_code), int(item.time_offset))
+                for item in fingerprint.hashes
+            )
+
+        try:
+            # remove() effect for every target file_id (pre-batch rows), batched.
+            self._conn.executemany(
+                "DELETE FROM postings WHERE file_id = ?", [(fid,) for fid in survivors]
+            )
+            self._conn.executemany(
+                "DELETE FROM files WHERE file_id = ?", [(fid,) for fid in survivors]
+            )
+            self._conn.executemany(
+                "INSERT INTO files (file_id, metadata) VALUES (?, ?)", file_rows
+            )
+            self._conn.executemany(
+                "INSERT INTO postings (file_id, hash_code, time_offset) VALUES (?, ?, ?)",
+                posting_rows,
+            )
+        except BaseException:
+            # Keep the all-or-nothing contract: a mid-batch failure rolls the
+            # whole transaction back instead of leaving a partial ingest.
+            self._conn.rollback()
+            raise
         self._conn.commit()
 
     def remove(self, file_id: str) -> None:
@@ -1022,6 +1182,69 @@ class PostgresHashIndex(HashIndex):
                     for item in fingerprint.hashes
                 ],
             )
+        self._conn.commit()
+
+    def add_many(self, fingerprints: Iterable[Fingerprint]) -> None:
+        """Ingest the whole batch in ONE transaction, streaming postings via COPY.
+
+        Equivalent to per-item :meth:`add`: each ``file_id`` is removed before it
+        is (re)inserted, so a duplicate ``file_id`` keeps only the LAST
+        fingerprint and any pre-batch rows for it are deleted once -- identical
+        postings, metadata, and search results. Postings stream through
+        ``cursor.copy`` (PostgreSQL's bulk path, far faster than row-at-a-time
+        INSERT); metadata goes via ``executemany``; everything commits once.
+        """
+
+        # Last-wins per file_id (a sequential add() of a repeated id removes the
+        # earlier copy), which also avoids the files PRIMARY KEY conflict.
+        survivors: dict[str, Fingerprint] = {}
+        for fingerprint in fingerprints:
+            survivors[fingerprint.file_id] = fingerprint
+        if not survivors:
+            return
+
+        file_rows: list[tuple[str, str]] = []
+        posting_rows: list[tuple[str, int, int]] = []
+        for file_id, fingerprint in survivors.items():
+            metadata = {
+                "file_id": file_id,
+                "path": fingerprint.path,
+                "handler": fingerprint.handler,
+                "size_bytes": fingerprint.size_bytes,
+                "content_sha256": fingerprint.content_sha256,
+                "hash_count": fingerprint.hash_count,
+                "landmark_count": fingerprint.landmark_count,
+                **fingerprint.metadata,
+            }
+            file_rows.append((file_id, json.dumps(metadata, sort_keys=True)))
+            posting_rows.extend(
+                (file_id, self._encode(item.hash_code), int(item.time_offset))
+                for item in fingerprint.hashes
+            )
+
+        file_ids = list(survivors)
+        try:
+            with self._conn.cursor() as cur:
+                # remove() effect for every target file_id (pre-batch rows).
+                cur.execute(
+                    f"DELETE FROM {self._postings_table} WHERE file_id = ANY(%s)", (file_ids,)
+                )
+                cur.execute(
+                    f"DELETE FROM {self._files_table} WHERE file_id = ANY(%s)", (file_ids,)
+                )
+                cur.executemany(
+                    f"INSERT INTO {self._files_table} (file_id, metadata) VALUES (%s, %s::jsonb)",
+                    file_rows,
+                )
+                if posting_rows:
+                    with cur.copy(
+                        f"COPY {self._postings_table} (file_id, hash_code, time_offset) FROM STDIN"
+                    ) as copy:
+                        for row in posting_rows:
+                            copy.write_row(row)
+        except BaseException:
+            self._conn.rollback()  # all-or-nothing; never leave a partial ingest
+            raise
         self._conn.commit()
 
     def remove(self, file_id: str) -> None:

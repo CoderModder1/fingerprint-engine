@@ -9,10 +9,11 @@ import logging
 import pkgutil
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterable
+from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 from fingerprint_engine.handlers.base import FileHandler
 
@@ -21,6 +22,41 @@ from .fft_pipeline import FFTFingerprintPipeline
 from .models import Fingerprint, FingerprintConfig, SearchResult
 
 logger = logging.getLogger(__name__)
+
+# Per-worker Fingerprinter, lazily built by ``_process_worker_init`` so the
+# ProcessPoolExecutor reconstructs ONE Fingerprinter per worker process (rather
+# than re-pickling the whole instance for every submitted path). On macOS the
+# default start method is 'spawn', so workers re-import this module and rebuild
+# the Fingerprinter from the picklable (config, handlers_package) pair handed to
+# the initializer -- both are trivially importable/picklable.
+_WORKER_FINGERPRINTER: Fingerprinter | None = None
+
+
+def _process_worker_init(config: FingerprintConfig, handlers_package: str) -> None:
+    """Initializer run once per worker process: build the shared Fingerprinter.
+
+    Holding the Fingerprinter in a module global keeps fingerprinting itself
+    free of any per-task pickling and produces hashes byte-identical to the
+    in-process Fingerprinter (same config, same discovered handlers, same
+    pipeline) -- the worker is a pure relocation of CPU-bound work, not a
+    behavior change.
+    """
+
+    global _WORKER_FINGERPRINTER
+    _WORKER_FINGERPRINTER = Fingerprinter(config=config, handlers_package=handlers_package)
+
+
+def _process_worker_fingerprint(path: str | Path) -> Fingerprint:
+    """Worker entry point: fingerprint one path with the per-worker instance.
+
+    Top-level (module-scope) so it is importable/picklable under the 'spawn'
+    start method. Any exception propagates back through the future exactly as in
+    thread mode, preserving the fail-soft / skip_errors semantics in the caller.
+    """
+
+    if _WORKER_FINGERPRINTER is None:  # pragma: no cover - initializer always runs first
+        raise RuntimeError("process worker was not initialized")
+    return _WORKER_FINGERPRINTER.fingerprint_file(path)
 
 
 class FileProcessor(ABC):
@@ -38,6 +74,7 @@ class FileProcessor(ABC):
         *,
         skip_errors: bool = True,
         errors: list[tuple[str, Exception]] | None = None,
+        executor: Literal["thread", "process"] = "thread",
     ) -> list[Fingerprint]:
         """Fingerprint many files."""
 
@@ -219,6 +256,7 @@ class Fingerprinter(FileProcessor):
         *,
         skip_errors: bool = True,
         errors: list[tuple[str, Exception]] | None = None,
+        executor: Literal["thread", "process"] = "thread",
     ) -> list[Fingerprint]:
         """Fingerprint a batch concurrently while preserving input order.
 
@@ -234,11 +272,28 @@ class Fingerprinter(FileProcessor):
         report ``type``/``message`` without parsing warning text. When no collector
         is supplied, a :class:`RuntimeWarning` naming the path and error is still
         emitted for callers that rely on it.
+
+        ``executor`` selects the parallelism strategy and is opt-in:
+
+        * ``"thread"`` (default) -- a :class:`ThreadPoolExecutor`, identical to the
+          previous behavior. Best for I/O-bound batches and the only mode that
+          changes nothing for existing callers.
+        * ``"process"`` -- a :class:`ProcessPoolExecutor`. ``build_hashes`` and the
+          peak extraction are GIL-bound pure Python, so threads barely parallelize
+          CPU-bound fingerprinting; processes give true parallelism. Each worker
+          rebuilds one :class:`Fingerprinter` from this instance's
+          ``(config, handlers_package)`` via :func:`_process_worker_init`, so the
+          produced hashes are byte-identical to thread mode -- only *where* the
+          work runs changes, never the output.
+
+        Order preservation, ``skip_errors`` fail-soft semantics, the ``errors``
+        collector, and the RuntimeWarning fallback are identical across both modes.
         """
 
         ordered = list(paths)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(self.fingerprint_file, path) for path in ordered]
+        pool, worker = self._build_executor(executor, max_workers)
+        with pool:
+            futures = [pool.submit(worker, path) for path in ordered]
             if not skip_errors:
                 return [future.result() for future in futures]
             results: list[Fingerprint] = []
@@ -258,6 +313,32 @@ class Fingerprinter(FileProcessor):
                             stacklevel=2,
                         )
             return results
+
+    def _build_executor(
+        self,
+        executor: Literal["thread", "process"],
+        max_workers: int | None,
+    ) -> tuple[Executor, Callable[[str | Path], Fingerprint]]:
+        """Resolve the (pool, per-path worker callable) for ``fingerprint_many``.
+
+        The pool is returned unentered so the caller owns its ``with`` block. The
+        worker callable is the *only* difference between modes: thread mode calls
+        this instance's bound ``fingerprint_file`` directly (shared memory); process
+        mode routes through the top-level :func:`_process_worker_fingerprint`, which
+        uses the per-worker Fingerprinter built by the initializer. Both produce the
+        same Fingerprint for the same path.
+        """
+
+        if executor == "thread":
+            return ThreadPoolExecutor(max_workers=max_workers), self.fingerprint_file
+        if executor == "process":
+            pool = ProcessPoolExecutor(
+                max_workers=max_workers,
+                initializer=_process_worker_init,
+                initargs=(self.config, self.handlers_package),
+            )
+            return pool, _process_worker_fingerprint
+        raise ValueError(f"unknown executor {executor!r}; expected 'thread' or 'process'")
 
     def search_file(self, path: str | Path, index, top_k: int = 10) -> list[SearchResult]:
         fingerprint = self.fingerprint_file(path)

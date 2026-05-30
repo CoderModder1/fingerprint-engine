@@ -75,9 +75,10 @@ match the pre-optimization baseline at every size.
    Stop-hash pruning (`prune_stop_hashes`, not exercised here) trims this further
    by dropping the highest-document-frequency hashes before they reach the join.
 
-### Genuinely-remaining levers (none of these are merged yet)
+### Remaining levers
 
-These are the real next steps; the SQL-query work above is already done.
+Ranked by impact. **Ingest throughput and posting volume are now addressed in the
+Tier-4 update below**; the SQL-query work above is already done.
 
 - **Ingest throughput.** SQLite `add` is still the slowest stage: 10.7 files/s at
   1000 files (each `add` commits/fsyncs). Batching commits — or `COPY` for the
@@ -99,3 +100,58 @@ These are the real next steps; the SQL-query work above is already done.
 These are single-machine numbers from a bounded (≤1000-file) re-run; treat them
 as representative of the current code's relative behaviour, not as a hard
 capacity ceiling.
+
+## Tier-4 update (2026-05-30)
+
+A performance pass landing four levers; **all are output-preserving** —
+fingerprint hashes and search rankings are byte-identical, verified against the
+prior commit (30 819 hashes over text/image/audio inputs). Bounded re-run at
+sizes 200/500 (the slow SQLite query phase keeps full 2000-file runs
+impractical); raw data in [`tier4-results.json`](tier4-results.json).
+
+### Bulk ingest (`add_many`) — addresses the ingest-throughput lever
+
+`HashIndex.add_many()` commits a whole batch in one transaction (SQLite also sets
+`synchronous=NORMAL`; Redis pipelines; Postgres uses `COPY`) and is proven
+identical to a sequential `add()` loop (same postings, metadata, and ranks,
+including replace-existing semantics). The CLI `add` now uses it.
+
+| corpus | per-file `add()` | `add_many()` | speedup |
+|-------:|-----------------:|-------------:|--------:|
+|    200 |      34.7 files/s |  103.9 files/s |  3.0× |
+|    500 |      18.8 files/s |   82.0 files/s |  4.4× |
+
+The speedup grows with corpus size as the per-`add` fsync cost is amortized.
+
+### Faster fingerprinting (vectorized peak extraction)
+
+`extract_peaks` now derives the clipped 3×3 local maximum as a separable,
+`-inf`-padded numpy max instead of a per-candidate Python `neighborhood.max()` —
+landmarks and hashes are byte-identical. The fingerprint pass rose from ~30 →
+**43.9 files/s** on this site-packages corpus (larger on small/dense inputs).
+Opt-in `fingerprint_many(executor="process")` additionally spreads the GIL-bound
+hashing across cores for large batches.
+
+### Posting-volume slack (fanout / max-peaks sweep)
+
+Recall stays at **1.0** while hashes/file — and therefore storage and query
+fan-in — fall by ~60%, confirming the defaults trade storage for headroom most
+corpora don't need (a tunable `--fanout` / `--max-peaks-per-frame` lever):
+
+| `fanout` / `max_peaks` | hashes/file | snapshot (120 files) | recall@1 |
+|:----------------------:|------------:|---------------------:|:--------:|
+| 6 / 8 (default)        |       3 725 |             11.11 MB |      1.0 |
+| 4 / 5                  |       2 193 |              6.57 MB |      1.0 |
+| 3 / 4                  |       1 455 |              4.39 MB |      1.0 |
+
+### Memory
+
+`IndexPosting`, `LandmarkPoint`, and `ConstellationHash` are now slotted
+(`@dataclass(slots=True)`), dropping each instance's per-object `__dict__` — a
+saving that compounds across millions of postings.
+
+### Still open (deferred Tier-4 follow-ups)
+
+Integer `file_id` surrogate key + compact posting encoding (footprint), SQL
+`top_k`/`HAVING` query fan-out pushdown, ANN/LSH candidate generation, and
+streaming ingest of very large files.

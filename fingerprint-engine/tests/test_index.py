@@ -930,3 +930,223 @@ def test_postgres_snapshot_interop_preserves_postings_metadata_and_ranks(pg_inde
         fid: pg_index._metadata_for(fid) for fid in normalized_files(pg_index)
     }
     assert _search_tuples(loaded, query, top_k=10) == _search_tuples(pg_index, query, top_k=10)
+
+
+# ---------------------------------------------------------------------------
+# Bulk/transactional ingest parity (Task 3 -- add_many)
+#
+# add_many() MUST be exactly equivalent to calling add() per fingerprint in
+# sequence: same posting_count, same normalized postings + metadata snapshot,
+# and same search() rankings -- including the replace case where a file_id is
+# re-indexed. These pin that contract for InMemory, SQLite, and (via fakeredis)
+# Redis. Postgres uses COPY and is gated behind @requires_pg below.
+# ---------------------------------------------------------------------------
+
+
+def _bulk_parity_factories() -> list[tuple[str, object]]:
+    """One factory per available backend: ``factory()`` returns a FRESH index.
+
+    Each parity test needs two independent indexes (sequential vs add_many) and
+    several distinct-prefixed Redis namespaces, so a factory (not a single
+    pre-built index) keeps them isolated.
+    """
+
+    counter = {"n": 0}
+
+    def redis_factory():
+        counter["n"] += 1
+        return RedisHashIndex(client=_fake_redis(), key_prefix=f"bulk{counter['n']}")
+
+    factories: list[tuple[str, object]] = [
+        ("in_memory", InMemoryHashIndex),
+        ("sqlite", lambda: SQLiteHashIndex(":memory:")),
+    ]
+    try:
+        import fakeredis  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        factories.append(("redis", redis_factory))
+    return factories
+
+
+def _normalized_files(index) -> dict[str, list[tuple[int, int]]]:
+    # Compare postings as sorted multisets: to_dict() per-file order differs by
+    # backend, but the CONTENT must be identical.
+    return {
+        file_id: sorted((int(code), int(offset)) for code, offset in entries)
+        for file_id, entries in index.to_dict()["files"].items()
+    }
+
+
+def _metadata_map(index) -> dict[str, dict]:
+    return {file_id: index._metadata_for(file_id) for file_id in index.to_dict()["files"]}
+
+
+def _assert_bulk_equivalent(name, sequential, bulk, queries) -> None:
+    # The core parity gate: add_many() == sequential add() for every observable.
+    assert bulk.file_count == sequential.file_count, name
+    assert bulk.posting_count == sequential.posting_count, name
+    assert _normalized_files(bulk) == _normalized_files(sequential), name
+    assert _metadata_map(bulk) == _metadata_map(sequential), name
+    for query in queries:
+        assert _search_tuples(bulk, query, top_k=20) == _search_tuples(sequential, query, top_k=20), (
+            name, query.file_id,
+        )
+
+
+def _bulk_corpus() -> list[Fingerprint]:
+    return [
+        fp_with_hashes("alpha", [(1, 10), (2, 20), (3, 30), (4, 40)]),
+        fp_with_hashes("beta", [(1, 5), (2, 40), (3, 99), (5, 7)]),
+        fp_with_hashes("gamma", [(1, 10), (2, 20), (6, 30)]),
+        # A file with zero hashes: add()/remove() must still track membership.
+        fp_with_hashes("empty", []),
+    ]
+
+
+def _bulk_queries() -> list[Fingerprint]:
+    return [
+        fp_with_hashes("q1", [(1, 0), (2, 10), (3, 20), (4, 30), (5, 1), (6, 2)]),
+        fp_with_hashes("q2", [(1, 0), (2, 0), (3, 0)]),
+    ]
+
+
+def test_add_many_equals_sequential_add_across_backends() -> None:
+    corpus = _bulk_corpus()
+    queries = _bulk_queries()
+    for name, factory in _bulk_parity_factories():
+        sequential = factory()
+        for fingerprint in corpus:
+            sequential.add(fingerprint)
+        bulk = factory()
+        bulk.add_many(corpus)
+        _assert_bulk_equivalent(name, sequential, bulk, queries)
+
+
+def test_add_many_preserves_replace_semantics_across_backends() -> None:
+    # A batch containing a file_id already present (and a duplicate WITHIN the
+    # batch) must end in the same state as sequential add(): last writer wins,
+    # pre-existing postings removed exactly once.
+    queries = _bulk_queries()
+    # Re-index list: alpha replaced (different postings), beta new, alpha AGAIN
+    # later in the same batch (intra-batch duplicate -> the final alpha wins).
+    reindex = [
+        fp_with_hashes("alpha", [(7, 1), (8, 2)]),
+        fp_with_hashes("beta", [(1, 5), (2, 40)]),
+        fp_with_hashes("alpha", [(9, 3), (10, 4), (11, 5)]),  # later duplicate wins
+    ]
+    for name, factory in _bulk_parity_factories():
+        sequential = factory()
+        # Pre-populate so add_many must REPLACE an existing alpha.
+        for fingerprint in [fp_with_hashes("alpha", [(1, 100), (2, 200)]), fp_with_hashes("gamma", [(3, 1)])]:
+            sequential.add(fingerprint)
+        bulk = factory()
+        for fingerprint in [fp_with_hashes("alpha", [(1, 100), (2, 200)]), fp_with_hashes("gamma", [(3, 1)])]:
+            bulk.add(fingerprint)
+
+        for fingerprint in reindex:
+            sequential.add(fingerprint)  # sequential reference path
+        bulk.add_many(reindex)           # bulk path under test
+
+        _assert_bulk_equivalent(name, sequential, bulk, queries)
+        # Concrete replace check: the later alpha (codes 9,10,11) is the survivor,
+        # the pre-batch alpha (codes 1,2) is gone -- on both paths.
+        assert _normalized_files(bulk)["alpha"] == [(9, 3), (10, 4), (11, 5)], name
+
+
+def test_add_many_empty_iterable_is_noop_across_backends() -> None:
+    for name, factory in _bulk_parity_factories():
+        index = factory()
+        index.add_many([])
+        assert index.file_count == 0, name
+        assert index.posting_count == 0, name
+
+
+def test_sqlite_add_many_uses_single_commit() -> None:
+    # The whole point of the SQLite override: ONE commit for the batch, not one
+    # per file. We prove the commit-count drop by counting sqlite3 commits via a
+    # wrapped connection, and (separately) that synchronous=NORMAL is set.
+    import sqlite3 as _sqlite3
+
+    commits = {"n": 0}
+    real_connect = _sqlite3.connect
+
+    class CountingConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def commit(self):
+            commits["n"] += 1
+            return self._conn.commit()
+
+        def __getattr__(self, attr):
+            return getattr(self._conn, attr)
+
+    raw = real_connect(":memory:", check_same_thread=False)
+    index = SQLiteHashIndex(connection=CountingConnection(raw))
+
+    # synchronous=NORMAL (value 1) is set by _init_schema for the WAL pairing.
+    assert int(raw.execute("PRAGMA synchronous").fetchone()[0]) == 1
+
+    corpus = [make_fingerprint(f"f{i}", [1, 2, 3, 4]) for i in range(25)]
+    commits["n"] = 0  # ignore schema-setup commits; count only the ingest
+    index.add_many(corpus)
+
+    # add() would commit at least once per file (>=25); add_many commits ONCE.
+    assert commits["n"] == 1
+    assert index.file_count == 25
+    assert index.posting_count == 100
+
+
+@requires_pg
+def test_pg_add_many_equals_sequential_add(pg_index) -> None:
+    # Postgres parity: COPY-based add_many() must match sequential add(). Uses a
+    # second prefix for the sequential reference so the two never share tables.
+    corpus = _bulk_corpus()
+    queries = _bulk_queries()
+
+    sequential = PostgresHashIndex(dsn=PG_DSN, table_prefix="fp_pytest_seq")
+    with sequential._conn.cursor() as cur:
+        cur.execute(f"TRUNCATE {sequential._files_table}, {sequential._postings_table}")
+    sequential._conn.commit()
+    try:
+        for fingerprint in corpus:
+            sequential.add(fingerprint)
+        pg_index.add_many(corpus)
+        _assert_bulk_equivalent("postgres", sequential, pg_index, queries)
+    finally:
+        with sequential._conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS {sequential._postings_table}, {sequential._files_table}")
+        sequential._conn.commit()
+        sequential.close()
+
+
+@requires_pg
+def test_pg_add_many_preserves_replace_semantics(pg_index) -> None:
+    queries = _bulk_queries()
+    pg_index.add(fp_with_hashes("alpha", [(1, 100), (2, 200)]))
+    pg_index.add(fp_with_hashes("gamma", [(3, 1)]))
+
+    reference = PostgresHashIndex(dsn=PG_DSN, table_prefix="fp_pytest_seq")
+    with reference._conn.cursor() as cur:
+        cur.execute(f"TRUNCATE {reference._files_table}, {reference._postings_table}")
+    reference._conn.commit()
+    try:
+        reference.add(fp_with_hashes("alpha", [(1, 100), (2, 200)]))
+        reference.add(fp_with_hashes("gamma", [(3, 1)]))
+        reindex = [
+            fp_with_hashes("alpha", [(7, 1), (8, 2)]),
+            fp_with_hashes("beta", [(1, 5), (2, 40)]),
+            fp_with_hashes("alpha", [(9, 3), (10, 4), (11, 5)]),
+        ]
+        for fingerprint in reindex:
+            reference.add(fingerprint)
+        pg_index.add_many(reindex)
+        _assert_bulk_equivalent("postgres", reference, pg_index, queries)
+        assert _normalized_files(pg_index)["alpha"] == [(9, 3), (10, 4), (11, 5)]
+    finally:
+        with reference._conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS {reference._postings_table}, {reference._files_table}")
+        reference._conn.commit()
+        reference.close()

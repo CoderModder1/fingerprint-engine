@@ -15,6 +15,31 @@ from fingerprint_engine.core.index import InMemoryHashIndex
 from fingerprint_engine.core.models import FingerprintConfig
 
 
+def _process_pool_available() -> bool:
+    """Whether this sandbox can actually spawn a ProcessPoolExecutor worker.
+
+    Some CI/sandbox environments forbid fork/spawn (no /dev/shm, seccomp, etc.).
+    The process-mode tests gate on this so they exercise the real parallel path
+    where possible and skip with a clear reason where it is impossible -- never
+    silently passing.
+    """
+
+    from concurrent.futures import ProcessPoolExecutor
+
+    try:
+        with ProcessPoolExecutor(max_workers=1) as pool:
+            return pool.submit(abs, -1).result(timeout=30) == 1
+    except Exception:  # noqa: BLE001 - any spawn failure means "unavailable"
+        return False
+
+
+_PROCESS_POOL = _process_pool_available()
+_requires_process_pool = pytest.mark.skipif(
+    not _PROCESS_POOL,
+    reason="ProcessPoolExecutor cannot spawn workers in this environment",
+)
+
+
 def test_text_fingerprint_is_deterministic(tmp_path: Path) -> None:
     path = tmp_path / "sample.py"
     path.write_text(
@@ -356,3 +381,162 @@ def test_no_handler_error_when_all_candidates_fail(
 
     with pytest.raises(NoHandlerError, match="no handler could fingerprint"):
         fingerprinter.fingerprint_file(path)
+
+
+def _mixed_batch_config() -> FingerprintConfig:
+    # A small explicit window so the batch fingerprints quickly while still
+    # exercising the text and binary handlers (a mixed batch).
+    return FingerprintConfig(
+        window_size=32,
+        hop_size=8,
+        peak_threshold=0.25,
+        peak_percentile=70.0,
+        max_delta_t=16,
+    )
+
+
+def _write_mixed_batch(tmp_path: Path) -> list[Path]:
+    # Text + binary inputs so both handler routes run through the worker.
+    text_a = tmp_path / "alpha.txt"
+    text_a.write_text("alpha alpha alpha\n" * 60, encoding="utf-8")
+    text_b = tmp_path / "beta.py"
+    text_b.write_text(
+        "".join(f"def f_{i}(x):\n    return x * {i} + {i * 3}\n\n" for i in range(40)),
+        encoding="utf-8",
+    )
+    payload = tmp_path / "payload.unknown"
+    payload.write_bytes(bytes(range(256)) * 8)
+    return [text_a, text_b, payload]
+
+
+@_requires_process_pool
+def test_process_mode_matches_thread_mode_hashes_and_order(tmp_path: Path) -> None:
+    # The process pool is a pure relocation of CPU-bound work: process mode must
+    # return fingerprints with IDENTICAL hashes (and landmarks, ids, handler) in
+    # IDENTICAL input order to thread mode, so swapping the parallelism strategy
+    # never changes what gets indexed.
+    paths = _write_mixed_batch(tmp_path)
+    fingerprinter = Fingerprinter(_mixed_batch_config())
+
+    thread_fps = fingerprinter.fingerprint_many(paths, executor="thread")
+    process_fps = fingerprinter.fingerprint_many(paths, executor="process")
+
+    # Same order (by name) and same number of results.
+    assert [Path(fp.path).name for fp in thread_fps] == [p.name for p in paths]
+    assert [Path(fp.path).name for fp in process_fps] == [p.name for p in paths]
+
+    # Byte-identical fingerprints, field by field, in lockstep order.
+    assert len(thread_fps) == len(process_fps) == len(paths)
+    for thread_fp, process_fp in zip(thread_fps, process_fps, strict=True):
+        assert thread_fp.handler == process_fp.handler
+        assert thread_fp.file_id == process_fp.file_id
+        assert thread_fp.content_sha256 == process_fp.content_sha256
+        assert thread_fp.hash_tuples() == process_fp.hash_tuples()
+        assert thread_fp.landmarks == process_fp.landmarks
+        assert thread_fp.hash_count > 0
+
+    # Mixed batch really exercised more than one handler.
+    assert {fp.handler for fp in process_fps} == {"text", "binary"}
+
+
+@_requires_process_pool
+def test_process_mode_default_max_workers_matches_thread_mode(tmp_path: Path) -> None:
+    # max_workers=None (the default) must work in process mode too and still
+    # produce identical hashes/order -- the pool sizing is irrelevant to output.
+    paths = _write_mixed_batch(tmp_path)
+    fingerprinter = Fingerprinter(_mixed_batch_config())
+
+    thread_fps = fingerprinter.fingerprint_many(paths)  # default thread, default workers
+    process_fps = fingerprinter.fingerprint_many(paths, executor="process")
+
+    assert [Path(fp.path).name for fp in process_fps] == [p.name for p in paths]
+    for thread_fp, process_fp in zip(thread_fps, process_fps, strict=True):
+        assert thread_fp.hash_tuples() == process_fp.hash_tuples()
+
+
+@_requires_process_pool
+def test_process_mode_fail_soft_skips_bad_path_and_collects_error(tmp_path: Path) -> None:
+    # Fail-soft semantics must be identical in process mode: a missing path
+    # between good ones is skipped (not fatal), the good fingerprints come back
+    # in input order, and the failure is recorded in the errors collector with
+    # its real exception type -- no RuntimeWarning when a collector is supplied.
+    good_a = tmp_path / "a.txt"
+    good_a.write_text("alpha alpha alpha\n" * 40, encoding="utf-8")
+    missing = tmp_path / "does-not-exist.txt"
+    good_b = tmp_path / "b.txt"
+    good_b.write_text("bravo bravo bravo\n" * 40, encoding="utf-8")
+
+    fingerprinter = Fingerprinter(_mixed_batch_config())
+
+    collector: list[tuple[str, Exception]] = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        fingerprints = fingerprinter.fingerprint_many(
+            [good_a, missing, good_b], errors=collector, executor="process"
+        )
+
+    assert [Path(fp.path).name for fp in fingerprints] == ["a.txt", "b.txt"]
+    assert len(collector) == 1
+    failed_path, failed_exc = collector[0]
+    assert failed_path == str(missing)
+    assert isinstance(failed_exc, FileNotFoundError)
+
+
+@_requires_process_pool
+def test_process_mode_fail_soft_warns_without_collector(tmp_path: Path) -> None:
+    # Without a collector, process mode still emits the RuntimeWarning naming the
+    # skipped path (same fallback path as thread mode).
+    good_a = tmp_path / "a.txt"
+    good_a.write_text("alpha alpha alpha\n" * 40, encoding="utf-8")
+    missing = tmp_path / "does-not-exist.txt"
+    good_b = tmp_path / "b.txt"
+    good_b.write_text("bravo bravo bravo\n" * 40, encoding="utf-8")
+
+    fingerprinter = Fingerprinter(_mixed_batch_config())
+
+    with pytest.warns(RuntimeWarning, match=r"skipping .*does-not-exist\.txt"):
+        fingerprints = fingerprinter.fingerprint_many(
+            [good_a, missing, good_b], executor="process"
+        )
+
+    assert [Path(fp.path).name for fp in fingerprints] == ["a.txt", "b.txt"]
+
+
+@_requires_process_pool
+def test_process_mode_raises_on_first_error_when_skip_errors_false(tmp_path: Path) -> None:
+    # skip_errors=False must still propagate the first failure in process mode.
+    good = tmp_path / "a.txt"
+    good.write_text("alpha alpha alpha\n" * 40, encoding="utf-8")
+    missing = tmp_path / "does-not-exist.txt"
+
+    fingerprinter = Fingerprinter(_mixed_batch_config())
+
+    with pytest.raises(FileNotFoundError):
+        fingerprinter.fingerprint_many(
+            [good, missing, good], skip_errors=False, executor="process"
+        )
+
+
+def test_unknown_executor_rejected(tmp_path: Path) -> None:
+    # A typo'd executor name fails loudly rather than silently defaulting.
+    path = tmp_path / "a.txt"
+    path.write_text("alpha alpha\n" * 40, encoding="utf-8")
+    fingerprinter = Fingerprinter(_mixed_batch_config())
+
+    with pytest.raises(ValueError, match="unknown executor"):
+        fingerprinter.fingerprint_many([path], executor="parallel")  # type: ignore[arg-type]
+
+
+def test_fingerprinter_is_picklable() -> None:
+    # ProcessPoolExecutor under the 'spawn' start method (macOS default) requires
+    # everything sent to workers to be picklable. The worker initializer is handed
+    # this instance's (config, handlers_package); both must round-trip, and the
+    # reconstructed Fingerprinter must produce the same hashes.
+    import pickle
+
+    fingerprinter = Fingerprinter(_mixed_batch_config())
+    restored = pickle.loads(pickle.dumps(fingerprinter))
+
+    assert [h.name for h in restored.handlers] == [h.name for h in fingerprinter.handlers]
+    assert restored.config == fingerprinter.config
+    assert restored.handlers_package == fingerprinter.handlers_package

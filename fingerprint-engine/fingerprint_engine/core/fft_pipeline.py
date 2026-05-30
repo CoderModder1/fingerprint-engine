@@ -209,7 +209,21 @@ class FFTFingerprintPipeline:
         return np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
 
     def extract_peaks(self, spectrogram: np.ndarray) -> list[LandmarkPoint]:
-        """Identify deterministic local maxima above an adaptive threshold."""
+        """Identify deterministic local maxima above an adaptive threshold.
+
+        Vectorized equivalent of the original per-candidate scan: instead of
+        recomputing a clipped 3x3 ``neighborhood.max()`` for every candidate bin
+        in Python, the 3x3 clipped local maximum is computed once for the whole
+        matrix as a separable pair of 1-D 3-window maxima (max along frequency,
+        then along time). Each 1-D pass pads with ``-inf`` and takes the
+        elementwise max of the three shifted slices; ``-inf`` padding never wins
+        a ``max``, so each cell's window max is taken over exactly the same
+        edge-CLIPPED 3x3 block the original used. A separable max equals the 2-D
+        block max because ``max`` is associative/commutative, and float32
+        ``max`` is pure selection (no arithmetic) so equality is exact -- the
+        produced landmarks are byte-identical to the original implementation,
+        without materializing a large strided neighborhood view.
+        """
 
         matrix = np.asarray(spectrogram, dtype=np.float32)
         if matrix.ndim != 2 or matrix.size == 0 or float(matrix.max()) <= 0.0:
@@ -220,30 +234,44 @@ class FFTFingerprintPipeline:
         percentile = float(np.percentile(matrix, self.config.peak_percentile))
         threshold = max(mean + self.config.peak_threshold * std, percentile)
 
-        peaks: list[LandmarkPoint] = []
-        time_count, freq_count = matrix.shape
-        for time_index in range(time_count):
-            frame_candidates: list[LandmarkPoint] = []
-            row = matrix[time_index]
-            candidate_bins = np.flatnonzero(row >= threshold)
-            for frequency_bin in candidate_bins:
-                magnitude = float(row[frequency_bin])
-                t0 = max(0, time_index - 1)
-                t1 = min(time_count, time_index + 2)
-                f0 = max(0, int(frequency_bin) - 1)
-                f1 = min(freq_count, int(frequency_bin) + 2)
-                neighborhood = matrix[t0:t1, f0:f1]
-                if magnitude >= float(neighborhood.max()) and magnitude > 0.0:
-                    frame_candidates.append(
-                        LandmarkPoint(
-                            time_index=time_index,
-                            frequency_bin=int(frequency_bin),
-                            magnitude=round(magnitude, 6),
-                        )
-                    )
+        # 3x3 clipped local maximum for every cell, computed separably. Padding
+        # with -inf keeps each windowed max equal to the original edge-clipped
+        # ``matrix[t-1:t+2, f-1:f+2].max()`` (padding can never be the maximum),
+        # so ``matrix == local_max`` reproduces ``magnitude >= neighborhood.max()``
+        # exactly (a cell is in its own neighborhood, so the max is >= the cell).
+        rows, cols = matrix.shape
+        pad_freq = np.full((rows, cols + 2), -np.inf, dtype=np.float32)
+        pad_freq[:, 1:-1] = matrix
+        col_max = np.maximum(np.maximum(pad_freq[:, :-2], pad_freq[:, 1:-1]), pad_freq[:, 2:])
+        pad_time = np.full((rows + 2, cols), -np.inf, dtype=np.float32)
+        pad_time[1:-1, :] = col_max
+        local_max = np.maximum(np.maximum(pad_time[:-2, :], pad_time[1:-1, :]), pad_time[2:, :])
 
+        # A peak qualifies iff it is its own 3x3 max, strictly positive, and at
+        # or above the threshold -- identical predicate to the original loop.
+        qualifies = (matrix >= local_max) & (matrix > 0.0) & (matrix >= threshold)
+
+        peaks: list[LandmarkPoint] = []
+        max_per_frame = self.config.max_peaks_per_frame
+        time_count = matrix.shape[0]
+        for time_index in range(time_count):
+            frame_bins = np.flatnonzero(qualifies[time_index])
+            if frame_bins.size == 0:
+                continue
+            # ``round(float(value), 6)`` reproduces the original stored (and
+            # sorted-on) magnitude exactly: float() on a float32 is lossless and
+            # round() then matches the per-element Python round.
+            row = matrix[time_index]
+            frame_candidates = [
+                LandmarkPoint(
+                    time_index=time_index,
+                    frequency_bin=int(frequency_bin),
+                    magnitude=round(float(row[frequency_bin]), 6),
+                )
+                for frequency_bin in frame_bins
+            ]
             frame_candidates.sort(key=lambda item: (-item.magnitude, item.frequency_bin))
-            peaks.extend(frame_candidates[: self.config.max_peaks_per_frame])
+            peaks.extend(frame_candidates[:max_per_frame])
 
         peaks.sort(key=lambda item: (item.time_index, item.frequency_bin, -item.magnitude))
         return peaks

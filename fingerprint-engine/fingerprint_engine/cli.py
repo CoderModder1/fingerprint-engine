@@ -167,8 +167,10 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         skipped = [
             {"path": path, "reason": f"{type(exc).__name__}: {exc}"} for path, exc in collector
         ]
-        for fingerprint in fingerprints:
-            index.add(fingerprint)
+        # Bulk/transactional ingest: one commit (SQLite) / one pipeline (Redis) /
+        # one COPY (Postgres) for the whole batch instead of a per-file commit.
+        # Equivalent to calling add() per fingerprint in sequence.
+        index.add_many(fingerprints)
         if args.backend == "memory":
             index.save(index_path)  # Redis/SQLite persist on add; no file to write.
         payload = {
