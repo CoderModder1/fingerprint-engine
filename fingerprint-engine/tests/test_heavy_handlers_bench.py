@@ -6,10 +6,11 @@ keep fingerprinting end-to-end:
 
 * video (gated on ``av`` + ``imageio``): self recall@1 == 1.0, and at least one
   cadence-preserving near-duplicate variant ranks its parent #1;
-* embedding (numpy-only, always runs): self recall@1 == 1.0, and an append /
-  edit near-duplicate ranks its parent #1, while a length-changing variant that
-  crosses the adaptive-window boundary is *expected* to miss (the documented
-  design gap is pinned, not hidden).
+* embedding (numpy-only, always runs): self recall@1 == 1.0, append / edit
+  near-duplicates rank their parent #1, and a LENGTH-CROSSING near-duplicate
+  (a big append) also ranks its parent #1 -- the per-frame window=d makes
+  matching length-stable -- while a DIFFERENT-dimensionality copy of the same
+  content correctly does NOT match (window=d isolates by dimensionality).
 
 The benchmark module is imported and reused so the tests exercise exactly the
 synthesis + indexing the reported numbers come from. Everything is seeded and
@@ -55,16 +56,33 @@ def test_embedding_benchmark_append_and_edit_variants_match() -> None:
     assert report["max_impostor_confidence"] < by_variant["append_5"]["confidence"]
 
 
-def test_embedding_benchmark_pins_adaptive_window_gap() -> None:
-    # The handler sets no class default_signal_window, so the signal is
-    # fingerprinted at the LENGTH-ADAPTIVE global window, not a d-aligned one.
-    # A large append crosses an adaptive-window boundary (512 -> 1024) and lands
-    # on a different time grid, so it FAILS to align. Pin that documented gap so
-    # a future change that fixes (or regresses) it is visible.
+def test_embedding_benchmark_length_stable_and_dim_isolated() -> None:
+    # The handler overrides extract_peaks to fingerprint at a per-frame
+    # window=hop=d (fixed_window=True), so all same-d files share one time grid
+    # regardless of sequence length -> length-STABLE matching. The big-append
+    # near-dup (append_30) crosses what was an adaptive-window boundary at the
+    # GLOBAL pipeline (effective_window 512 -> 1024) yet must now still rank the
+    # true parent #1, because the actual fingerprint window is d, not the global
+    # adaptive window.
     report = run_embedding_benchmark(num_docs=8, num_vectors=60, dim=64)
     by_variant = {row["variant"]: row for row in report["per_variant"]}
-    assert by_variant["append_30"]["matched"] is False
+
+    # Length stability: the length-crossing near-dup now MATCHES its parent.
+    assert by_variant["append_30"]["matched"] is True
+    # It really did cross the global adaptive-window boundary (proving the old
+    # gap), yet it still matched -- the d window, not the global window, governs.
     assert by_variant["append_30"]["effective_window"] != by_variant["append_5"]["effective_window"]
+    # Every same-d file -- original or near-dup -- was fingerprinted at window=d.
+    assert by_variant["append_30"]["embedding_window"] == 64
+    assert by_variant["append_5"]["embedding_window"] == 64
+
+    # Self recall stays perfect.
+    assert report["self_recall_at_1"] == 1.0
+
+    # Dimensionality isolation: the SAME base content re-embedded at 2*d lands on
+    # a different time grid (window=2*d) and must NOT match the d=64 parent.
+    assert by_variant["different_dim"]["embedding_window"] == 128
+    assert by_variant["different_dim"]["matched"] is False
 
 
 # ---------------------------------------------------------------------------

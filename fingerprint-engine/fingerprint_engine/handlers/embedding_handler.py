@@ -23,11 +23,33 @@ the two by treating an ORDERED LIST of vectors as a time series:
   encode.
 * The normalised rows are concatenated in order into one long 1D signal:
   ``signal = [v0_0 .. v0_{d-1}, v1_0 .. v1_{d-1}, ...]``. Because every frame is
-  exactly ``d`` samples wide, a per-handler FIXED FFT window aligned to ``d``
+  exactly ``d`` samples wide, a per-frame FIXED FFT window aligned to ``d``
   keeps each vector on the SAME time grid across files, so a shared run of
   embeddings (a quoted passage, a repeated segment) produces shared
   constellation hashes and aligns on the existing offset histogram -- no change
   to the index or search code.
+
+How the per-frame ``d`` window is wired (length stability)
+----------------------------------------------------------
+``d`` is a PER-FILE quantity, known only after :meth:`load`, so it cannot be
+expressed as the class-level ``default_signal_window`` the framework reads at
+configure time (that mechanism is for content types with a single fixed window).
+Instead :meth:`extract_peaks` is overridden to build a per-file
+:class:`FFTFingerprintPipeline` with ``window_size = hop_size = d`` and
+``fixed_window=True``, reusing every other tuning parameter from the passed
+pipeline's config. Each vector then occupies EXACTLY ONE non-overlapping FFT
+frame, so the concatenated ``n*d``-sample signal yields exactly ``n`` frames and
+ALL files of the same dimensionality ``d`` share the same time grid regardless
+of sequence length ``n``. A length-changing near-duplicate (a big append, a
+delete) therefore stays aligned with its parent instead of crossing the global
+length-ADAPTIVE window boundary and dropping to ~0 recall.
+
+Because the window is dictated by ``d``, an explicit global ``--window-size``
+override does NOT apply to embeddings; they always fingerprint at ``window=d``.
+A tiny embedding whose ``d`` is below ``min_window_size`` falls back to the
+passed pipeline (we never construct an invalid sub-window). A 1-vector input is
+the degenerate 1-frame case and produces 0 hashes (it carries no time
+structure), exactly as the single-bare-vector note below describes.
 
 This is deliberately a SEQUENCE / near-duplicate-of-a-stream matcher, not a
 single-vector ANN nearest-neighbour search (which is a different data structure
@@ -40,22 +62,25 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 
 from fingerprint_engine.core.exceptions import MissingDependencyError
-from fingerprint_engine.core.models import FingerprintConfig
+from fingerprint_engine.core.fft_pipeline import FFTFingerprintPipeline
+from fingerprint_engine.core.models import ConstellationHash, FingerprintConfig, LandmarkPoint
 
 from .base import FileHandler
 
 logger = logging.getLogger(__name__)
 
 # A fixed per-frame width is unknown until load() (it is the embedding
-# dimensionality ``d``), so the handler sets its FFT window from the loaded
-# payload via ``configure``-time defaults; see ``to_signal`` / the window note.
+# dimensionality ``d``), so the handler cannot declare a class-level
+# default_signal_window; instead extract_peaks builds a per-file window=hop=d
+# pipeline (see the module docstring / extract_peaks).
 # These bound a pathological input so the concatenated signal cannot explode.
 _DEFAULT_MAX_VECTORS = 4096
 _DEFAULT_MAX_DIM = 8192
@@ -114,8 +139,27 @@ class EmbeddingFileHandler(FileHandler):
             raise ValueError("max_vectors must be positive")
         if self.max_dim <= 0:
             raise ValueError("max_dim must be positive")
-        # Per-frame FFT window == embedding dimensionality, learned at load().
-        self._signal_window: int | None = None
+        # Per-frame FFT window (== embedding dim d), learned at load() and read
+        # by extract_peaks. Stored THREAD-LOCALLY because fingerprint_many(
+        # executor="thread") shares one handler instance across workers, while
+        # load() -> to_signal() -> extract_peaks() all run on the SAME worker
+        # thread: a thread-local keeps each worker's d isolated so a concurrent
+        # load() of a different-dimensionality file cannot clobber another
+        # thread's window between its load() and its extract_peaks().
+        self._tls = threading.local()
+
+    def __getstate__(self) -> dict[str, object]:
+        # threading.local() is not picklable, but the Fingerprinter that holds
+        # this handler must stay picklable for fingerprint_many(executor=
+        # "process"). Drop the transient per-thread window store from the pickle
+        # (load() repopulates it in the worker; __setstate__ recreates it empty).
+        state = self.__dict__.copy()
+        state.pop("_tls", None)
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+        self._tls = threading.local()
 
     def configure(self, config: FingerprintConfig) -> None:
         # Forward-compatible config wiring; ``getattr`` keeps the default path
@@ -164,7 +208,7 @@ class EmbeddingFileHandler(FileHandler):
 
         matrix = self._sanitize(vectors)
         num_vectors, dim = matrix.shape
-        self._signal_window = dim
+        self._tls.signal_window = dim
         return EmbeddingPayload(vectors=matrix, num_vectors=num_vectors, dim=dim, source=origin)
 
     def _embed_with_plugin(self, path: Path) -> np.ndarray:
@@ -249,10 +293,53 @@ class EmbeddingFileHandler(FileHandler):
             return np.zeros(1, dtype=np.float32)
         return np.asarray(payload.vectors, dtype=np.float32).reshape(-1)
 
+    def extract_peaks(
+        self,
+        signal: np.ndarray,
+        pipeline: FFTFingerprintPipeline,
+    ) -> tuple[list[LandmarkPoint], list[ConstellationHash]]:
+        """Fingerprint the concatenated signal at a per-frame window of ``d``.
+
+        ``d`` (the per-thread window learned at :meth:`load`) is the width
+        of one embedding vector. Building a sub-pipeline with
+        ``window_size = hop_size = d`` and ``fixed_window=True`` makes each vector
+        occupy EXACTLY ONE non-overlapping FFT frame, so the ``n*d``-sample signal
+        yields exactly ``n`` frames and every file of the same dimensionality
+        ``d`` shares the same time grid regardless of sequence length ``n`` --
+        length-stable matching (a big append no longer crosses the global
+        length-adaptive window boundary). All other tuning
+        (peak_threshold/percentile/fanout/min_delta_t/...) is reused from the
+        passed pipeline's config so only the window/hop change.
+
+        GUARD: if ``d`` is below ``min_window_size`` (a tiny embedding) or is not
+        a usable positive int, we do NOT construct an invalid sub-window and fall
+        back to the passed pipeline. ``signal`` length is ``n*d >= d``, so the
+        fixed window never adaptively shrinks; a 1-vector input is the documented
+        degenerate 1-frame case (0 hashes).
+        """
+
+        config = pipeline.config
+        d = getattr(self._tls, "signal_window", None)
+        if d is None or d < config.min_window_size or d > config.max_signal_samples:
+            # Tiny / unknown / pathological dimensionality: keep the passed
+            # pipeline rather than build an out-of-range window.
+            return pipeline.fingerprint_signal(signal)
+        per_frame = FFTFingerprintPipeline(
+            replace(config, window_size=d, hop_size=d),
+            fixed_window=True,
+        )
+        return per_frame.fingerprint_signal(signal)
+
     def metadata(self, payload: EmbeddingPayload) -> dict[str, object]:
         return {
             "num_vectors": payload.num_vectors,
             "embedding_dim": payload.dim,
             "source": payload.source,
             "signal_strategy": "l2_normalized_vector_sequence",
+            # The TRUE per-frame FFT window the signal was fingerprinted at (== d
+            # unless d < min_window_size, where extract_peaks fell back to the
+            # passed pipeline). The framework records ``effective_window_size``
+            # from the GLOBAL pipeline, which is length-adaptive and does not
+            # reflect this per-file window, so expose it here for auditability.
+            "embedding_signal_window": payload.dim,
         }

@@ -297,7 +297,9 @@ def run_embedding_benchmark(num_docs: int = 8, num_vectors: int = 60, dim: int =
         variant_specs: list[tuple[str, np.ndarray]] = [
             # Append a few vectors (small length change).
             ("append_5", np.vstack([base, _make_embedding_doc(99, 5, dim)])),
-            # Append MANY vectors -- crosses an adaptive-window boundary (see verdict).
+            # Append MANY vectors -- length-crossing near-dup. At the OLD global
+            # length-adaptive window this crossed 512 -> 1024 and missed; with the
+            # per-frame window=d it stays length-stable and matches.
             ("append_30", np.vstack([base, _make_embedding_doc(99, 30, dim)])),
             # Delete a few rows.
             ("delete_5_rows", np.delete(base, [10, 11, 12, 30, 31], axis=0)),
@@ -307,6 +309,12 @@ def run_embedding_benchmark(num_docs: int = 8, num_vectors: int = 60, dim: int =
             ("perturb_5_rows", _perturb_rows(base, [5, 6, 7, 8, 9], scale=0.1)),
             # Reorder a contiguous block (swap two adjacent runs of rows).
             ("reorder_block", np.vstack([base[:15], base[25:35], base[15:25], base[35:]])),
+            # SAME base content re-embedded at a DIFFERENT dimensionality (each row
+            # width-doubled to 2*d). The per-frame window is d-aligned, so a 2*d
+            # stream lands on a different time grid and frequency basis and MUST
+            # NOT match: window=d isolates by dimensionality. Tracked as a control,
+            # not a near-dup, so it is excluded from the near-dup recall stats.
+            ("different_dim", np.concatenate([base, base], axis=1)),
         ]
         variant_rows: list[dict[str, object]] = []
         for name, arr in variant_specs:
@@ -321,6 +329,11 @@ def run_embedding_benchmark(num_docs: int = 8, num_vectors: int = 60, dim: int =
                     "confidence": round(conf, 4),
                     "query_hashes": fp.hash_count,
                     "num_vectors": int(arr.shape[0]),
+                    "embedding_dim": int(arr.shape[1]),
+                    # The TRUE per-frame FFT window used (== d); the framework's
+                    # ``effective_window_size`` reflects the GLOBAL length-adaptive
+                    # pipeline and does NOT govern embedding matching anymore.
+                    "embedding_window": int(fp.metadata.get("embedding_signal_window", 0)),
                     "effective_window": int(fp.metadata.get("effective_window_size", 0)),
                 }
             )
@@ -331,25 +344,33 @@ def run_embedding_benchmark(num_docs: int = 8, num_vectors: int = 60, dim: int =
         unrelated_fp = fingerprinter.fingerprint_file(unrelated_path)
         _m, _c, impostor_top = _query(index, unrelated_fp, base_id)
 
-    summary = _summarize_variants(variant_rows)
+    # ``different_dim`` is a negative control (it MUST miss), so it is excluded
+    # from the near-dup recall stat -- those stats only cover the genuine
+    # same-d near-duplicates -- but it is still reported in ``per_variant``.
+    near_dup_rows = [row for row in variant_rows if row["variant"] != "different_dim"]
+    summary = _summarize_variants(near_dup_rows)
     return {
         "corpus": {"docs": num_docs, "vectors_per_doc": num_vectors, "dim": dim},
         "self_recall_at_1": round(self_hits / num_docs, 4),
         "mean_self_confidence": round(statistics.mean(self_confs), 4),
         "near_dup_recall_at_1": summary["near_dup_recall_at_1"],
         "mean_near_dup_confidence": summary["mean_confidence"],
-        "per_variant": summary["per_variant"],
+        "per_variant": variant_rows,
         "max_impostor_confidence": round(impostor_top, 4),
         "throughput_docs_per_s": round(num_docs / fp_elapsed, 3) if fp_elapsed > 0 else None,
         "avg_hashes_per_file": round(statistics.mean(hash_counts), 1),
         "original_effective_windows": sorted(set(eff_windows)),
         "window_note": (
-            "EmbeddingFileHandler defines no class default_signal_window, so the "
-            "signal is fingerprinted at the GLOBAL default window (4096), which is "
-            "LENGTH-ADAPTIVE -- not the per-frame d. The effective window therefore "
-            "depends on the signal length (num_vectors*d), so a length-changing "
-            "near-dup that crosses an adaptive-window boundary lands on a different "
-            "time grid and fails to align (see the append_30 variant)."
+            "EmbeddingFileHandler overrides extract_peaks to fingerprint at a "
+            "per-frame window=hop=d (fixed_window=True), so each vector is exactly "
+            "one FFT frame and all files of the same dimensionality d share one "
+            "time grid regardless of sequence length n. Matching is therefore "
+            "LENGTH-STABLE: a length-crossing near-dup (append_30) stays aligned "
+            "with its parent. The framework-recorded ``effective_window_size`` "
+            "still reflects the GLOBAL length-adaptive pipeline and no longer "
+            "governs embedding matching (see ``embedding_window`` for the real d "
+            "window). A different-dimensionality copy (``different_dim``) lands on "
+            "a different grid and correctly does NOT match."
         ),
     }
 
