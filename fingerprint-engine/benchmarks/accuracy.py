@@ -47,6 +47,7 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -56,7 +57,7 @@ if str(ROOT) not in sys.path:
 
 from fingerprint_engine.core.fingerprinter import Fingerprinter
 from fingerprint_engine.core.index import InMemoryHashIndex
-from fingerprint_engine.core.models import Fingerprint
+from fingerprint_engine.core.models import Fingerprint, FingerprintConfig
 
 # A modest, deterministic vocabulary keeps generated text decodable as UTF-8 and
 # rich enough that a fingerprint of one document is highly distinct from another.
@@ -302,6 +303,277 @@ def _char_edit(rng: np.random.Generator, text: str, fraction: float) -> str:
         code = ord(chars[int(pos)])
         chars[int(pos)] = chr(33 + (code + 1) % 90)  # stay in printable ASCII
     return "".join(chars)
+
+
+# ---------------------------------------------------------------------------
+# HARD evaluation mode
+#
+# The default near-dup matrix above is deliberately gentle: it documents the
+# happy path and, by design, every text/image case there recalls at 1.0 even
+# under heavy char edits (the offset histogram is extremely robust -- the large
+# UNTOUCHED spans of a doc all vote coherently at offset 0, so a true match wins
+# however much you scribble on it). That saturation is the BLIND SPOT: an opt-in
+# matching flag that genuinely lifts recall is invisible when recall is already
+# 1.0, so a flag's win can only show up as confidence, never as recall.
+#
+# This section builds a HARDER corpus + mutation matrix whose explicit purpose is
+# to push default-config recall@1 BELOW 1.0, so a flag's effect on RECALL (not
+# just confidence) is measurable, and to inject genuine false-accept pressure so
+# PRECISION is measurable too. Two pressures combine:
+#
+# * AGGRESSIVE mutations that fragment the offset alignment -- many scattered
+#   insertions (each shifts the absolute frame index of everything after it, so
+#   aligned votes smear across a wide band of delta bins instead of piling on one
+#   bin), heavy multi-point char edits, line shuffles; for image, strong
+#   downscale + crop + rotate + low-quality JPEG; for audio, the excerpt clip
+#   that re-normalises the global time grid.
+# * CONFUSABILITY pressure -- "sibling" documents that share a common header
+#   skeleton but carry distinct payload bodies. Siblings genuinely collide on the
+#   shared region, so an impostor's best wrong-file confidence rises toward the
+#   0.05 cutoff and a real false-accept risk exists to measure. The shared
+#   fraction is tuned so impostors sit AROUND the cutoff (not far above it): the
+#   default operating point leaks some false accepts, and a stricter cutoff
+#   recovers precision -- which is the trade a "promote a collision-adding flag to
+#   default" decision must weigh.
+#
+# Everything here is seeded off the same ``default_rng`` and bounded to small
+# corpora so it stays a few-seconds unit-testable harness, never a benchmark run.
+# ---------------------------------------------------------------------------
+
+# Each hard text mutation is keyed by name -> (description, builder). A builder is
+# ``(rng, text) -> str``; recall is read OFF (default config) vs ON (each flag).
+HARD_SCATTER_INSERTS = 40  # scattered single-line inserts: enough to fragment
+HARD_CHAR_EDIT_FRACTION = 0.20  # heavy multi-point edits (20% of code points)
+
+
+def _scatter_insert(rng: np.random.Generator, text: str, n_inserts: int) -> str:
+    """Splice ``n_inserts`` random word-salad lines at scattered positions.
+
+    Each insertion shifts the frame index of all following content by a little,
+    so the true match's aligned votes fragment across a wide band of delta bins
+    instead of concentrating on the single offset-0 bin -- the exact failure mode
+    the offset histogram is weakest against and that drops default recall below
+    1.0 once enough insertions accumulate.
+    """
+
+    lines = text.split("\n")
+    for _ in range(n_inserts):
+        pos = int(rng.integers(0, len(lines) + 1))
+        count = int(rng.integers(5, 13))
+        idx = rng.integers(0, len(_WORDS), size=count)
+        lines.insert(pos, " ".join(_WORDS[int(i)] for i in idx))
+    return "\n".join(lines) + "\n"
+
+
+def _line_shuffle(rng: np.random.Generator, text: str) -> str:
+    """Permute the lines of a document (destroys all sequential structure)."""
+
+    lines = text.split("\n")
+    perm = rng.permutation(len(lines))
+    return "\n".join(lines[int(i)] for i in perm) + "\n"
+
+
+def _multi_point_edit(rng: np.random.Generator, text: str, n_inserts: int, fraction: float) -> str:
+    """Combine scattered inserts with a heavy char-edit pass (the worst case)."""
+
+    return _char_edit(rng, _scatter_insert(rng, text, n_inserts), fraction)
+
+
+# Number of shared header lines vs distinct payload lines in a sibling. Tuned
+# (see benchmarks/RESULTS.md hard-mode notes) so a sibling's best wrong-match
+# confidence lands AROUND the 0.05 cutoff: enough collision to leak false accepts
+# at 0.05 (measurable precision loss), little enough that a stricter cutoff cleans
+# it up -- the band where a precision/recall trade is actually visible.
+HARD_SIBLING_SHARED_LINES = 12
+HARD_SIBLING_PAYLOAD_LINES = 45
+
+
+def _gen_sibling_lines(rng: np.random.Generator, n_lines: int) -> list[str]:
+    """Build ``n_lines`` of word-salad as a list (so headers/payloads compose)."""
+
+    lines: list[str] = []
+    for _ in range(n_lines):
+        count = int(rng.integers(5, 13))
+        idx = rng.integers(0, len(_WORDS), size=count)
+        lines.append(" ".join(_WORDS[int(i)] for i in idx))
+    return lines
+
+
+def _write_sibling_corpus(
+    rng: np.random.Generator, families: int, siblings_per_family: int, workdir: Path
+) -> tuple[list[str], list[str]]:
+    """Write a confusability corpus of sibling documents.
+
+    Each of ``families`` families shares one randomly generated header skeleton;
+    every sibling in a family appends its own distinct payload body. Siblings
+    therefore collide on the shared header (the false-accept pressure) while
+    remaining distinct documents (the payload dominates the fingerprint). Returns
+    (paths, source texts) in a fixed order so the corpus is fully reproducible.
+    """
+
+    paths: list[str] = []
+    texts: list[str] = []
+    doc = 0
+    for _ in range(families):
+        header = _gen_sibling_lines(rng, HARD_SIBLING_SHARED_LINES)
+        for _ in range(siblings_per_family):
+            payload = _gen_sibling_lines(rng, HARD_SIBLING_PAYLOAD_LINES)
+            text = "\n".join(header + payload) + "\n"
+            path = workdir / f"sib{doc:03d}.txt"
+            path.write_text(text, encoding="utf-8")
+            paths.append(str(path))
+            texts.append(text)
+            doc += 1
+    return paths, texts
+
+
+def _gen_hard_image(rng: np.random.Generator, width: int, height: int):  # noqa: ANN202 - PIL optional
+    """Build a SMOOTH, per-file-distinct image for the hard image sweep.
+
+    The standard harness's gradient image is identical across files apart from
+    additive noise, so a global pHash descriptor (a low-frequency summary) makes
+    every file look alike and impostor confidence is uninformative. Here each file
+    is a sum of a few RANDOM low-frequency 2D sinusoids: smooth (so a pHash
+    survives crop/rotate/resize -- a real recall signal) yet per-file-distinct in
+    its global structure (so impostor pHashes separate and the precision cost of
+    pHash is measured honestly, not masked by a shared gradient).
+    """
+
+    from PIL import Image
+
+    yy, xx = np.mgrid[0:height, 0:width].astype(float)
+    field = np.zeros((height, width))
+    for _ in range(4):
+        fx = rng.uniform(0.5, 3.0) / width
+        fy = rng.uniform(0.5, 3.0) / height
+        phase = rng.uniform(0, 2 * np.pi)
+        amp = rng.uniform(0.5, 1.0)
+        field += amp * np.sin(2 * np.pi * (fx * xx + fy * yy) + phase)
+    field -= field.min()
+    field /= field.max() or 1.0
+    arr = np.empty((height, width, 3), dtype=np.uint8)
+    arr[:, :, 0] = (field * 255).astype(np.uint8)
+    arr[:, :, 1] = ((1.0 - field) * 255).astype(np.uint8)
+    arr[:, :, 2] = (field * field * 255).astype(np.uint8)
+    return Image.fromarray(arr, "RGB")
+
+
+def _write_hard_image_corpus(rng: np.random.Generator, size: int, workdir: Path):  # noqa: ANN202
+    """Write ``size`` smooth per-file-distinct PNGs; return (paths, PIL images)."""
+
+    paths: list[str] = []
+    images = []
+    for i in range(size):
+        width = int(rng.integers(140, 200))
+        height = int(rng.integers(110, 160))
+        image = _gen_hard_image(rng, width, height)
+        path = workdir / f"himg{i:03d}.png"
+        image.save(path)
+        paths.append(str(path))
+        images.append(image)
+    return paths, images
+
+
+# ---------------------------------------------------------------------------
+# Per-flag OFF-vs-ON measurement on the hard corpus
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FlagComparison:
+    """recall@1 and precision/false-accept for one mutation, OFF vs ON a flag.
+
+    ``*_false_accept`` is the leave-one-out false-accept rate at the default 0.05
+    cutoff; ``*_false_accept_strict`` is the same at a stricter 0.20 cutoff. A
+    flag whose recall win comes with a high 0.05 false-accept but a clean 0.20 one
+    is justifiable only at the stricter operating point -- the table makes that
+    explicit so a "promote to default" decision sees the cutoff it would require.
+    """
+
+    flag: str
+    setting: str
+    mutation: str
+    off_recall: float
+    on_recall: float
+    off_false_accept: float
+    on_false_accept: float
+    off_false_accept_strict: float = 0.0
+    on_false_accept_strict: float = 0.0
+
+    @property
+    def recall_delta(self) -> float:
+        return self.on_recall - self.off_recall
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "flag": self.flag,
+            "setting": self.setting,
+            "mutation": self.mutation,
+            "off_recall": round(self.off_recall, 4),
+            "on_recall": round(self.on_recall, 4),
+            "recall_delta": round(self.recall_delta, 4),
+            "off_false_accept@0.05": round(self.off_false_accept, 4),
+            "on_false_accept@0.05": round(self.on_false_accept, 4),
+            "off_false_accept@0.20": round(self.off_false_accept_strict, 4),
+            "on_false_accept@0.20": round(self.on_false_accept_strict, 4),
+        }
+
+
+def _false_accept_rate(
+    index: InMemoryHashIndex,
+    fingerprints: list[Fingerprint],
+    cutoff: float,
+    *,
+    offset_tolerance: int | None = None,
+    candidate_limit: int | None = None,
+) -> float:
+    """Leave-one-out false-accept rate at ``cutoff``.
+
+    Each fingerprint is removed from the index, searched (so no correct answer is
+    reachable), and restored; any returned top-1 whose confidence clears
+    ``cutoff`` is a false accept. The index is left exactly as it was found.
+    """
+
+    if not fingerprints:
+        return 0.0
+    false_accepts = 0
+    for fingerprint in fingerprints:
+        index.remove(fingerprint.file_id)
+        results = index.search(
+            fingerprint, top_k=1, offset_tolerance=offset_tolerance, candidate_limit=candidate_limit
+        )
+        if results and results[0].confidence >= cutoff:
+            false_accepts += 1
+        index.add(fingerprint)
+    return false_accepts / len(fingerprints)
+
+
+def _mutation_recall(
+    index: InMemoryHashIndex,
+    fingerprinter: Fingerprinter,
+    workdir: Path,
+    targets: list[Fingerprint],
+    render: Callable[[int], bytes],
+    suffix: str,
+    *,
+    offset_tolerance: int | None = None,
+    candidate_limit: int | None = None,
+) -> float:
+    """recall@1 of a mutation, with optional search-time flags applied."""
+
+    if not targets:
+        return 0.0
+    hits = 0
+    scratch = workdir / f"_hard_mut{suffix}"
+    for i, target in enumerate(targets):
+        scratch.write_bytes(render(i))
+        query = fingerprinter.fingerprint_file(scratch)
+        results = index.search(
+            query, top_k=1, offset_tolerance=offset_tolerance, candidate_limit=candidate_limit
+        )
+        if results and results[0].file_id == target.file_id:
+            hits += 1
+    return hits / len(targets)
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +829,496 @@ def prune_is_lossless(index: InMemoryHashIndex, fingerprints: list[Fingerprint])
 
 
 # ---------------------------------------------------------------------------
+# Hard-corpus per-flag sweeps. Each returns a list[FlagComparison]: the OFF
+# (default-config) recall and false-accept vs the ON recall and false-accept,
+# per hard mutation. The corpus and mutations are rebuilt identically (same seed,
+# same fixed RNG call order) for OFF and ON so the only variable is the flag.
+# ---------------------------------------------------------------------------
+
+
+def _hard_text_corpus(
+    fingerprinter: Fingerprinter, rng: np.random.Generator, size: int, workdir: Path
+) -> tuple[InMemoryHashIndex, list[Fingerprint], list[str]]:
+    """Index a plain text corpus and return (index, fingerprints, source texts)."""
+
+    paths, texts = _write_text_corpus(rng, size, workdir)
+    fingerprints = [fingerprinter.fingerprint_file(p) for p in paths]
+    index = InMemoryHashIndex()
+    index.add_many(fingerprints)
+    return index, fingerprints, texts
+
+
+def _hard_text_mutations(
+    rng: np.random.Generator, texts: list[str]
+) -> list[tuple[str, Callable[[int], bytes]]]:
+    """Pre-render the deterministic hard text mutation payloads (pure of seed)."""
+
+    scatter = [_scatter_insert(rng, t, HARD_SCATTER_INSERTS) for t in texts]
+    shuffle = [_line_shuffle(rng, t) for t in texts]
+    heavy = [_char_edit(rng, t, HARD_CHAR_EDIT_FRACTION) for t in texts]
+    multi = [_multi_point_edit(rng, t, HARD_SCATTER_INSERTS, HARD_CHAR_EDIT_FRACTION) for t in texts]
+    return [
+        ("scatter_insert_40", lambda i: scatter[i].encode("utf-8")),
+        ("line_shuffle", lambda i: shuffle[i].encode("utf-8")),
+        ("char_edit_20pct", lambda i: heavy[i].encode("utf-8")),
+        ("multi_point_edit", lambda i: multi[i].encode("utf-8")),
+    ]
+
+
+def sweep_text_flags(
+    rng: np.random.Generator, size: int, workdir: Path
+) -> list[FlagComparison]:
+    """OFF-vs-ON sweep of the text-relevant flags on the hard text corpus.
+
+    Covers ``freq_quantization`` in {2, 4}, ``offset_tolerance`` in {1, 2}, and
+    ``candidate_limit`` in {size, 5}. Each ON config rebuilds the corpus with the
+    same seed so OFF/ON differ only by the flag. Reports recall@1 per hard
+    mutation and the leave-one-out false-accept rate at the 0.05 cutoff.
+    """
+
+    # OFF baseline: default config, exact search. Built once and reused.
+    off_index, off_fps, off_texts = _hard_text_corpus(Fingerprinter(), rng, size, workdir)
+    off_mutations = _hard_text_mutations(rng, off_texts)
+    off_recall = {
+        name: _mutation_recall(off_index, Fingerprinter(), workdir, off_fps, render, ".txt")
+        for name, render in off_mutations
+    }
+    off_fa = _false_accept_rate(off_index, off_fps, 0.05)
+    off_fa_strict = _false_accept_rate(off_index, off_fps, 0.20)
+
+    comparisons: list[FlagComparison] = []
+
+    def _record(
+        flag: str, setting: str, on_recall: dict[str, float], on_fa: float, on_fa_strict: float
+    ) -> None:
+        for name in off_recall:
+            comparisons.append(
+                FlagComparison(
+                    flag=flag,
+                    setting=setting,
+                    mutation=name,
+                    off_recall=off_recall[name],
+                    on_recall=on_recall[name],
+                    off_false_accept=off_fa,
+                    on_false_accept=on_fa,
+                    off_false_accept_strict=off_fa_strict,
+                    on_false_accept_strict=on_fa_strict,
+                )
+            )
+
+    # freq_quantization: a hash-changing flag, so rebuild the corpus at each q.
+    for q in (2, 4):
+        cfg = FingerprintConfig(freq_quantization=q)
+        fp = Fingerprinter(config=cfg)
+        idx, fps, texts = _hard_text_corpus(fp, np.random.default_rng(_SEED_FOR(rng)), size, workdir)
+        mutations = _hard_text_mutations(np.random.default_rng(_SEED_FOR(rng)), texts)
+        on_recall = {
+            name: _mutation_recall(idx, fp, workdir, fps, render, ".txt")
+            for name, render in mutations
+        }
+        _record(
+            "freq_quantization",
+            str(q),
+            on_recall,
+            _false_accept_rate(idx, fps, 0.05),
+            _false_accept_rate(idx, fps, 0.20),
+        )
+
+    # offset_tolerance: a SEARCH-time flag -- reuse the OFF index/corpus, just pass
+    # the tolerance through, so the only change is the banded-vote aggregation.
+    for tol in (1, 2):
+        on_recall = {
+            name: _mutation_recall(
+                off_index, Fingerprinter(), workdir, off_fps, render, ".txt", offset_tolerance=tol
+            )
+            for name, render in off_mutations
+        }
+        _record(
+            "offset_tolerance",
+            str(tol),
+            on_recall,
+            _false_accept_rate(off_index, off_fps, 0.05, offset_tolerance=tol),
+            _false_accept_rate(off_index, off_fps, 0.20, offset_tolerance=tol),
+        )
+
+    # candidate_limit: also a SEARCH-time flag (a prefilter). A generous limit
+    # must not change recall; a tight one can drop low-overlap matches.
+    for limit in (size, 5):
+        on_recall = {
+            name: _mutation_recall(
+                off_index, Fingerprinter(), workdir, off_fps, render, ".txt", candidate_limit=limit
+            )
+            for name, render in off_mutations
+        }
+        _record(
+            "candidate_limit",
+            str(limit),
+            on_recall,
+            _false_accept_rate(off_index, off_fps, 0.05, candidate_limit=limit),
+            _false_accept_rate(off_index, off_fps, 0.20, candidate_limit=limit),
+        )
+
+    return comparisons
+
+
+def confusability_precision(
+    rng: np.random.Generator, families: int, siblings_per_family: int, workdir: Path
+) -> list[dict[str, object]]:
+    """Measure how each collision-adding flag trades precision on sibling docs.
+
+    Builds the confusability corpus (sibling families sharing a header) and, for
+    the default config and each ``freq_quantization`` / ``offset_tolerance``
+    setting, reports the mean and max impostor (best wrong-file) confidence and
+    the leave-one-out false-accept rate at 0.05. A flag that adds collisions
+    pushes impostors further over the cutoff -- the precision COST a recall win
+    must be weighed against.
+    """
+
+    rows: list[dict[str, object]] = []
+
+    def _impostor_stats(
+        index: InMemoryHashIndex,
+        fingerprints: list[Fingerprint],
+        *,
+        offset_tolerance: int | None = None,
+    ) -> dict[str, object]:
+        impostor_conf: list[float] = []
+        for fingerprint in fingerprints:
+            results = index.search(fingerprint, top_k=5, offset_tolerance=offset_tolerance)
+            impostor_conf.append(
+                max(
+                    (r.confidence for r in results if r.file_id != fingerprint.file_id),
+                    default=0.0,
+                )
+            )
+        fa = _false_accept_rate(index, fingerprints, 0.05, offset_tolerance=offset_tolerance)
+        fa_strict = _false_accept_rate(index, fingerprints, 0.20, offset_tolerance=offset_tolerance)
+        return {
+            "mean_impostor": round(statistics.mean(impostor_conf) if impostor_conf else 0.0, 4),
+            "max_impostor": round(max(impostor_conf) if impostor_conf else 0.0, 4),
+            "false_accept@0.05": round(fa, 4),
+            "false_accept@0.20": round(fa_strict, 4),
+        }
+
+    # Default config / exact search baseline.
+    paths, _texts = _write_sibling_corpus(rng, families, siblings_per_family, workdir)
+    base_fp = Fingerprinter()
+    base_fps = [base_fp.fingerprint_file(p) for p in paths]
+    base_index = InMemoryHashIndex()
+    base_index.add_many(base_fps)
+    rows.append({"flag": "default", "setting": "off", **_impostor_stats(base_index, base_fps)})
+
+    # offset_tolerance reuses the same index (search-time only).
+    for tol in (1, 2):
+        rows.append(
+            {
+                "flag": "offset_tolerance",
+                "setting": str(tol),
+                **_impostor_stats(base_index, base_fps, offset_tolerance=tol),
+            }
+        )
+
+    # freq_quantization changes hashes -> rebuild the sibling corpus per q.
+    for q in (2, 4):
+        fp = Fingerprinter(config=FingerprintConfig(freq_quantization=q))
+        q_paths, _ = _write_sibling_corpus(
+            np.random.default_rng(_SEED_FOR(rng)), families, siblings_per_family, workdir
+        )
+        q_fps = [fp.fingerprint_file(p) for p in q_paths]
+        q_index = InMemoryHashIndex()
+        q_index.add_many(q_fps)
+        rows.append({"flag": "freq_quantization", "setting": str(q), **_impostor_stats(q_index, q_fps)})
+
+    return rows
+
+
+def sweep_image_flags(
+    rng: np.random.Generator, size: int, workdir: Path
+) -> list[FlagComparison]:
+    """OFF (raster) vs ON (phash) sweep on the hard image mutation matrix.
+
+    The hard image mutations are the documented raster weak spots -- strong
+    downscale, a 15% border crop, an 8 degree rotation, and a crop+downscale+
+    low-quality JPEG -- where the row-major raster signal collapses and a DCT
+    pHash, a low-frequency global descriptor, is far more robust.
+    """
+
+    import io
+
+    from PIL import Image  # noqa: F401 - gates the case on Pillow
+
+    def _build(mode: Literal["raster", "phash"]) -> tuple[InMemoryHashIndex, list[Fingerprint], list]:
+        fp = Fingerprinter(config=FingerprintConfig(image_mode=mode))
+        paths, images = _write_hard_image_corpus(np.random.default_rng(_SEED_FOR(rng)), size, workdir)
+        fps = [fp.fingerprint_file(p) for p in paths]
+        index = InMemoryHashIndex()
+        index.add_many(fps)
+        return index, fps, images
+
+    def _mutations(images: list) -> list[tuple[str, Callable[[int], bytes], str]]:
+        def _resize(i: int) -> bytes:
+            buffer = io.BytesIO()
+            images[i].resize((64, 48)).save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        def _crop(i: int) -> bytes:
+            image = images[i]
+            width, height = image.size
+            box = (int(width * 0.15), int(height * 0.15), int(width * 0.85), int(height * 0.85))
+            buffer = io.BytesIO()
+            image.crop(box).save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        def _rotate(i: int) -> bytes:
+            buffer = io.BytesIO()
+            images[i].rotate(8, expand=True, fillcolor=128).save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        def _jpeg_crop(i: int) -> bytes:
+            image = images[i]
+            width, height = image.size
+            box = (int(width * 0.1), int(height * 0.1), int(width * 0.9), int(height * 0.9))
+            buffer = io.BytesIO()
+            image.crop(box).resize((90, 70)).save(buffer, format="JPEG", quality=25)
+            return buffer.getvalue()
+
+        return [
+            ("resize_64x48", _resize, ".png"),
+            ("crop_border_15pct", _crop, ".png"),
+            ("rotate_8deg", _rotate, ".png"),
+            ("jpeg_crop_resize_q25", _jpeg_crop, ".jpg"),
+        ]
+
+    off_index, off_fps, off_images = _build("raster")
+    off_fp = Fingerprinter(config=FingerprintConfig(image_mode="raster"))
+    off_recall = {
+        name: _mutation_recall(off_index, off_fp, workdir, off_fps, render, suffix)
+        for name, render, suffix in _mutations(off_images)
+    }
+    off_fa = _false_accept_rate(off_index, off_fps, 0.05)
+    off_fa_strict = _false_accept_rate(off_index, off_fps, 0.20)
+
+    on_index, on_fps, on_images = _build("phash")
+    on_fp = Fingerprinter(config=FingerprintConfig(image_mode="phash"))
+    on_recall = {
+        name: _mutation_recall(on_index, on_fp, workdir, on_fps, render, suffix)
+        for name, render, suffix in _mutations(on_images)
+    }
+    on_fa = _false_accept_rate(on_index, on_fps, 0.05)
+    on_fa_strict = _false_accept_rate(on_index, on_fps, 0.20)
+
+    return [
+        FlagComparison(
+            flag="image_mode",
+            setting="phash",
+            mutation=name,
+            off_recall=off_recall[name],
+            on_recall=on_recall[name],
+            off_false_accept=off_fa,
+            on_false_accept=on_fa,
+            off_false_accept_strict=off_fa_strict,
+            on_false_accept_strict=on_fa_strict,
+        )
+        for name in off_recall
+    ]
+
+
+def sweep_audio_flags(
+    rng: np.random.Generator, size: int, workdir: Path
+) -> list[FlagComparison]:
+    """OFF (single window) vs ON (window bank) sweep on hard audio excerpts.
+
+    The hard audio mutations are clips/excerpts that re-normalise the whole
+    signal and shift the fixed-window time grid (default recall ~0). A bank of
+    windows lets the query align at whatever window survives the excerpt.
+    """
+
+    import io
+
+    from scipy.io import wavfile
+
+    bank = (512, 1024, 2048, 4096)
+
+    def _build(config: FingerprintConfig) -> tuple[InMemoryHashIndex, list[Fingerprint], list]:
+        fp = Fingerprinter(config=config)
+        paths, waves = _write_audio_corpus(np.random.default_rng(_SEED_FOR(rng)), size, workdir)
+        fps = [fp.fingerprint_file(p) for p in paths]
+        index = InMemoryHashIndex()
+        index.add_many(fps)
+        return index, fps, waves
+
+    def _clip(waves: list, lo: float, hi: float) -> Callable[[int], bytes]:
+        def render(i: int) -> bytes:
+            sample_rate, data = waves[i]
+            start, end = int(len(data) * lo), int(len(data) * hi)
+            buffer = io.BytesIO()
+            wavfile.write(buffer, sample_rate, data[start:end])
+            return buffer.getvalue()
+
+        return render
+
+    off_index, off_fps, off_waves = _build(FingerprintConfig())
+    off_fp = Fingerprinter()
+    mutations = [
+        ("clip_prefix_60pct", _clip(off_waves, 0.0, 0.6)),
+        ("excerpt_mid", _clip(off_waves, 0.2, 0.8)),
+    ]
+    off_recall = {
+        name: _mutation_recall(off_index, off_fp, workdir, off_fps, render, ".wav")
+        for name, render in mutations
+    }
+    off_fa = _false_accept_rate(off_index, off_fps, 0.05)
+    off_fa_strict = _false_accept_rate(off_index, off_fps, 0.20)
+
+    on_index, on_fps, on_waves = _build(FingerprintConfig(window_bank=bank))
+    on_fp = Fingerprinter(config=FingerprintConfig(window_bank=bank))
+    on_mutations = [
+        ("clip_prefix_60pct", _clip(on_waves, 0.0, 0.6)),
+        ("excerpt_mid", _clip(on_waves, 0.2, 0.8)),
+    ]
+    on_recall = {
+        name: _mutation_recall(on_index, on_fp, workdir, on_fps, render, ".wav")
+        for name, render in on_mutations
+    }
+    on_fa = _false_accept_rate(on_index, on_fps, 0.05)
+    on_fa_strict = _false_accept_rate(on_index, on_fps, 0.20)
+
+    return [
+        FlagComparison(
+            flag="window_bank",
+            setting=str(bank),
+            mutation=name,
+            off_recall=off_recall[name],
+            on_recall=on_recall[name],
+            off_false_accept=off_fa,
+            on_false_accept=on_fa,
+            off_false_accept_strict=off_fa_strict,
+            on_false_accept_strict=on_fa_strict,
+        )
+        for name in off_recall
+    ]
+
+
+def _SEED_FOR(rng: np.random.Generator) -> int:  # noqa: N802 - reads as a constant helper
+    """Draw a fresh deterministic 32-bit seed from the master RNG.
+
+    Each ON config that changes the HASHES (freq_quantization, window_bank,
+    image mode) must regenerate its corpus from a generator whose state matches
+    the OFF run's, so OFF and ON see byte-identical source files. Drawing the
+    sub-seed from the single master ``rng`` keeps the whole sweep a pure function
+    of the top-level seed while giving every rebuild the SAME starting state
+    (the draw order is fixed), so OFF/ON differ only by the flag.
+    """
+
+    return int(rng.integers(0, 2**32))
+
+
+def run_hard_accuracy(
+    *,
+    seed: int = 1234,
+    text_corpus: int = 30,
+    image_corpus: int = 16,
+    audio_corpus: int = 12,
+    sibling_families: int = 8,
+    siblings_per_family: int = 4,
+    include_image: bool = True,
+    include_audio: bool = True,
+) -> dict[str, object]:
+    """Run the HARD per-flag sweep and return a structured report dict.
+
+    Deterministic for a fixed ``seed`` (a single master ``default_rng`` drives the
+    OFF corpus and all sub-seeds for the hash-changing ON configs). Reports, per
+    flag and per hard mutation, recall@1 OFF vs ON and the 0.05 false-accept rate,
+    plus a confusability precision table. Image/audio sections skip (and record)
+    when their optional dependency is absent.
+    """
+
+    report: dict[str, object] = {"seed": seed, "flags": {}, "confusability": [], "skipped": []}
+    flags: dict[str, object] = report["flags"]  # type: ignore[assignment]
+    skipped: list[str] = report["skipped"]  # type: ignore[assignment]
+
+    with tempfile.TemporaryDirectory(prefix="fp_hard_accuracy_") as tmp:
+        workdir = Path(tmp)
+
+        # A single master RNG, drawn from in a fixed order, drives the whole run.
+        rng = np.random.default_rng(seed)
+        flags["text"] = [c.to_dict() for c in sweep_text_flags(rng, text_corpus, workdir)]
+        report["confusability"] = confusability_precision(
+            rng, sibling_families, siblings_per_family, workdir
+        )
+
+        if include_image:
+            try:
+                import PIL  # noqa: F401
+            except ImportError:
+                skipped.append("image (Pillow not installed)")
+            else:
+                flags["image"] = [c.to_dict() for c in sweep_image_flags(rng, image_corpus, workdir)]
+
+        if include_audio:
+            try:
+                import scipy  # noqa: F401
+            except ImportError:
+                skipped.append("audio (scipy not installed)")
+            else:
+                flags["audio"] = [c.to_dict() for c in sweep_audio_flags(rng, audio_corpus, workdir)]
+
+    return report
+
+
+def _render_hard_markdown(report: dict[str, object]) -> str:
+    """Render the hard per-flag report as a human-readable markdown document."""
+
+    lines: list[str] = [
+        f"# Fingerprint engine HARD accuracy report (seed={report['seed']})",
+        "",
+        "Per-flag recall@1 OFF vs ON on a deliberately hard near-dup corpus, with "
+        "the leave-one-out false-accept rate at the default 0.05 cutoff. A flag is "
+        "RECALL-justified only where on_recall > off_recall at acceptable precision.",
+        "",
+    ]
+    flags: dict[str, list[dict]] = report["flags"]  # type: ignore[assignment]
+    for handler, comparisons in flags.items():
+        lines.append(f"## {handler}")
+        lines.append("")
+        lines.append(
+            "| flag | setting | mutation | off recall | on recall | delta | "
+            "on FA@0.05 | on FA@0.20 |"
+        )
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        for c in comparisons:
+            mark = " **" if c["recall_delta"] > 0 else " "
+            lines.append(
+                f"| {c['flag']} | {c['setting']} | {c['mutation']} | {c['off_recall']} |"
+                f"{mark}{c['on_recall']}{'**' if c['recall_delta'] > 0 else ''} | "
+                f"{c['recall_delta']:+} | {c['on_false_accept@0.05']} | {c['on_false_accept@0.20']} |"
+            )
+        lines.append("")
+
+    rows: list[dict] = report["confusability"]  # type: ignore[assignment]
+    if rows:
+        lines.append("## confusability (sibling docs): impostor confidence + precision cost")
+        lines.append("")
+        lines.append("| flag | setting | mean impostor | max impostor | FA@0.05 | FA@0.20 |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for row in rows:
+            lines.append(
+                f"| {row['flag']} | {row['setting']} | {row['mean_impostor']} | "
+                f"{row['max_impostor']} | {row['false_accept@0.05']} | {row['false_accept@0.20']} |"
+            )
+        lines.append("")
+
+    skipped: list[str] = report["skipped"]  # type: ignore[assignment]
+    if skipped:
+        lines.append("## skipped")
+        lines.append("")
+        for item in skipped:
+            lines.append(f"- {item}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Top-level harness + reporting
 # ---------------------------------------------------------------------------
 
@@ -656,10 +1418,11 @@ def _render_markdown(report: dict[str, object]) -> str:
             )
         lines.append("")
 
-    if report["skipped"]:
+    skipped: list[str] = report["skipped"]  # type: ignore[assignment]
+    if skipped:
         lines.append("## skipped")
         lines.append("")
-        for item in report["skipped"]:  # type: ignore[union-attr]
+        for item in skipped:
             lines.append(f"- {item}")
         lines.append("")
     return "\n".join(lines)
@@ -674,19 +1437,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-image", action="store_true", help="skip the image section even if Pillow is present")
     parser.add_argument("--no-audio", action="store_true", help="skip the audio section even if scipy is present")
     parser.add_argument("--format", choices=("json", "markdown"), default="json", help="output format")
+    parser.add_argument(
+        "--mode",
+        choices=("standard", "hard"),
+        default="standard",
+        help="standard near-dup matrix (default) or the HARD per-flag recall/precision sweep",
+    )
     args = parser.parse_args(argv)
 
-    report = run_accuracy(
-        seed=args.seed,
-        text_corpus=args.text_corpus,
-        image_corpus=args.image_corpus,
-        audio_corpus=args.audio_corpus,
-        include_image=not args.no_image,
-        include_audio=not args.no_audio,
-    )
+    if args.mode == "hard":
+        report = run_hard_accuracy(
+            seed=args.seed,
+            include_image=not args.no_image,
+            include_audio=not args.no_audio,
+        )
+        renderer = _render_hard_markdown
+    else:
+        report = run_accuracy(
+            seed=args.seed,
+            text_corpus=args.text_corpus,
+            image_corpus=args.image_corpus,
+            audio_corpus=args.audio_corpus,
+            include_image=not args.no_image,
+            include_audio=not args.no_audio,
+        )
+        renderer = _render_markdown
 
     if args.format == "markdown":
-        print(_render_markdown(report))
+        print(renderer(report))
     else:
         print(json.dumps(report, indent=2))
     return 0

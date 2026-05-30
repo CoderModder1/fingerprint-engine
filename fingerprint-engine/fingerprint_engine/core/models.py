@@ -5,6 +5,67 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
+# Version of the HASH-DERIVATION format -- the rule set that turns a file's
+# bytes into ``hash_code`` values. This is DISTINCT from the snapshot
+# ``schema_version`` (which versions the *container* that serializes postings,
+# see ``core/index.py``): two builds can share a snapshot schema yet derive
+# incompatible hash codes. ``1`` is the default derivation shipped today.
+#
+# Matching is only valid between a query and an index built with the SAME
+# format version: a hash code carries no meaning across formats, so a
+# cross-format "match" is a false result, not a weak one. Flipping any
+# HASH-CHANGING default (the constellation packing, the per-handler windows, a
+# new canonical image transform, ...) MUST bump this constant AND require
+# re-indexing existing corpora -- see VERSIONING.md.
+#
+# The opt-in, default-off hash-changing flags do not change this baseline
+# (their default values leave the derivation byte-identical); instead, when one
+# is *enabled*, ``effective_format_version`` reports a DIFFERENT version for
+# that config, so an index built with such a flag is detectably incompatible
+# with a default index without flipping any default. The offsets below are the
+# additive per-flag bumps; they are deliberately distinct so a config that
+# enables several flags lands on a value distinct from enabling any one alone.
+FINGERPRINT_FORMAT_VERSION = 1
+
+# Key under which the effective format version is recorded in
+# ``Fingerprint.config`` (a metadata-only stamp; it is NOT a tuning parameter,
+# is NOT consumed by the FFT pipeline, and never enters a hash payload).
+FORMAT_VERSION_KEY = "fingerprint_format_version"
+
+# Additive offsets applied to ``FINGERPRINT_FORMAT_VERSION`` when an opt-in
+# hash-changing flag is enabled, so an index built with the flag records a
+# version distinct from the default and from the other flags. These describe
+# the *effective* derivation of a non-default config only; the default config
+# always reports the bare ``FINGERPRINT_FORMAT_VERSION``.
+_FORMAT_BUMP_FREQ_QUANTIZATION = 1000
+_FORMAT_BUMP_WINDOW_BANK = 2000
+_FORMAT_BUMP_IMAGE_PHASH = 4000
+
+
+def effective_format_version(config: FingerprintConfig) -> int:
+    """Return the hash-derivation format version a ``config`` records.
+
+    A default :class:`FingerprintConfig` -- and any config whose hash-changing
+    fields are all at their defaults -- reports :data:`FINGERPRINT_FORMAT_VERSION`
+    unchanged, so the stamped version is byte-identical to today for every
+    existing index. Enabling an opt-in HASH-CHANGING flag (``freq_quantization``
+    > 1, a ``window_bank``, or ``image_mode == "phash"``) adds that flag's
+    distinct offset, so a config that derives different hash codes reports a
+    different version and an index built with it is *detectably* incompatible
+    with a default index (see :func:`HashIndex.search`). This is the mechanism
+    that makes a future default-flip a deliberate version bump rather than a
+    silent corpus corruption; it changes no hash code and no ranking itself.
+    """
+
+    version = FINGERPRINT_FORMAT_VERSION
+    if config.freq_quantization > 1:
+        version += _FORMAT_BUMP_FREQ_QUANTIZATION
+    if config.window_bank:
+        version += _FORMAT_BUMP_WINDOW_BANK
+    if config.image_mode == "phash":
+        version += _FORMAT_BUMP_IMAGE_PHASH
+    return version
+
 
 @dataclass(frozen=True)
 class FingerprintConfig:
@@ -229,6 +290,22 @@ class Fingerprint:
     @property
     def landmark_count(self) -> int:
         return len(self.landmarks)
+
+    @property
+    def format_version(self) -> int:
+        """The hash-derivation format version recorded on this fingerprint.
+
+        Read from the :data:`FORMAT_VERSION_KEY` stamp the fingerprinter writes
+        into :attr:`config`. A fingerprint produced or loaded WITHOUT the stamp
+        (legacy data written before the field existed, or a snapshot-rebuilt
+        fingerprint) is treated as the default :data:`FINGERPRINT_FORMAT_VERSION`,
+        so absence is backward-compatible rather than a mismatch.
+        """
+
+        try:
+            return int(self.config.get(FORMAT_VERSION_KEY, FINGERPRINT_FORMAT_VERSION))
+        except (TypeError, ValueError):
+            return FINGERPRINT_FORMAT_VERSION
 
     def hash_tuples(self) -> list[tuple[int, int]]:
         return [item.to_tuple() for item in self.hashes]

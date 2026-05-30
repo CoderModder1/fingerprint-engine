@@ -161,6 +161,58 @@ Caveats and guarantees:
   built with it. A core-only install (numpy only) and an install with optional
   handler extras produce the same hashes for the content types they share.
 
+#### 4a. `FINGERPRINT_FORMAT_VERSION` — the enforced derivation version
+
+The fingerprint derivation now carries an explicit, machine-checked version,
+implemented as the module constant `FINGERPRINT_FORMAT_VERSION` (currently `1`)
+in `fingerprint_engine/core/models.py`. It is **distinct from the snapshot
+`schema_version`** (section 1): `schema_version` versions the JSON *container*
+that serializes postings, whereas `FINGERPRINT_FORMAT_VERSION` versions the
+*meaning of the `hash_code` integers* inside it. Two builds can share a snapshot
+schema yet derive incompatible hash codes; only an equal format version
+guarantees the codes occupy the same code space.
+
+How it travels and is enforced (all default-preserving — it adds metadata, never
+a hash code or a ranking):
+
+- **Stamped onto each fingerprint.** `Fingerprinter` records the *effective*
+  format version under the `fingerprint_format_version` key of
+  `Fingerprint.config` (additive; it does not displace any tuning key), readable
+  as `Fingerprint.format_version`. The value is computed by
+  `effective_format_version(config)`: a default config (and any config whose
+  hash-changing fields are all default) reports the bare
+  `FINGERPRINT_FORMAT_VERSION`, so existing fingerprints/indexes are byte-for-byte
+  unchanged.
+- **Stamped into the index and snapshot.** A `HashIndex` pins its
+  `format_version` from the first fingerprint added; `save()` writes it as the
+  top-level snapshot field `fingerprint_format_version` (alongside
+  `schema_version`), and `load()`/`from_dict()`/`load_snapshot()` restore it. An
+  **absent** field loads as the default (legacy snapshots stay loadable and
+  compatible).
+- **Detected at search and at add.** `HashIndex.search()` compares the query
+  fingerprint's `format_version` with the index's; a mismatch emits a
+  `RuntimeWarning` by default (so no existing pipeline breaks) and raises
+  `FormatVersionMismatchError` when called with `strict_format=True`. Adding a
+  fingerprint whose version differs from an already-pinned index warns and keeps
+  the index's pinned version (first writer wins). A *matching*-version query is a
+  no-op: rankings are byte-identical to before the check existed.
+- **Opt-in hash-changers bump the recorded version.** Enabling
+  `freq_quantization > 1`, a `window_bank`, or `image_mode == "phash"` makes
+  `effective_format_version` report a *distinct* value (each flag a distinct,
+  composable offset). An index built with such a flag is therefore detectably
+  incompatible with a default index — without flipping any default.
+
+**Enforcement rule.** Flipping ANY hash-changing default — promoting an opt-in
+flag to default-on, or changing the constellation packing / per-handler windows /
+canonical image transform — **REQUIRES bumping `FINGERPRINT_FORMAT_VERSION` and
+re-indexing** existing corpora, and is a **MAJOR** release. The mechanism above
+now *enforces detection* of the resulting incompatibility: a query or snapshot at
+the old version is flagged against an index at the new version rather than
+silently returning false matches. (Promoting an opt-in flag does not change the
+value `effective_format_version` already reports for that flag; it changes which
+config is the *default*, so the new default's recorded version differs from the
+old default's, which is exactly the incompatibility the check surfaces.)
+
 ## 1.0 definition-of-done checklist
 
 `1.0.0` is tagged when **all** of the following are true:

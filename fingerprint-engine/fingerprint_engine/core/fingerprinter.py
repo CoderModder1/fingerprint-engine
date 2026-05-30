@@ -20,7 +20,13 @@ from fingerprint_engine.handlers.base import FileHandler
 
 from .exceptions import FileTooLargeError, MissingDependencyError, NoHandlerError
 from .fft_pipeline import FFTFingerprintPipeline
-from .models import Fingerprint, FingerprintConfig, SearchResult
+from .models import (
+    FORMAT_VERSION_KEY,
+    Fingerprint,
+    FingerprintConfig,
+    SearchResult,
+    effective_format_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +193,13 @@ class Fingerprinter(FileProcessor):
     ) -> None:
         self.config = config or FingerprintConfig()
         self.config.validate()
+        # The hash-derivation format version this config records (default config
+        # -> the baseline FINGERPRINT_FORMAT_VERSION; an opt-in hash-changing flag
+        # -> a distinct value). Stamped into every Fingerprint.config below so the
+        # format travels with the fingerprint into the index/snapshot. It is a
+        # metadata-only stamp: it is NOT consumed by the FFT pipeline and never
+        # enters a hash payload, so it changes no hash code and no ranking.
+        self._format_version = effective_format_version(self.config)
         self.pipeline = FFTFingerprintPipeline(self.config)
         self.handlers_package = handlers_package
         self.handlers = self.discover_handlers(handlers_package)
@@ -316,13 +329,18 @@ class Fingerprinter(FileProcessor):
                         source,
                         len(errors),
                     )
+                config = self.config.to_dict()
+                # Stamp the hash-derivation format version alongside the tuning
+                # parameters. Additive: it adds a key, never alters one, so
+                # config["window_size"] etc. and the produced hashes are unchanged.
+                config[FORMAT_VERSION_KEY] = self._format_version
                 return Fingerprint(
                     file_id=content_sha256,
                     path=str(source.resolve()),
                     handler=handler.name,
                     size_bytes=len(content),
                     content_sha256=content_sha256,
-                    config=self.config.to_dict(),
+                    config=config,
                     landmarks=landmarks,
                     hashes=hashes,
                     metadata=metadata,

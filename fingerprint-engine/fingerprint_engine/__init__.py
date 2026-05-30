@@ -20,6 +20,7 @@ from .core.dedup import (
 )
 from .core.exceptions import (
     FingerprintError,
+    FormatVersionMismatchError,
     InvalidSnapshotError,
     MissingDependencyError,
     NoHandlerError,
@@ -33,12 +34,14 @@ from .core.index import (
     SQLiteHashIndex,
 )
 from .core.models import (
+    FINGERPRINT_FORMAT_VERSION,
     Calibration,
     ConstellationHash,
     Fingerprint,
     FingerprintConfig,
     LandmarkPoint,
     SearchResult,
+    effective_format_version,
 )
 
 try:
@@ -54,6 +57,7 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 __all__ = [
+    "FINGERPRINT_FORMAT_VERSION",
     "Calibration",
     "ConstellationHash",
     "DedupReport",
@@ -62,6 +66,7 @@ __all__ = [
     "FingerprintConfig",
     "FingerprintError",
     "Fingerprinter",
+    "FormatVersionMismatchError",
     "HashIndex",
     "InMemoryHashIndex",
     "InvalidSnapshotError",
@@ -74,5 +79,6 @@ __all__ = [
     "SQLiteHashIndex",
     "SearchResult",
     "__version__",
+    "effective_format_version",
     "find_duplicates",
 ]

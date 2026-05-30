@@ -9,14 +9,23 @@ import shutil
 import sqlite3
 import threading
 import time
+import warnings
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
-from .exceptions import InvalidSnapshotError
-from .models import Calibration, ConstellationHash, Fingerprint, IndexPosting, SearchResult
+from .exceptions import FormatVersionMismatchError, InvalidSnapshotError
+from .models import (
+    FINGERPRINT_FORMAT_VERSION,
+    FORMAT_VERSION_KEY,
+    Calibration,
+    ConstellationHash,
+    Fingerprint,
+    IndexPosting,
+    SearchResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +35,14 @@ logger = logging.getLogger(__name__)
 # treated as version 1 for backward compatibility with already-written files.
 SNAPSHOT_SCHEMA_VERSION = 1
 _SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
+
+# Top-level snapshot field recording the HASH-DERIVATION format version of the
+# indexed postings (see ``FINGERPRINT_FORMAT_VERSION`` in ``core/models.py``).
+# DISTINCT from ``schema_version``: schema versions the JSON container, this
+# versions the meaning of the ``hash_code`` integers inside it. An ABSENT field
+# is treated as the default ``FINGERPRINT_FORMAT_VERSION`` (legacy snapshots
+# written before the field existed stay loadable and compatible).
+SNAPSHOT_FORMAT_VERSION_KEY = "fingerprint_format_version"
 
 # Hash codes are unsigned 64-bit; reject snapshot postings outside this range
 # before they reach a SQL backend's signed-offset encode (which would raise
@@ -51,6 +68,26 @@ def _validate_schema_version(data: dict[str, object]) -> None:
         )
 
 
+def _snapshot_format_version(data: dict[str, object]) -> int:
+    """Read a snapshot's hash-derivation format version.
+
+    An ABSENT :data:`SNAPSHOT_FORMAT_VERSION_KEY` is treated as the default
+    :data:`FINGERPRINT_FORMAT_VERSION` -- legacy snapshots written before the
+    field existed describe the default derivation, so they stay loadable and
+    compatible. A malformed (non-int) value also falls back to the default
+    rather than aborting the load; the version is advisory metadata for the
+    search-time compatibility check, never a gate on loadability.
+    """
+
+    raw = data.get(SNAPSHOT_FORMAT_VERSION_KEY, FINGERPRINT_FORMAT_VERSION)
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        return FINGERPRINT_FORMAT_VERSION
+    try:
+        return int(raw)
+    except ValueError:
+        return FINGERPRINT_FORMAT_VERSION
+
+
 def _in_hash_range(hash_code: int) -> bool:
     """Whether ``hash_code`` fits the unsigned 64-bit posting range."""
 
@@ -59,6 +96,56 @@ def _in_hash_range(hash_code: int) -> bool:
 
 class HashIndex(ABC):
     """Storage-agnostic contract for searchable fingerprint postings."""
+
+    # Hash-derivation format version of this index's postings, and whether it
+    # has been pinned by a recorded fingerprint/snapshot yet. Both default at
+    # the class level (lazily, so a backend that never sets them -- e.g. an
+    # empty or legacy index -- reads the engine baseline and is unpinned), and
+    # are plain instance attributes so they cost nothing per posting and are
+    # independent of the storage backend.
+    _format_version: int = FINGERPRINT_FORMAT_VERSION
+    _format_version_pinned: bool = False
+
+    @property
+    def format_version(self) -> int:
+        """The hash-derivation format version of the postings in this index.
+
+        Pinned from the :attr:`Fingerprint.format_version` of the FIRST
+        fingerprint added (and restored from a loaded snapshot's
+        :data:`SNAPSHOT_FORMAT_VERSION_KEY`). A query must share this version for
+        its hash codes to mean the same thing as the index's;
+        :meth:`search` surfaces a mismatch. An empty/legacy index reports the
+        default :data:`FINGERPRINT_FORMAT_VERSION`.
+        """
+
+        return self._format_version
+
+    def _record_format_version(self, fingerprint: Fingerprint) -> None:
+        """Pin (or check against) the index's format version from a fingerprint.
+
+        The first recorded fingerprint pins the index's format version. A later
+        fingerprint whose recorded version DIFFERS is an attempt to mix
+        incompatible hash derivations in one index (their codes do not share a
+        space), so it is surfaced as a :class:`RuntimeWarning` -- loud but
+        non-fatal, mirroring the engine's fail-soft ingest -- and the index
+        keeps its pinned version (the first writer wins), so a stray cross-format
+        add never silently re-stamps the whole corpus.
+        """
+
+        incoming = fingerprint.format_version
+        if not self._format_version_pinned:
+            self._format_version = incoming
+            self._format_version_pinned = True
+            return
+        if incoming != self._format_version:
+            warnings.warn(
+                f"adding a fingerprint with hash format version {incoming} to an "
+                f"index built at version {self._format_version}; their hash codes "
+                "do not share a code space, so matches between them are invalid. "
+                "Re-index with a single, consistent FingerprintConfig.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
 
     @property
     @abstractmethod
@@ -164,6 +251,7 @@ class HashIndex(ABC):
         calibration: Calibration | None = None,
         offset_tolerance: int | None = None,
         candidate_limit: int | None = None,
+        strict_format: bool = False,
     ) -> list[SearchResult]:
         """Return ranked matches via Shazam-style offset-histogram alignment.
 
@@ -215,8 +303,20 @@ class HashIndex(ABC):
         comfortably above ``top_k`` to keep recall at 1.0 for genuine matches.
         Ties in shared-hash count at the cut boundary are broken deterministically
         (count DESC, then file_id ASC) so the candidate set is reproducible.
+
+        ``strict_format`` controls the HASH-FORMAT compatibility check. The query
+        fingerprint's :attr:`Fingerprint.format_version` is compared with this
+        index's :attr:`format_version`; a mismatch means the two were derived
+        under different hash rules, so their codes do not share a code space and
+        any "match" is a false result. ``False`` (the default) only emits a
+        :class:`RuntimeWarning` and proceeds -- so the new check never breaks an
+        existing pipeline and the returned rankings for a MATCHING-format query
+        are BYTE-IDENTICAL to before this parameter existed (no warning, no
+        behavior change). ``True`` raises :class:`FormatVersionMismatchError`
+        instead, for callers that want a hard guard against cross-format search.
         """
 
+        self._check_format_version(fingerprint, strict_format)
         resolved_tolerance = self._resolve_offset_tolerance(offset_tolerance, calibration)
         candidates = self._select_candidates(fingerprint, candidate_limit)
         started = time.perf_counter()
@@ -230,6 +330,35 @@ class HashIndex(ABC):
             (time.perf_counter() - started) * 1000.0,
         )
         return results
+
+    def _check_format_version(self, fingerprint: Fingerprint, strict: bool) -> None:
+        """Detect a cross-format query against this index; warn or raise.
+
+        No-op when the query's format version matches the index's (the normal
+        case -- so a same-format search is byte-identical to before this check),
+        or when the index is empty/unpinned (nothing to be incompatible with).
+        On a mismatch: raise :class:`FormatVersionMismatchError` if ``strict``,
+        else emit a :class:`RuntimeWarning`. Matching across formats is invalid
+        because the hash codes are derived under different rules and do not share
+        a code space.
+        """
+
+        query_version = fingerprint.format_version
+        index_version = self._format_version
+        if query_version == index_version:
+            return
+        message = (
+            f"query fingerprint hash format version {query_version} does not match "
+            f"this index's version {index_version}; their hash codes are derived "
+            "under different rules and do not share a code space, so any match "
+            "between them is invalid. Re-index or re-fingerprint with a single, "
+            "consistent FingerprintConfig."
+        )
+        if strict:
+            raise FormatVersionMismatchError(
+                message, query_version=query_version, index_version=index_version
+            )
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
 
     def _select_candidates(
         self, fingerprint: Fingerprint, candidate_limit: int | None
@@ -464,6 +593,13 @@ class HashIndex(ABC):
         destination.parent.mkdir(parents=True, exist_ok=True)
         payload = self.to_dict()
         payload["schema_version"] = SNAPSHOT_SCHEMA_VERSION
+        # Travel the hash-derivation format version with the snapshot so a load
+        # restores the index's version and a later search can detect a
+        # cross-format query. Distinct from schema_version (see the module
+        # constants). Additive top-level field: it does not touch postings,
+        # metadata, or the schema container, so the round-tripped index is
+        # otherwise byte-identical.
+        payload[SNAPSHOT_FORMAT_VERSION_KEY] = self._format_version
         tmp = destination.with_name(f"{destination.name}.{os.getpid()}.tmp")
         try:
             with tmp.open("w", encoding="utf-8") as handle:
@@ -538,6 +674,15 @@ class HashIndex(ABC):
             return self
         if isinstance(data, dict):
             _validate_schema_version(data)
+        # Restore the index's hash-derivation format version from the snapshot
+        # (default for a legacy/absent field) so a later search detects a
+        # cross-format query. Pin it directly rather than relying on a rebuilt
+        # fingerprint's config, so even an EMPTY snapshot carries its version.
+        snapshot_version = (
+            _snapshot_format_version(data) if isinstance(data, dict) else FINGERPRINT_FORMAT_VERSION
+        )
+        self._format_version = snapshot_version
+        self._format_version_pinned = True
         files = data.get("files", {}) if isinstance(data, dict) else {}
         metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
         if not isinstance(files, dict):
@@ -568,7 +713,10 @@ class HashIndex(ABC):
                     handler=str(meta.get("handler", "")),
                     size_bytes=int(meta.get("size_bytes", 0) or 0),
                     content_sha256=str(meta.get("content_sha256", file_id)),
-                    config={},
+                    # Stamp the snapshot's format version so the rebuilt
+                    # fingerprint reports it (matching the index we just pinned),
+                    # and a re-add never spuriously warns about a mismatch.
+                    config={FORMAT_VERSION_KEY: snapshot_version},
                     hashes=hashes,
                     metadata={
                         key: value
@@ -705,6 +853,7 @@ class InMemoryHashIndex(HashIndex):
 
     def add(self, fingerprint: Fingerprint) -> None:
         with self._write_lock:
+            self._record_format_version(fingerprint)
             self.remove(fingerprint.file_id)
             entries = [(item.hash_code, item.time_offset) for item in fingerprint.hashes]
             self._file_entries[fingerprint.file_id] = entries
@@ -887,6 +1036,11 @@ class InMemoryHashIndex(HashIndex):
     def from_dict(cls, data: dict[str, object]) -> InMemoryHashIndex:
         index = cls()
         _validate_schema_version(data)
+        # Restore the hash-derivation format version (default for a legacy/absent
+        # field) so a search against the rebuilt index detects a cross-format
+        # query. from_dict bypasses add(), so pin it explicitly.
+        index._format_version = _snapshot_format_version(data)
+        index._format_version_pinned = True
         files = data.get("files", {})
         if not isinstance(files, dict):
             raise InvalidSnapshotError("invalid index: files must be a mapping")
@@ -985,6 +1139,7 @@ class RedisHashIndex(HashIndex):
         return int(value) if value else 0
 
     def add(self, fingerprint: Fingerprint) -> None:
+        self._record_format_version(fingerprint)
         self.remove(fingerprint.file_id)
         file_id = fingerprint.file_id
         entries = [(item.hash_code, item.time_offset) for item in fingerprint.hashes]
@@ -1026,6 +1181,7 @@ class RedisHashIndex(HashIndex):
         # the order in which each file_id first appeared for deterministic ops.
         survivors: dict[str, Fingerprint] = {}
         for fingerprint in fingerprints:
+            self._record_format_version(fingerprint)
             survivors[fingerprint.file_id] = fingerprint
         if not survivors:
             return
@@ -1237,6 +1393,7 @@ class SQLiteHashIndex(HashIndex):
         return int(self._conn.execute("SELECT COUNT(*) FROM postings").fetchone()[0])
 
     def add(self, fingerprint: Fingerprint) -> None:
+        self._record_format_version(fingerprint)
         self.remove(fingerprint.file_id)
         metadata = {
             "file_id": fingerprint.file_id,
@@ -1277,6 +1434,7 @@ class SQLiteHashIndex(HashIndex):
         # here also avoids the files PRIMARY KEY conflict a naive re-insert hits.
         survivors: dict[str, Fingerprint] = {}
         for fingerprint in fingerprints:
+            self._record_format_version(fingerprint)
             survivors[fingerprint.file_id] = fingerprint
         if not survivors:
             return
@@ -1614,6 +1772,7 @@ class PostgresHashIndex(HashIndex):
         return count
 
     def add(self, fingerprint: Fingerprint) -> None:
+        self._record_format_version(fingerprint)
         self.remove(fingerprint.file_id)
         metadata = {
             "file_id": fingerprint.file_id,
@@ -1655,6 +1814,7 @@ class PostgresHashIndex(HashIndex):
         # earlier copy), which also avoids the files PRIMARY KEY conflict.
         survivors: dict[str, Fingerprint] = {}
         for fingerprint in fingerprints:
+            self._record_format_version(fingerprint)
             survivors[fingerprint.file_id] = fingerprint
         if not survivors:
             return
