@@ -43,7 +43,9 @@ video = ["av>=10.0", "Pillow>=9.0"]
 # Embedding-sequence fingerprinting: the precomputed-vector path (.npy/.jsonl)
 # is numpy-only (the one core dep) and always available. This extra provides a
 # default encoder for the optional encode-on-load path; it is lazily imported
-# only when a concrete Embedder is wired in.
+# only when a concrete Embedder is wired in. A lightweight, no-torch alternative
+# is model2vec (static distilled embeddings, e.g. minishlab/potion-base-8M);
+# benchmarks/heavy_handlers.py uses it to exercise the real encode-on-load path.
 embeddings = ["sentence-transformers>=2.2"]
 redis = ["redis>=4.0"]
 postgres = ["psycopg[binary]>=3.1"]

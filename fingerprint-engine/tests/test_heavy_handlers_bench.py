@@ -27,7 +27,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from benchmarks.heavy_handlers import run_embedding_benchmark, run_video_benchmark
+from benchmarks.heavy_handlers import (
+    run_embedding_benchmark,
+    run_encoder_benchmark,
+    run_video_benchmark,
+)
 
 # ---------------------------------------------------------------------------
 # Embedding: numpy-only, always runs.
@@ -83,6 +87,66 @@ def test_embedding_benchmark_length_stable_and_dim_isolated() -> None:
     # a different time grid (window=2*d) and must NOT match the d=64 parent.
     assert by_variant["different_dim"]["embedding_window"] == 128
     assert by_variant["different_dim"]["matched"] is False
+
+
+# ---------------------------------------------------------------------------
+# Encoder: gated on model2vec (the real encode-on-load path). Skips cleanly when
+# model2vec is absent, so CI never downloads a model.
+# ---------------------------------------------------------------------------
+
+
+def test_encoder_benchmark_exact_reuse_matches_and_self_recall_perfect() -> None:
+    pytest.importorskip("model2vec")
+
+    report = run_encoder_benchmark(num_docs=8)
+    if report.get("skipped"):
+        pytest.skip(f"encoder backend unavailable: {report.get('reason')}")
+
+    # The real model2vec encode-on-load path produces matchable fingerprints:
+    # every indexed doc ranks itself #1 with full confidence.
+    assert report["self_recall_at_1"] == 1.0
+    assert report["mean_self_confidence"] == 1.0
+    # potion-base-8M is a 256-dim static model; each vector is exactly one frame,
+    # so the per-frame fingerprint window equals d.
+    assert report["embedding_dim"] == 256
+
+    by_variant = {row["variant"]: row for row in report["per_variant"]}
+
+    # EXACT_PASSAGE_REUSE: a doc that copies several of doc-0's paragraphs
+    # VERBATIM ranks doc-0 #1. Verbatim chunks encode to bit-identical vectors ->
+    # identical spectra -> identical constellation hashes, so it shares many hash
+    # codes and clears the impostor ceiling by a wide margin -- this is the core
+    # claim, that the encoder path matches SHARED EXACT PASSAGES.
+    reuse = by_variant["exact_passage_reuse"]
+    assert reuse["matched"] is True
+    assert reuse["shared_hash_codes"] > 0
+    assert reuse["confidence"] > report["max_impostor_confidence"]
+
+
+def test_encoder_benchmark_paraphrase_is_not_a_semantic_match() -> None:
+    # The documented LIMIT, pinned because model2vec static embeddings are
+    # deterministic. A FULL paraphrase (every paragraph reworded, no verbatim
+    # line shared) is semantically close but encodes to DIFFERENT vectors, so it
+    # shares essentially no hash codes and its confidence collapses to the
+    # impostor/noise floor. The encoder path detects SHARED EXACT EMBEDDING
+    # SUB-SEQUENCES, not semantic paraphrase.
+    pytest.importorskip("model2vec")
+
+    report = run_encoder_benchmark(num_docs=8)
+    if report.get("skipped"):
+        pytest.skip(f"encoder backend unavailable: {report.get('reason')}")
+
+    by_variant = {row["variant"]: row for row in report["per_variant"]}
+    paraphrase = by_variant["paraphrase_all"]
+    reuse = by_variant["exact_passage_reuse"]
+
+    # The paraphrase shares far fewer exact hash codes than verbatim reuse, and
+    # its confidence sits at or below the impostor ceiling -- indistinguishable
+    # from an unrelated doc, i.e. NOT a real match even though it nominally
+    # rank-1s doc-0 in this tiny same-pool corpus.
+    assert paraphrase["shared_hash_codes"] < reuse["shared_hash_codes"]
+    assert paraphrase["confidence"] <= report["max_impostor_confidence"]
+    assert paraphrase["confidence"] < reuse["confidence"]
 
 
 # ---------------------------------------------------------------------------
