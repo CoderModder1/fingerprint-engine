@@ -203,6 +203,37 @@ What is **not** supported (and is outside the Shazam model): true geometric or
 time-stretch invariance — e.g. cropping/rotating an image, or time-stretching
 audio — because those change the underlying signal sequence, not just its scale.
 
+## Tuning: opt-in matching settings
+
+The defaults are tuned for exact/near-duplicate detection and are **byte-stable**
+— upgrading the library never changes the hashes you've already indexed. Several
+matching refinements ship **opt-in and off by default**; enable them per
+use-case. The numbers below are from the reproducible harness in
+`benchmarks/accuracy.py` (run `python benchmarks/accuracy.py --mode hard`).
+
+> **Hash compatibility:** settings marked *hash-changing* alter the derived
+> hashes, so an index built with them is **not** comparable to a default index —
+> you must re-index, and the query must use the same setting. The engine stamps a
+> `fingerprint_format_version` and **warns (or raises, with `strict_format=True`)
+> on a query/index format mismatch**, so a mismatch can't silently return wrong
+> matches. Settings marked *search-time* leave hashes untouched (no re-index).
+
+| Goal | Setting | Effect (hard corpus) | Cost / caveat | Kind |
+|------|---------|----------------------|---------------|------|
+| **Match audio excerpts / clips** | `FingerprintConfig(window_bank=(512, 1024, 2048, 4096))` | excerpt/clip recall@1 **~0 → 1.0** | ~3.4× more hashes/file (sequence) — up to ~8× for images; index + query must share the bank | *hash-changing* |
+| **Fuzzy / multi-edit text near-dups** | `search(query, offset_tolerance=1)` (or `Calibration(offset_tolerance=1)`) | multi-edit recall 0.83 → 0.90; scatter 0.90 → 0.97 | small, no measured precision loss | *search-time* |
+| **Image resize / crop / rotate robustness** | `FingerprintConfig(image_mode="phash")` | crop/rotate/jpeg recall up vs the raster default | weaker impostor separation — **use a stricter cutoff (~0.2–0.3, not 0.05)** via `Calibration(per_handler={"image": 0.25})` | *hash-changing* |
+| **Bound query cost on a large corpus** | `search(query, candidate_limit=N)` | lossless when `N` ≥ true match set; sub-linear candidate scan | a tight `N` on a dense corpus can drop low-overlap tail matches | *search-time* |
+| Spectral-shift tolerance (niche) | `FingerprintConfig(freq_quantization=2)` | raises confidence on shifted spectra | **net-negative recall + worse precision on general near-dups — not recommended as a blanket setting** | *hash-changing* |
+
+```python
+# Example: an audio-excerpt-tolerant index (re-index required; query must match).
+from fingerprint_engine.core.fingerprinter import Fingerprinter
+from fingerprint_engine.core.models import FingerprintConfig
+audio_cfg = FingerprintConfig(window_bank=(512, 1024, 2048, 4096))
+fingerprinter = Fingerprinter(audio_cfg)        # index + queries both use audio_cfg
+```
+
 ## Extension Guide
 
 ### Add A File Handler
