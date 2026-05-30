@@ -222,9 +222,18 @@ use-case. The numbers below are from the reproducible harness in
 |------|---------|----------------------|---------------|------|
 | **Match audio excerpts / clips** | `FingerprintConfig(window_bank=(512, 1024, 2048, 4096))` | excerpt/clip recall@1 **~0 → 1.0** | ~3.4× more hashes/file (sequence) — up to ~8× for images; index + query must share the bank | *hash-changing* |
 | **Fuzzy / multi-edit text near-dups** | `search(query, offset_tolerance=1)` (or `Calibration(offset_tolerance=1)`) | multi-edit recall 0.83 → 0.90; scatter 0.90 → 0.97 | small, no measured precision loss | *search-time* |
-| **Image resize / crop / rotate robustness** | `FingerprintConfig(image_mode="phash")` | crop/rotate/jpeg recall up vs the raster default | weaker impostor separation — **use a stricter cutoff (~0.2–0.3, not 0.05)** via `Calibration(per_handler={"image": 0.25})` | *hash-changing* |
+| **Image resize / crop / rotate robustness** | `FingerprintConfig(image_mode="phash")` | crop/rotate/jpeg recall up vs the raster default | weaker impostor separation — **use a stricter cutoff (~0.2–0.3, not 0.05)** via `Calibration(per_handler={"image_phash": 0.25})` | *hash-changing* |
 | **Bound query cost on a large corpus** | `search(query, candidate_limit=N)` | lossless when `N` ≥ true match set; sub-linear candidate scan | a tight `N` on a dense corpus can drop low-overlap tail matches | *search-time* |
 | Spectral-shift tolerance (niche) | `FingerprintConfig(freq_quantization=2)` | raises confidence on shifted spectra | **net-negative recall + worse precision on general near-dups — not recommended as a blanket setting** | *hash-changing* |
+
+> **pHash is its own handler.** `image_mode="phash"` selects a distinct handler
+> (the raster handler stays the default and claims images under `image_mode="raster"`;
+> the two are mutually exclusive). Fingerprints made in phash mode are labelled
+> `handler="image_phash"`, so the stricter cutoff is keyed on **`"image_phash"`**
+> (not `"image"`) — `Calibration(per_handler={"image_phash": 0.25})` — and the raster
+> `"image"` operating point is untouched. The recommended cutoff is also exposed as
+> `IMAGE_PHASH_RECOMMENDED_MIN_CONFIDENCE` (0.25) / `IMAGE_PHASH_RECOMMENDED_CALIBRATION_KEY`
+> in `fingerprint_engine.handlers.image_phash_handler`.
 
 ```python
 # Example: an audio-excerpt-tolerant index (re-index required; query must match).
@@ -232,6 +241,13 @@ from fingerprint_engine.core.fingerprinter import Fingerprinter
 from fingerprint_engine.core.models import FingerprintConfig
 audio_cfg = FingerprintConfig(window_bank=(512, 1024, 2048, 4096))
 fingerprinter = Fingerprinter(audio_cfg)        # index + queries both use audio_cfg
+
+# Example: a resize/crop/rotate-tolerant image index using the dedicated pHash
+# handler, with the stricter cutoff it needs keyed on its own handler name.
+from fingerprint_engine.core.models import Calibration
+phash_cfg = FingerprintConfig(image_mode="phash")        # routes images to "image_phash"
+phash_fp = Fingerprinter(phash_cfg)                      # index + queries both use phash_cfg
+calibration = Calibration(per_handler={"image_phash": 0.25})  # stricter cutoff, raster untouched
 ```
 
 ## Extension Guide

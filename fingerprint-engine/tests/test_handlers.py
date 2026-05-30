@@ -203,15 +203,18 @@ def test_text_handler_rejects_control_char_dense_binary() -> None:
 
 def test_image_handler_excludes_svg() -> None:
     # image/svg+xml shares the ``image/`` prefix but is XML text the raster
-    # decoder cannot handle; it must score 0.0 and fall to text/binary.
-    score = ImageFileHandler.can_handle(
+    # decoder cannot handle; it must score 0.0 and fall to text/binary. The
+    # default-mode raster handler is the one that would claim images, so the
+    # decline is asserted on a default (raster) instance.
+    score = ImageFileHandler().can_handle(
         "logo.svg", mime_type="image/svg+xml", sample=b"<svg xmlns='...'></svg>"
     )
     assert score == 0.0
 
 
 def test_image_handler_still_accepts_png() -> None:
-    score = ImageFileHandler.can_handle(
+    # Default mode is raster, so a fresh raster instance claims a PNG.
+    score = ImageFileHandler().can_handle(
         "pic.png", mime_type="image/png", sample=b"\x89PNG\r\n\x1a\n"
     )
     assert score > 0.0
