@@ -181,8 +181,12 @@ built at 1024. Two design choices keep that window stable across size changes:
   small fixed window (`default_signal_window = 512`) instead of inheriting the
   audio-tuned 4096 default. So a file and a *truncated copy / excerpt* of it use
   the same window and still match (their hashes are a subset relation), rather
-  than landing on different length-adaptive windows. Audio keeps the 4096 window,
-  which is why a short clip matches its full track at the correct time offset.
+  than landing on different length-adaptive windows. Audio keeps the 4096 window
+  — but note a short audio *excerpt* does **not** reliably match its full track
+  (global signal normalisation and the global peak threshold both shift when
+  computed over a sub-segment), so audio excerpt/clip matching is a known
+  limitation, unlike the text/PDF prefix case above. See `benchmarks/accuracy.py`,
+  which measures this.
 - **Canonical image normalisation.** Every image is resampled to a fixed
   256×256 grayscale grid before the signal is built, so the *same picture at a
   different resolution* (or after lossy re-encoding) maps to a comparable signal.

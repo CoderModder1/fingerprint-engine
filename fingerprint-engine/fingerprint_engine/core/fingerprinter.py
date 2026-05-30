@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import inspect
 import logging
+import os
 import pkgutil
 import warnings
 from abc import ABC, abstractmethod
@@ -22,6 +23,103 @@ from .fft_pipeline import FFTFingerprintPipeline
 from .models import Fingerprint, FingerprintConfig, SearchResult
 
 logger = logging.getLogger(__name__)
+
+# Read files in fixed-size chunks when only the content hash is needed (no
+# fingerprinting), so a large file is never pulled fully into memory just to
+# learn its sha256. 1 MiB balances syscall count against peak memory.
+_SHA_CHUNK_BYTES = 1024 * 1024
+
+
+def expand_paths(
+    paths: Iterable[str | Path],
+    *,
+    errors: list[tuple[str, Exception]] | None = None,
+) -> list[Path]:
+    """Expand a mix of files and directories into a sorted list of regular files.
+
+    Each input path is handled independently and fail-soft:
+
+    * a regular file is kept as-is;
+    * a directory is walked recursively (``os.walk``) and every regular file
+      under it is collected;
+    * anything else (a broken symlink, a path that disappears mid-walk, a
+      special device, or an unreadable directory) is skipped -- recorded in the
+      optional ``errors`` collector as a ``(str(path), exc)`` tuple when one is
+      supplied, otherwise simply dropped.
+
+    The result is de-duplicated by resolved path and sorted, so the same
+    directory tree always expands to the same ordered file list regardless of
+    filesystem iteration order or repeated/overlapping inputs. Symlinks are not
+    followed during the directory walk, which prevents both cycle loops and
+    escaping the tree being ingested.
+
+    A missing top-level path is surfaced as :class:`FileNotFoundError` in
+    ``errors`` (or dropped) rather than raised, so one bad argument never aborts
+    the whole expansion -- matching the fail-soft batch philosophy of
+    :meth:`Fingerprinter.fingerprint_many`.
+    """
+
+    def _record(path_str: str, exc: Exception) -> None:
+        logger.debug("expand_paths skipping %s: %s: %s", path_str, type(exc).__name__, exc)
+        if errors is not None:
+            errors.append((path_str, exc))
+
+    collected: set[Path] = set()
+    for raw in paths:
+        source = Path(raw)
+        try:
+            if source.is_dir():
+                # followlinks=False (default): never traverse symlinked dirs, so
+                # the walk cannot loop on a cycle or escape the tree.
+                for dirpath, _dirnames, filenames in os.walk(source):
+                    base = Path(dirpath)
+                    for name in filenames:
+                        candidate = base / name
+                        if candidate.is_file():
+                            collected.add(candidate)
+            elif source.is_file():
+                collected.add(source)
+            elif not source.exists():
+                _record(str(source), FileNotFoundError(source))
+            else:
+                # Exists but is neither a regular file nor a directory (FIFO,
+                # socket, device, broken symlink target): nothing to fingerprint.
+                _record(str(source), OSError(f"not a regular file or directory: {source}"))
+        except OSError as exc:
+            _record(str(source), exc)
+    return sorted(collected)
+
+
+def file_content_sha256(path: str | Path, *, max_file_size_bytes: int = 0) -> str:
+    """Compute the sha256 hex digest of a file's bytes, read in chunks.
+
+    This is the same digest the fingerprinter stores as ``content_sha256`` /
+    ``file_id`` (``hashlib.sha256`` over the raw file bytes), but computed
+    *without* decoding or fingerprinting -- so incremental ingest can learn a
+    file's identity cheaply and skip files already present in the index.
+
+    ``max_file_size_bytes`` mirrors :attr:`FingerprintConfig.max_file_size_bytes`:
+    when positive, a file larger than the limit raises :class:`FileTooLargeError`
+    *before* any bytes are read (the size is taken from ``stat``), bounding the
+    work an oversized/hostile input can trigger. 0 means unlimited.
+    """
+
+    source = Path(path)
+    if max_file_size_bytes > 0:
+        size = source.stat().st_size
+        if size > max_file_size_bytes:
+            raise FileTooLargeError(
+                f"{source}: file size {size} bytes exceeds max_file_size_bytes "
+                f"limit of {max_file_size_bytes} bytes",
+                size=size,
+                limit=max_file_size_bytes,
+            )
+    digest = hashlib.sha256()
+    with source.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_SHA_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 
 # Per-worker Fingerprinter, lazily built by ``_process_worker_init`` so the
 # ProcessPoolExecutor reconstructs ONE Fingerprinter per worker process (rather

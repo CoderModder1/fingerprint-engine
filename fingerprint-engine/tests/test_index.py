@@ -1122,6 +1122,134 @@ def test_pg_add_many_equals_sequential_add(pg_index) -> None:
         sequential.close()
 
 
+# ---------------------------------------------------------------------------
+# Enumeration API parity (Task 1 -- list_files / iter_metadata / contains)
+#
+# list_files() and iter_metadata() MUST be byte-identical across every backend
+# and reflect adds AND removes; iter_metadata() MUST yield exactly what
+# _metadata_for() returns, in list_files() order, without going through the
+# heavy to_dict(). contains()/__contains__ MUST agree with list_files()
+# membership. Redis runs via fakeredis; Postgres parity is gated by @requires_pg.
+# ---------------------------------------------------------------------------
+
+
+def test_list_files_and_iter_metadata_parity_across_backends() -> None:
+    corpus = _bulk_corpus()  # includes an "empty" (zero-hash) file: still listed
+    expected_ids = sorted(fingerprint.file_id for fingerprint in corpus)
+
+    per_backend_ids: dict[str, list[str]] = {}
+    per_backend_meta: dict[str, list[dict]] = {}
+    for name, index in _parity_backends():
+        for fingerprint in corpus:
+            index.add(fingerprint)
+
+        listed = index.list_files()
+        # Sorted, deterministic, and covers every added file (empty one included).
+        assert listed == expected_ids, name
+        per_backend_ids[name] = listed
+
+        # iter_metadata() must yield exactly _metadata_for() for each id, IN ORDER,
+        # and not depend on to_dict() (it streams list_files()+_metadata_for()).
+        streamed = list(index.iter_metadata())
+        assert [m["file_id"] for m in streamed] == expected_ids, name
+        assert streamed == [index._metadata_for(fid) for fid in listed], name
+        per_backend_meta[name] = streamed
+
+        # Membership: contains()/__contains__ agree with list_files().
+        for fid in expected_ids:
+            assert index.contains(fid), (name, fid)
+            assert fid in index, (name, fid)
+        assert not index.contains("does-not-exist"), name
+        assert "does-not-exist" not in index, name
+        assert 12345 not in index, name  # non-str membership is False, not a crash
+
+    # Cross-backend byte-identical enumeration (ids and full metadata dicts).
+    reference_ids = per_backend_ids["in_memory"]
+    reference_meta = per_backend_meta["in_memory"]
+    for name in per_backend_ids:
+        assert per_backend_ids[name] == reference_ids, name
+        assert per_backend_meta[name] == reference_meta, name
+
+
+def test_list_files_reflects_adds_and_removes_across_backends() -> None:
+    for name, index in _parity_backends():
+        assert index.list_files() == [], name  # empty index enumerates to nothing
+        assert list(index.iter_metadata()) == [], name
+
+        index.add(fp_with_hashes("alpha", [(1, 10), (2, 20)]))
+        index.add(fp_with_hashes("beta", [(3, 5)]))
+        assert index.list_files() == ["alpha", "beta"], name
+        assert "alpha" in index and "beta" in index, name
+
+        index.remove("alpha")
+        assert index.list_files() == ["beta"], name
+        assert "alpha" not in index, name
+        assert [m["file_id"] for m in index.iter_metadata()] == ["beta"], name
+
+        # Re-adding (replace) a file_id keeps it listed exactly once.
+        index.add(fp_with_hashes("beta", [(9, 1), (9, 2)]))
+        assert index.list_files() == ["beta"], name
+        assert index._metadata_for("beta")["hash_count"] == 2, name
+
+
+def test_iter_metadata_does_not_call_to_dict() -> None:
+    # iter_metadata() must stream list_files()+_metadata_for(), NOT build the heavy
+    # whole-index to_dict(). Trip a flag if to_dict() is touched during iteration.
+    index = InMemoryHashIndex()
+    for fingerprint in _bulk_corpus():
+        index.add(fingerprint)
+
+    called = {"to_dict": False}
+    original = index.to_dict
+
+    def _tripwire() -> dict:
+        called["to_dict"] = True
+        return original()
+
+    index.to_dict = _tripwire  # type: ignore[method-assign]
+    streamed = list(index.iter_metadata())
+
+    assert not called["to_dict"]
+    assert [m["file_id"] for m in streamed] == sorted(fp.file_id for fp in _bulk_corpus())
+
+
+def test_list_files_and_iter_metadata_survive_snapshot_round_trip(tmp_path: Path) -> None:
+    # Enumeration must reflect a load_snapshot() bulk import, not just live adds.
+    corpus = _bulk_corpus()
+    source = SQLiteHashIndex(":memory:")
+    for fingerprint in corpus:
+        source.add(fingerprint)
+    snapshot = tmp_path / "snap.json"
+    source.save(snapshot)
+
+    loaded = InMemoryHashIndex.load(snapshot)
+    assert loaded.list_files() == source.list_files()
+    assert list(loaded.iter_metadata()) == list(source.iter_metadata())
+
+
+@requires_pg
+def test_pg_list_files_and_iter_metadata_match_in_memory(pg_index) -> None:
+    # Enumeration parity for Postgres against the in-memory reference, including
+    # the empty (zero-hash) file and removal.
+    corpus = _bulk_corpus()
+    mem = InMemoryHashIndex()
+    for fingerprint in corpus:
+        mem.add(fingerprint)
+        pg_index.add(fingerprint)
+
+    assert pg_index.list_files() == mem.list_files()
+    assert list(pg_index.iter_metadata()) == list(mem.iter_metadata())
+    for fid in mem.list_files():
+        assert pg_index.contains(fid)
+        assert fid in pg_index
+    assert "missing" not in pg_index
+
+    pg_index.remove("alpha")
+    mem.remove("alpha")
+    assert pg_index.list_files() == mem.list_files()
+    assert "alpha" not in pg_index
+
+
 @requires_pg
 def test_pg_add_many_preserves_replace_semantics(pg_index) -> None:
     queries = _bulk_queries()

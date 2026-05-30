@@ -12,6 +12,12 @@ from __future__ import annotations
 import logging
 from importlib.metadata import PackageNotFoundError, version
 
+from .core.dedup import (
+    DedupReport,
+    ExactDuplicateCluster,
+    NearDuplicateCluster,
+    find_duplicates,
+)
 from .core.exceptions import (
     FingerprintError,
     InvalidSnapshotError,
@@ -50,6 +56,8 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 __all__ = [
     "Calibration",
     "ConstellationHash",
+    "DedupReport",
+    "ExactDuplicateCluster",
     "Fingerprint",
     "FingerprintConfig",
     "FingerprintError",
@@ -59,10 +67,12 @@ __all__ = [
     "InvalidSnapshotError",
     "LandmarkPoint",
     "MissingDependencyError",
+    "NearDuplicateCluster",
     "NoHandlerError",
     "PostgresHashIndex",
     "RedisHashIndex",
     "SQLiteHashIndex",
     "SearchResult",
     "__version__",
+    "find_duplicates",
 ]

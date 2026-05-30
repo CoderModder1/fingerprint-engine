@@ -176,3 +176,219 @@ def test_search_missing_query_file_exits_1(
     assert out == ""
     assert "error:" in err
     assert "absent.py" in err
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_list_command_emits_indexed_files(
+    backend: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    good = _write_corpus(tmp_path)
+    base = _backend_argv(backend, tmp_path)
+
+    # An empty index lists zero files.
+    code, out, _err = _run(base + ["list"], capsys)
+    assert code == 0
+    empty = json.loads(out)
+    assert empty["backend"] == backend
+    assert empty["file_count"] == 0
+    assert empty["files"] == []
+
+    add_code, add_out, _ = _run(base + ["add", *[str(p) for p in good]], capsys)
+    assert add_code == 0
+    added = {
+        item["file_id"]: Path(item["path"]).name for item in json.loads(add_out)["indexed_files"]
+    }
+
+    code, out, _err = _run(base + ["list"], capsys)
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["backend"] == backend
+    assert payload["file_count"] == 3
+    # Each listed file carries the stable projection fields, sorted by file_id.
+    listed_ids = [item["file_id"] for item in payload["files"]]
+    assert listed_ids == sorted(added)
+    assert {item["path"] and Path(item["path"]).name for item in payload["files"]} == set(added.values())
+    for item in payload["files"]:
+        assert set(item) == {"file_id", "path", "handler", "hash_count"}
+        assert item["handler"] == "text"
+        assert item["hash_count"] > 0
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_list_summary_omits_per_file_list(
+    backend: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    good = _write_corpus(tmp_path)
+    base = _backend_argv(backend, tmp_path)
+    assert _run(base + ["add", *[str(p) for p in good]], capsys)[0] == 0
+
+    code, out, _err = _run(base + ["list", "--summary"], capsys)
+
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["file_count"] == 3
+    assert payload["posting_count"] > 0
+    assert "files" not in payload  # --summary drops the per-file list
+
+
+def _write_corpus_in(directory: Path, count: int = 3) -> list[Path]:
+    """A featured-text corpus written under ``directory`` (created if needed).
+
+    The directory name is folded into each file's body so that same-named files
+    in different directories have DISTINCT content (distinct content_sha256, the
+    index's file_id) and are therefore indexed as distinct files rather than
+    collapsed by content-dedup.
+    """
+
+    directory.mkdir(parents=True, exist_ok=True)
+    tag = directory.name
+    paths: list[Path] = []
+    for i in range(count):
+        path = directory / f"doc_{i}.py"
+        lines = [
+            f"def function_{tag}_{i}_{j}(value):\n    return value * {j} + {i * 7}\n\n"
+            for j in range(60)
+        ]
+        path.write_text("".join(lines), encoding="utf-8")
+        paths.append(path)
+    return paths
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_add_directory_is_walked_recursively(
+    backend: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Files spread across a nested directory tree; `add <dir>` must collect them
+    # all, including those in the sub-directory, from a single directory argument.
+    corpus = tmp_path / "corpus"
+    top = _write_corpus_in(corpus, count=2)
+    nested = _write_corpus_in(corpus / "sub", count=2)
+    base = _backend_argv(backend, tmp_path)
+
+    code, out, _err = _run(base + ["add", str(corpus)], capsys)
+
+    assert code == 0
+    payload = json.loads(out)
+    indexed_names = {Path(item["path"]).name for item in payload["indexed_files"]}
+    # doc_0/doc_1 appear in both the top dir and the sub dir; same names, distinct
+    # content (different bytes), so all four are indexed as distinct files.
+    assert len(payload["indexed_files"]) == len(top) + len(nested) == 4
+    assert indexed_names == {"doc_0.py", "doc_1.py"}
+    assert payload["counts"]["scanned"] == 4
+    assert payload["counts"]["newly_indexed"] == 4
+    assert payload["counts"]["failed"] == 0
+    assert payload["file_count"] == 4
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_add_incremental_skips_on_second_run_and_adds_only_new(
+    backend: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    corpus = tmp_path / "corpus"
+    initial = _write_corpus_in(corpus, count=3)
+    base = _backend_argv(backend, tmp_path)
+
+    # First incremental run over the directory indexes every file.
+    code1, out1, _ = _run(base + ["add", str(corpus), "--incremental"], capsys)
+    assert code1 == 0
+    first = json.loads(out1)
+    assert first["counts"]["scanned"] == 3
+    assert first["counts"]["skipped_existing"] == 0
+    assert first["counts"]["newly_indexed"] == 3
+    assert first["counts"]["failed"] == 0
+    assert first["file_count"] == 3
+
+    # Second incremental run over the SAME directory skips all of them: nothing
+    # new is fingerprinted, the index is unchanged.
+    code2, out2, _ = _run(base + ["add", str(corpus), "--incremental"], capsys)
+    assert code2 == 0
+    second = json.loads(out2)
+    assert second["counts"]["scanned"] == 3
+    assert second["counts"]["skipped_existing"] == 3
+    assert second["counts"]["newly_indexed"] == 0
+    assert second["indexed_files"] == []
+    assert second["file_count"] == 3  # unchanged
+
+    # Add ONE new file, re-run incrementally: only the new file is indexed.
+    new_file = corpus / "doc_new.py"
+    new_file.write_text(
+        "".join(
+            f"def brand_new_{j}(value):\n    return value - {j} * 13\n\n" for j in range(60)
+        ),
+        encoding="utf-8",
+    )
+    code3, out3, _ = _run(base + ["add", str(corpus), "--incremental"], capsys)
+    assert code3 == 0
+    third = json.loads(out3)
+    assert third["counts"]["scanned"] == 4
+    assert third["counts"]["skipped_existing"] == 3
+    assert third["counts"]["newly_indexed"] == 1
+    indexed_names = {Path(item["path"]).name for item in third["indexed_files"]}
+    assert indexed_names == {"doc_new.py"}
+    assert third["file_count"] == 4
+
+    # The --skip-existing alias selects the same behavior.
+    code4, out4, _ = _run(base + ["add", str(corpus), "--skip-existing"], capsys)
+    assert code4 == 0
+    fourth = json.loads(out4)
+    assert fourth["counts"]["skipped_existing"] == 4
+    assert fourth["counts"]["newly_indexed"] == 0
+
+    _ = initial  # corpus authored above; referenced for clarity
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_add_incremental_directory_with_oversized_file_succeeds_fail_soft(
+    backend: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A directory holding good files plus one oversized input: the add must
+    # still succeed (exit 0), index the good ones, and report the oversized one
+    # as a failure (FileTooLargeError, rejected before its bytes are read on the
+    # cheap sha path) without aborting the batch.
+    corpus = tmp_path / "corpus"
+    good = _write_corpus_in(corpus, count=2)
+    big = corpus / "huge.bin"
+    big.write_bytes(b"\x00" * 200_000)  # over the 100000-byte cap below
+    base = _backend_argv(backend, tmp_path)
+
+    code, out, _err = _run(
+        base + ["--max-file-size", "100000", "add", str(corpus), "--incremental"], capsys
+    )
+
+    assert code == 0
+    payload = json.loads(out)
+    indexed_names = {Path(item["path"]).name for item in payload["indexed_files"]}
+    assert indexed_names == {p.name for p in good}
+    assert payload["file_count"] == len(good) == 2
+    # scanned counts every regular file found (good + oversized); newly_indexed
+    # counts only the successfully fingerprinted good files; the oversized file
+    # is reported as a structured failure.
+    assert payload["counts"]["scanned"] == 3
+    assert payload["counts"]["newly_indexed"] == 2
+    assert payload["counts"]["failed"] == 1
+    bad_reasons = [item["reason"] for item in payload["skipped"]]
+    assert any(reason.startswith("FileTooLargeError") for reason in bad_reasons)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_add_non_incremental_default_reindexes_existing(
+    backend: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Without --incremental, the default behavior is unchanged: every scanned
+    # file is (re-)fingerprinted and added, even when already present.
+    corpus = tmp_path / "corpus"
+    _write_corpus_in(corpus, count=3)
+    base = _backend_argv(backend, tmp_path)
+
+    code1, out1, _ = _run(base + ["add", str(corpus)], capsys)
+    assert code1 == 0
+    assert json.loads(out1)["counts"]["newly_indexed"] == 3
+
+    code2, out2, _ = _run(base + ["add", str(corpus)], capsys)
+    assert code2 == 0
+    second = json.loads(out2)
+    # Default add re-fingerprints all three (no skip); file_count stays 3 because
+    # the index dedupes by content sha (last write wins).
+    assert second["counts"]["newly_indexed"] == 3
+    assert second["counts"]["skipped_existing"] == 0
+    assert second["file_count"] == 3

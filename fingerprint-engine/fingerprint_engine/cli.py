@@ -8,13 +8,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from fingerprint_engine.core.dedup import DEFAULT_MIN_CONFIDENCE, find_duplicates
 from fingerprint_engine.core.exceptions import (
     FileTooLargeError,
     FingerprintError,
     MissingDependencyError,
     NoHandlerError,
 )
-from fingerprint_engine.core.fingerprinter import Fingerprinter
+from fingerprint_engine.core.fingerprinter import (
+    Fingerprinter,
+    expand_paths,
+    file_content_sha256,
+)
 from fingerprint_engine.core.index import (
     HashIndex,
     InMemoryHashIndex,
@@ -62,9 +67,17 @@ def build_parser() -> argparse.ArgumentParser:
     fingerprint.add_argument("file")
     fingerprint.add_argument("--full", action="store_true", help="Emit full hashes and landmarks")
 
-    add = subparsers.add_parser("add", help="Add one or more files to the index")
-    add.add_argument("files", nargs="+")
+    add = subparsers.add_parser(
+        "add", help="Add files and/or directories (walked recursively) to the index"
+    )
+    add.add_argument("files", nargs="+", help="files and/or directories to ingest")
     add.add_argument("--workers", type=int, default=None)
+    add.add_argument(
+        "--incremental", "--skip-existing", dest="incremental", action="store_true",
+        help="skip files whose content is already indexed (matched cheaply by "
+             "sha256 of the file bytes, without fingerprinting); only new/changed "
+             "files are fingerprinted and added",
+    )
 
     search = subparsers.add_parser("search", help="Search the index with a query file")
     search.add_argument("file")
@@ -77,6 +90,19 @@ def build_parser() -> argparse.ArgumentParser:
     prune.add_argument("--max-df-ratio", type=float, default=0.1,
                        help="prune hash codes present in more than this fraction of files "
                             "(default 0.1; lower = more aggressive)")
+
+    list_files = subparsers.add_parser("list", help="List the files indexed in the selected backend")
+    list_files.add_argument("--summary", action="store_true",
+                            help="emit only the counts, omitting the per-file list")
+
+    dedup = subparsers.add_parser(
+        "dedup", help="Find exact and near-duplicate files among the given paths"
+    )
+    dedup.add_argument("files", nargs="+")
+    dedup.add_argument("--workers", type=int, default=None)
+    dedup.add_argument("--min-confidence", type=float, default=DEFAULT_MIN_CONFIDENCE,
+                       help="near-duplicate confidence cutoff in [0,1] "
+                            f"(default {DEFAULT_MIN_CONFIDENCE}; higher = stricter)")
 
     return parser
 
@@ -156,17 +182,55 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
 
     if args.command == "add":
         index = open_index(args)
+        # Expand directories into their files (recursive walk) and keep plain
+        # files as-is, fail-soft: a missing/unreadable argument is recorded as a
+        # skip rather than aborting the whole ingest. Sorted + de-duplicated, so
+        # a directory always yields the same ordered file list.
+        expand_errors: list[tuple[str, Exception]] = []
+        targets = expand_paths(args.files, errors=expand_errors)
+        skipped = [
+            {"path": path, "reason": f"{type(exc).__name__}: {exc}"} for path, exc in expand_errors
+        ]
+        scanned = len(targets)
+        skipped_existing = 0
+
+        # Incremental ingest: before fingerprinting, drop files whose content is
+        # already in the index. Since file_id == content_sha256, "already
+        # indexed" means the file's content sha is a member of the index. We
+        # compute that sha by reading the bytes (chunked) -- far cheaper than the
+        # FFT fingerprint -- and only fingerprint the misses. A file whose sha
+        # cannot be computed (vanished/oversized/unreadable) is recorded as a
+        # skip here, never fingerprinted, mirroring the fail-soft contract.
+        if getattr(args, "incremental", False):
+            limit = fingerprinter.config.max_file_size_bytes
+            misses: list[Path] = []
+            for target in targets:
+                try:
+                    sha = file_content_sha256(target, max_file_size_bytes=limit)
+                except (OSError, FileTooLargeError) as exc:
+                    skipped.append(
+                        {"path": str(target), "reason": f"{type(exc).__name__}: {exc}"}
+                    )
+                    continue
+                if index.contains(sha):
+                    skipped_existing += 1
+                else:
+                    misses.append(target)
+            to_fingerprint: list[Path] = misses
+        else:
+            to_fingerprint = list(targets)
+
         # Fail-soft batch: per-file errors are reported, not fatal, so a partial
         # batch still indexes (and saves) its successes. fingerprint_many collects
         # each failure as a structured (path, exc) tuple, so a path containing
         # ": " can never mis-split (unlike parsing the warning text).
         collector: list[tuple[str, Exception]] = []
         fingerprints = fingerprinter.fingerprint_many(
-            args.files, max_workers=args.workers, errors=collector
+            to_fingerprint, max_workers=args.workers, errors=collector
         )
-        skipped = [
+        skipped.extend(
             {"path": path, "reason": f"{type(exc).__name__}: {exc}"} for path, exc in collector
-        ]
+        )
         # Bulk/transactional ingest: one commit (SQLite) / one pipeline (Redis) /
         # one COPY (Postgres) for the whole batch instead of a per-file commit.
         # Equivalent to calling add() per fingerprint in sequence.
@@ -180,6 +244,16 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                 summarize_fingerprint(fingerprint, full=False) for fingerprint in fingerprints
             ],
             "skipped": skipped,
+            "counts": {
+                # Every entry in `skipped` is a genuine failure (a bad/unreadable
+                # argument, an un-sha-able file, or a fingerprint error);
+                # already-indexed files are counted in skipped_existing instead
+                # and never appear in `skipped`.
+                "scanned": scanned,
+                "skipped_existing": skipped_existing,
+                "newly_indexed": len(fingerprints),
+                "failed": len(skipped),
+            },
             "file_count": index.file_count,
             "posting_count": index.posting_count,
         }
@@ -216,6 +290,53 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             "pruned_postings": removed,
             "file_count": index.file_count,
             "posting_count": index.posting_count,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "list":
+        index = open_index(args)
+        # Stream per-file metadata rather than the heavy to_dict(); each dict is
+        # projected down to the stable list fields. iter_metadata() yields in the
+        # backend-independent sorted file_id order.
+        files = [
+            {
+                "file_id": str(meta.get("file_id", "")),
+                "path": str(meta.get("path", "")),
+                "handler": str(meta.get("handler", "")),
+                "hash_count": int(meta.get("hash_count", 0) or 0),
+            }
+            for meta in index.iter_metadata()
+        ]
+        payload = {
+            "backend": args.backend,
+            "index_path": index_location(args),
+            "file_count": index.file_count,
+            "posting_count": index.posting_count,
+        }
+        if not args.summary:
+            payload["files"] = files
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "dedup":
+        # Fingerprint each input once (fail-soft: bad paths are reported, not
+        # fatal), then cluster. Dedup analyses the GIVEN paths against each
+        # other in a scratch in-memory index -- it never reads or mutates the
+        # selected persistent backend, so exact dupes (which the backend would
+        # collapse to one entry) are detected from the inputs as designed.
+        dedup_errors: list[tuple[str, Exception]] = []
+        fingerprints = fingerprinter.fingerprint_many(
+            args.files, max_workers=args.workers, errors=dedup_errors
+        )
+        skipped = [
+            {"path": path, "reason": f"{type(exc).__name__}: {exc}"} for path, exc in dedup_errors
+        ]
+        report = find_duplicates(fingerprints, min_confidence=args.min_confidence)
+        payload = {
+            "min_confidence": args.min_confidence,
+            "skipped": skipped,
+            **report.to_dict(),
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0

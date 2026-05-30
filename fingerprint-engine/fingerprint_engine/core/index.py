@@ -11,7 +11,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 from .exceptions import InvalidSnapshotError
@@ -103,6 +103,47 @@ class HashIndex(ABC):
     @abstractmethod
     def to_dict(self) -> dict[str, object]:
         """Return a portable ``{backend, files, metadata}`` snapshot of the index."""
+
+    @abstractmethod
+    def list_files(self) -> list[str]:
+        """Return every indexed ``file_id``, sorted for deterministic output.
+
+        Cheaper than :meth:`to_dict` (which materializes all postings): backends
+        enumerate the file-id set directly. Sorted ascending so the order is
+        identical across backends regardless of their internal storage order.
+        """
+
+    def iter_metadata(self) -> Iterator[dict]:
+        """Yield each file's stored metadata dict, in :meth:`list_files` order.
+
+        Streams one metadata dict per file (the same shape :meth:`_metadata_for`
+        returns: ``file_id``, ``path``, ``handler``, ``size_bytes``,
+        ``content_sha256``, ``hash_count``, ``landmark_count``, plus any extra
+        per-file metadata) without building the heavy whole-index
+        :meth:`to_dict`. The default composes :meth:`list_files` with
+        :meth:`_metadata_for`, so it is parity-identical across every backend;
+        a backend MAY override it only if it can stream the same dicts, in the
+        same order, more efficiently.
+        """
+
+        for file_id in self.list_files():
+            yield self._metadata_for(file_id)
+
+    def contains(self, file_id: str) -> bool:
+        """Whether ``file_id`` is indexed (membership without loading postings).
+
+        Used by incremental ingest to skip already-indexed files. The default
+        consults :meth:`_metadata_for` (present iff the file was added); backends
+        SHOULD override with an O(1) membership check (a key/row existence probe)
+        rather than fetching and decoding the metadata blob.
+        """
+
+        return bool(self._metadata_for(file_id))
+
+    def __contains__(self, file_id: object) -> bool:
+        """``file_id in index`` membership, delegating to :meth:`contains`."""
+
+        return isinstance(file_id, str) and self.contains(file_id)
 
     def query_many(self, hash_codes: Iterable[int]) -> dict[int, list[IndexPosting]]:
         """Return postings for many hash codes in one batch: ``{code: postings}``.
@@ -479,6 +520,12 @@ class InMemoryHashIndex(HashIndex):
     def _metadata_for(self, file_id: str) -> dict:
         return dict(self._metadata.get(file_id, {}))
 
+    def list_files(self) -> list[str]:
+        return sorted(self._file_entries)
+
+    def contains(self, file_id: str) -> bool:
+        return file_id in self._file_entries
+
     def to_dict(self) -> dict[str, object]:
         return {
             "backend": "in_memory",
@@ -744,6 +791,12 @@ class RedisHashIndex(HashIndex):
         except (ValueError, TypeError):
             return {}
         return data if isinstance(data, dict) else {}
+
+    def list_files(self) -> list[str]:
+        return sorted(self._text(raw_id) for raw_id in self._redis.smembers(self._key("files")))
+
+    def contains(self, file_id: str) -> bool:
+        return bool(self._redis.sismember(self._key("files"), file_id))
 
     def to_dict(self) -> dict[str, object]:
         files: dict[str, list[list[int]]] = {}
@@ -1043,6 +1096,20 @@ class SQLiteHashIndex(HashIndex):
         except (ValueError, TypeError):
             return {}
         return data if isinstance(data, dict) else {}
+
+    def list_files(self) -> list[str]:
+        # ORDER BY in SQL gives the same ascending order as the base sorted()
+        # contract without a Python-side sort of the whole id set.
+        return [
+            row[0]
+            for row in self._conn.execute("SELECT file_id FROM files ORDER BY file_id").fetchall()
+        ]
+
+    def contains(self, file_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM files WHERE file_id = ? LIMIT 1", (file_id,)
+        ).fetchone()
+        return row is not None
 
     def to_dict(self) -> dict[str, object]:
         files: dict[str, list[list[int]]] = {}
@@ -1384,6 +1451,27 @@ class PostgresHashIndex(HashIndex):
             except (ValueError, TypeError):
                 return {}
         return data if isinstance(data, dict) else {}
+
+    def list_files(self) -> list[str]:
+        try:
+            with self._conn.cursor() as cur:
+                # ORDER BY file_id matches the base sorted() contract server-side.
+                cur.execute(f"SELECT file_id FROM {self._files_table} ORDER BY file_id")
+                file_ids = [row[0] for row in cur.fetchall()]
+        finally:
+            self._conn.rollback()  # release the implicit read transaction even on error
+        return file_ids
+
+    def contains(self, file_id: str) -> bool:
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT 1 FROM {self._files_table} WHERE file_id = %s LIMIT 1", (file_id,)
+                )
+                row = cur.fetchone()
+        finally:
+            self._conn.rollback()  # release the implicit read transaction even on error
+        return row is not None
 
     def to_dict(self) -> dict[str, object]:
         files: dict[str, list[list[int]]] = {}
