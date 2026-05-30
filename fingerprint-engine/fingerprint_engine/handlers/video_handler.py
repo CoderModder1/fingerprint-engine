@@ -229,6 +229,12 @@ class VideoFileHandler(FileHandler):
                     continue
                 if self.max_keyframes and len(frames) >= self.max_keyframes:
                     break
+                # Decoding a video stream yields VideoFrames; this narrows the
+                # PyAV-17 stub union (VideoFrame|AudioFrame|SubtitleSet) so the
+                # VideoFrame-only .to_image() type-checks, and defensively skips
+                # any non-video frame instead of erroring.
+                if not isinstance(frame, av.VideoFrame):
+                    continue
                 image = frame.to_image()  # PIL.Image in native size/mode
                 grayscale = image.convert("L").resize(target, resampling)
                 frames.append(np.asarray(grayscale, dtype=np.float32))
