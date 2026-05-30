@@ -40,7 +40,7 @@ from fingerprint_engine.handlers.image_phash_handler import (  # noqa: E402 - af
     phash_band_codes,
 )
 
-pytest.importorskip("PIL")
+pytest.importorskip("PIL", exc_type=ImportError)
 
 
 def _make_image(rng: np.random.Generator, width: int = 180, height: int = 140):  # noqa: ANN202

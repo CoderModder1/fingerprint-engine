@@ -20,8 +20,8 @@ sys.path.insert(0, str(ROOT))
 
 # Skip the whole module unless the service extra is installed. TestClient lives
 # in starlette (a fastapi dependency) and itself needs httpx, so require both.
-pytest.importorskip("fastapi")
-pytest.importorskip("httpx")
+pytest.importorskip("fastapi", exc_type=ImportError)
+pytest.importorskip("httpx", exc_type=ImportError)
 
 from fastapi.testclient import TestClient  # noqa: E402
 

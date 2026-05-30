@@ -29,7 +29,7 @@ from fingerprint_engine.core.models import (
 
 
 def _fake_redis():
-    fakeredis = pytest.importorskip("fakeredis")
+    fakeredis = pytest.importorskip("fakeredis", exc_type=ImportError)
     return fakeredis.FakeStrictRedis(decode_responses=True)
 
 

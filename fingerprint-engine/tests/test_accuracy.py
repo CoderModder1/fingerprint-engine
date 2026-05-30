@@ -158,7 +158,7 @@ def test_prune_stop_hashes_keeps_recall(text_eval) -> None:  # noqa: ANN001
 
 
 def test_image_recall_and_separation(tmp_path: Path) -> None:
-    pytest.importorskip("PIL")
+    pytest.importorskip("PIL", exc_type=ImportError)
     rng = np.random.default_rng(SEED)
     report = evaluate_image(Fingerprinter(), rng, IMAGE_CORPUS, tmp_path)
     assert report.exact_recall_at_1 == 1.0
@@ -178,7 +178,7 @@ def test_image_recall_and_separation(tmp_path: Path) -> None:
 
 
 def test_audio_exact_recall_and_separation(tmp_path: Path) -> None:
-    pytest.importorskip("scipy")
+    pytest.importorskip("scipy", exc_type=ImportError)
     rng = np.random.default_rng(SEED)
     report = evaluate_audio(Fingerprinter(), rng, AUDIO_CORPUS, tmp_path)
     assert report.exact_recall_at_1 == 1.0
@@ -204,7 +204,7 @@ _AUDIO_WINDOW_BANK = (512, 1024, 2048, 4096)
 
 
 def test_window_bank_fixes_audio_excerpt_recall(tmp_path: Path) -> None:
-    pytest.importorskip("scipy")
+    pytest.importorskip("scipy", exc_type=ImportError)
     bank_cfg = FingerprintConfig(window_bank=_AUDIO_WINDOW_BANK)
 
     # OFF: the documented baseline -- excerpt/clip recall is at the floor.
@@ -339,7 +339,7 @@ def test_hard_confusability_precision_needs_stricter_cutoff(tmp_path: Path) -> N
 
 
 def test_hard_audio_window_bank_recovers_excerpt_recall(tmp_path: Path) -> None:
-    pytest.importorskip("scipy")
+    pytest.importorskip("scipy", exc_type=ImportError)
     # The headline opt-in win: on the hard audio excerpts the default single window
     # recalls ~0 (whole-signal re-normalisation shifts the fixed-window grid); the
     # window bank lifts both clip and excerpt recall sharply, at no false-accept
@@ -356,7 +356,7 @@ def test_hard_audio_window_bank_recovers_excerpt_recall(tmp_path: Path) -> None:
 
 
 def test_hard_image_phash_recovers_recall_at_precision_cost(tmp_path: Path) -> None:
-    pytest.importorskip("PIL")
+    pytest.importorskip("PIL", exc_type=ImportError)
     # pHash recovers recall on the hard raster weak spots (strong resize, crop,
     # rotate, jpeg+crop) -- a REAL recall win, not just confidence. But on these
     # smooth synthetic images its global descriptor also raises impostor

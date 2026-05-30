@@ -96,7 +96,7 @@ def test_embedding_benchmark_length_stable_and_dim_isolated() -> None:
 
 
 def test_encoder_benchmark_exact_reuse_matches_and_self_recall_perfect() -> None:
-    pytest.importorskip("model2vec")
+    pytest.importorskip("model2vec", exc_type=ImportError)
 
     report = run_encoder_benchmark(num_docs=8)
     if report.get("skipped"):
@@ -130,7 +130,7 @@ def test_encoder_benchmark_paraphrase_is_not_a_semantic_match() -> None:
     # shares essentially no hash codes and its confidence collapses to the
     # impostor/noise floor. The encoder path detects SHARED EXACT EMBEDDING
     # SUB-SEQUENCES, not semantic paraphrase.
-    pytest.importorskip("model2vec")
+    pytest.importorskip("model2vec", exc_type=ImportError)
 
     report = run_encoder_benchmark(num_docs=8)
     if report.get("skipped"):
@@ -155,9 +155,9 @@ def test_encoder_benchmark_paraphrase_is_not_a_semantic_match() -> None:
 
 
 def test_video_benchmark_self_recall_and_a_near_dup_match() -> None:
-    pytest.importorskip("av")
-    pytest.importorskip("imageio")
-    pytest.importorskip("PIL")
+    pytest.importorskip("av", exc_type=ImportError)
+    pytest.importorskip("imageio", exc_type=ImportError)
+    pytest.importorskip("PIL", exc_type=ImportError)
 
     report = run_video_benchmark(num_clips=6, num_frames=48, width=64, height=48)
     if report.get("skipped"):

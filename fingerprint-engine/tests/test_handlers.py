@@ -51,7 +51,7 @@ def test_pdf_handler_corrupt_pdf_still_degrades_to_latin1(tmp_path: Path) -> Non
     # A genuine parse failure on a corrupt/unparseable PDF (pypdf installed)
     # must still degrade gracefully to the latin1 byte fallback rather than
     # raise -- only the missing-dependency case fails loud.
-    pytest.importorskip("pypdf")
+    pytest.importorskip("pypdf", exc_type=ImportError)
 
     path = tmp_path / "garbage.pdf"
     path.write_bytes(b"%PDF-1.4 garbage")
@@ -144,7 +144,7 @@ def test_audio_load_does_not_hardcode_mp3_format(
     # The MP3 loader must let ffmpeg sniff the container (no ``format=`` kwarg)
     # rather than force-decode as mp3, which turned any non-mp3 input into
     # garbage. Verify AudioSegment.from_file is called WITHOUT a format kwarg.
-    pydub = pytest.importorskip("pydub")
+    pydub = pytest.importorskip("pydub", exc_type=ImportError)
 
     class _FakeSegment:
         channels = 1
@@ -237,7 +237,7 @@ def _make_multipage_pdf(num_pages: int) -> bytes:
 
 
 def test_pdf_handler_page_cap_limits_extraction(tmp_path: Path) -> None:
-    pytest.importorskip("pypdf")
+    pytest.importorskip("pypdf", exc_type=ImportError)
 
     path = tmp_path / "many.pdf"
     path.write_bytes(_make_multipage_pdf(5))
@@ -254,7 +254,7 @@ def test_pdf_handler_page_cap_limits_extraction(tmp_path: Path) -> None:
 
 
 def test_pdf_handler_default_is_unlimited(tmp_path: Path) -> None:
-    pytest.importorskip("pypdf")
+    pytest.importorskip("pypdf", exc_type=ImportError)
 
     path = tmp_path / "three.pdf"
     path.write_bytes(_make_multipage_pdf(3))
@@ -272,7 +272,7 @@ def test_pdf_handler_corrupt_pdf_warns_structural_only(tmp_path: Path) -> None:
     # On a genuine parse failure the latin1 fallback must fire AND a
     # RuntimeWarning must announce that the fingerprint is structural-only, so
     # it is not silently mistaken for real text extraction.
-    pytest.importorskip("pypdf")
+    pytest.importorskip("pypdf", exc_type=ImportError)
 
     path = tmp_path / "garbage.pdf"
     path.write_bytes(b"%PDF-1.4 garbage")

@@ -232,8 +232,8 @@ def test_embedding_via_injected_embedder(tmp_path: Path) -> None:
 
 
 def test_video_fingerprints_end_to_end_if_backend_present(tmp_path: Path) -> None:
-    av = pytest.importorskip("av")
-    pytest.importorskip("PIL")
+    av = pytest.importorskip("av", exc_type=ImportError)
+    pytest.importorskip("PIL", exc_type=ImportError)
 
     # Build a tiny synthetic clip: a few solid-color frames.
     path = tmp_path / "synthetic.mp4"
