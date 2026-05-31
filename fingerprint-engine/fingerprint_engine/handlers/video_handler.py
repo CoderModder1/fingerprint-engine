@@ -30,7 +30,6 @@ Design (see the module-level constants and ``load``):
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -40,10 +39,8 @@ import numpy as np
 from fingerprint_engine.core.exceptions import MissingDependencyError
 from fingerprint_engine.core.models import FingerprintConfig
 
-from .base import FileHandler
+from .base import FileHandler, require_optional
 from .image_handler import ImageFileHandler
-
-logger = logging.getLogger(__name__)
 
 # Sample one keyframe per this many seconds of video. A small fixed cadence
 # keeps the keyframe grid stable across re-encodes/trims (see module docstring).
@@ -175,34 +172,29 @@ class VideoFileHandler(FileHandler):
         ``video`` extra rather than degrade silently.
         """
 
-        try:
-            import av
-        except ImportError as exc:
-            logger.warning(
-                "missing optional dependency %s (extra %s) for video fingerprinting",
-                "av",
-                "video",
-            )
-            raise MissingDependencyError(
+        av = require_optional(
+            "av",
+            package="av",
+            extra="video",
+            message=(
                 "PyAV (av) is required for video fingerprinting; install with "
-                "'pip install \"fingerprint-engine[video]\"'",
-                package="av",
-                extra="video",
-            ) from exc
+                "'pip install \"fingerprint-engine[video]\"'"
+            ),
+        )
 
         # Reuse the IMAGE handler's canonicalization so a keyframe is reduced
         # exactly like a still image (256x256 grayscale via PIL Lanczos). PIL is
         # the ``image`` extra; the lazy import here gives a clear message if a
         # video backend is present but PIL is not.
-        try:
-            from PIL import Image
-        except ImportError as exc:
-            raise MissingDependencyError(
+        Image = require_optional(
+            "PIL.Image",
+            package="Pillow",
+            extra="video",
+            message=(
                 "Pillow is required to canonicalize video keyframes; install with "
-                "'pip install \"fingerprint-engine[video]\"'",
-                package="Pillow",
-                extra="video",
-            ) from exc
+                "'pip install \"fingerprint-engine[video]\"'"
+            ),
+        )
 
         resampling = getattr(Image, "Resampling", Image).LANCZOS
         target = self.canonical_size

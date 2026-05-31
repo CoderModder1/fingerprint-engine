@@ -14,7 +14,7 @@ Covers the two new handlers -- :class:`VideoFileHandler` and
 
 from __future__ import annotations
 
-import builtins
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -112,15 +112,16 @@ def test_video_handler_missing_av_fails_loud(tmp_path: Path, monkeypatch: pytest
     path = tmp_path / "clip.mp4"
     path.write_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom")
 
-    monkeypatch.delitem(sys.modules, "av", raising=False)
-    real_import = builtins.__import__
+    # Simulate av being absent via the import_module call require_optional uses
+    # (robust regardless of whether av's submodules are cached by another test).
+    real_import_module = importlib.import_module
 
-    def _fake_import(name: str, *args: object, **kwargs: object) -> object:
+    def _fake_import_module(name: str, *args: object, **kwargs: object) -> object:
         if name == "av" or name.startswith("av."):
             raise ImportError("No module named 'av'")
-        return real_import(name, *args, **kwargs)
+        return real_import_module(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    monkeypatch.setattr(importlib, "import_module", _fake_import_module)
 
     with pytest.raises(MissingDependencyError) as excinfo:
         VideoFileHandler().load(path)

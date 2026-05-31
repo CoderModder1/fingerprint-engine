@@ -2,15 +2,42 @@
 
 from __future__ import annotations
 
+import importlib
+import logging
 import mimetypes
 from abc import ABC, abstractmethod
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import numpy as np
 
+from fingerprint_engine.core.exceptions import MissingDependencyError
 from fingerprint_engine.core.fft_pipeline import FFTFingerprintPipeline
 from fingerprint_engine.core.models import ConstellationHash, FingerprintConfig, LandmarkPoint
+
+logger = logging.getLogger(__name__)
+
+
+def require_optional(module: str, *, package: str, extra: str, message: str) -> ModuleType:
+    """Import an optional-dependency module, or fail loud with ``MissingDependencyError``.
+
+    Centralizes the lazy-import-or-fail-loud pattern the dependency-backed handlers
+    share (PDF/image/audio/video): import ``module`` and return it, or -- on
+    ``ImportError`` -- log a warning and raise
+    :class:`MissingDependencyError` (carrying ``package``/``extra``, which
+    :meth:`Fingerprinter.fingerprint_file` reads to fail loudly rather than
+    silently demote to a lower-priority handler). The caller takes the symbol it
+    needs off the returned module (e.g. ``require_optional("pypdf", ...).PdfReader``).
+    ``message`` is the user-visible error text and is passed through verbatim, so
+    each handler keeps its own install hint.
+    """
+
+    try:
+        return importlib.import_module(module)
+    except ImportError as exc:
+        logger.warning("missing optional dependency %s (extra %s): %s", package, extra, message)
+        raise MissingDependencyError(message, package=package, extra=extra) from exc
 
 
 class FileHandler(ABC):

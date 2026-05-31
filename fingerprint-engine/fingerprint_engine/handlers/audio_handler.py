@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
 import numpy as np
 
-from fingerprint_engine.core.exceptions import MissingDependencyError
-
-from .base import FileHandler
-
-logger = logging.getLogger(__name__)
+from .base import FileHandler, require_optional
 
 
 @dataclass(frozen=True)
@@ -105,21 +100,15 @@ class AudioFileHandler(FileHandler):
 
     @staticmethod
     def _load_wav(raw: bytes) -> AudioPayload:
-        try:
-            from scipy.io import wavfile
-        except ImportError as exc:
-            logger.warning(
-                "missing optional dependency %s (extra %s) for WAV fingerprinting",
-                "scipy",
-                "audio",
-            )
-            raise MissingDependencyError(
+        wavfile = require_optional(
+            "scipy.io.wavfile",
+            package="scipy",
+            extra="audio",
+            message=(
                 "scipy is required for WAV fingerprinting; install with "
-                "'pip install fingerprint_engine[audio]'",
-                package="scipy",
-                extra="audio",
-            ) from exc
-
+                "'pip install fingerprint_engine[audio]'"
+            ),
+        )
         sample_rate, data = wavfile.read(BytesIO(raw))
         array = np.asarray(data)
         channels = int(array.shape[1]) if array.ndim > 1 else 1
@@ -146,20 +135,15 @@ class AudioFileHandler(FileHandler):
 
     @staticmethod
     def _load_mp3(raw: bytes) -> AudioPayload:
-        try:
-            from pydub import AudioSegment
-        except ImportError as exc:
-            logger.warning(
-                "missing optional dependency %s (extra %s) for MP3 fingerprinting",
-                "pydub",
-                "audio",
-            )
-            raise MissingDependencyError(
+        AudioSegment = require_optional(
+            "pydub",
+            package="pydub",
+            extra="audio",
+            message=(
                 "pydub plus ffmpeg is required for MP3 fingerprinting; install with "
-                "'pip install fingerprint_engine[audio]'",
-                package="pydub",
-                extra="audio",
-            ) from exc
+                "'pip install fingerprint_engine[audio]'"
+            ),
+        ).AudioSegment
 
         # No hardcoded ``format=`` so ffmpeg sniffs the real container. The
         # previous force-decode-as-mp3 turned any non-MP3 input routed here into

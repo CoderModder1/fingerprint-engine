@@ -15,19 +15,16 @@ handler declines and the phash handler claims them instead.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
 import numpy as np
 
-from fingerprint_engine.core.exceptions import FileTooLargeError, MissingDependencyError
+from fingerprint_engine.core.exceptions import FileTooLargeError
 from fingerprint_engine.core.models import FingerprintConfig
 
-from .base import FileHandler
-
-logger = logging.getLogger(__name__)
+from .base import FileHandler, require_optional
 
 
 @dataclass(frozen=True)
@@ -155,20 +152,15 @@ class ImageFileHandler(FileHandler):
         return 0.0
 
     def load(self, path: str | Path, *, content: bytes | None = None) -> ImagePayload:
-        try:
-            from PIL import Image
-        except ImportError as exc:
-            logger.warning(
-                "missing optional dependency %s (extra %s) for image fingerprinting",
-                "Pillow",
-                "image",
-            )
-            raise MissingDependencyError(
+        Image = require_optional(
+            "PIL.Image",
+            package="Pillow",
+            extra="image",
+            message=(
                 "Pillow is required for image fingerprinting; install with "
-                "'pip install fingerprint_engine[image]'",
-                package="Pillow",
-                extra="image",
-            ) from exc
+                "'pip install fingerprint_engine[image]'"
+            ),
+        )
 
         # Decode from the already-read bytes when provided (single-read path);
         # PIL sniffs the format from the content, so a BytesIO decodes identically

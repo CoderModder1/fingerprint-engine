@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import builtins
+import importlib
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -28,17 +28,16 @@ def test_pdf_handler_missing_pypdf_fails_loud(
     path = tmp_path / "doc.pdf"
     path.write_bytes(b"%PDF-1.4\nsome real-looking pdf content\n%%EOF\n")
 
-    # Drop any cached pypdf so the import inside load() re-runs, and force the
-    # re-import to raise ImportError.
-    monkeypatch.delitem(sys.modules, "pypdf", raising=False)
-    real_import = builtins.__import__
+    # Simulate pypdf being absent by making the import_module call require_optional
+    # uses raise (robust regardless of whether pypdf's submodules are cached).
+    real_import_module = importlib.import_module
 
-    def _fake_import(name: str, *args: object, **kwargs: object) -> object:
+    def _fake_import_module(name: str, *args: object, **kwargs: object) -> object:
         if name == "pypdf" or name.startswith("pypdf."):
             raise ImportError("No module named 'pypdf'")
-        return real_import(name, *args, **kwargs)
+        return real_import_module(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    monkeypatch.setattr(importlib, "import_module", _fake_import_module)
 
     with pytest.raises(MissingDependencyError) as excinfo:
         PDFFileHandler().load(path)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import warnings
 from dataclasses import dataclass
 from io import BytesIO
@@ -10,13 +9,10 @@ from pathlib import Path
 
 import numpy as np
 
-from fingerprint_engine.core.exceptions import MissingDependencyError
 from fingerprint_engine.core.models import FingerprintConfig
 
-from .base import FileHandler
+from .base import FileHandler, require_optional
 from .text_handler import TextFileHandler
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -61,20 +57,15 @@ class PDFFileHandler(FileHandler):
 
     def load(self, path: str | Path, *, content: bytes | None = None) -> PDFPayload:
         data = content if content is not None else self.read_bytes(path)
-        try:
-            from pypdf import PdfReader
-        except ImportError as exc:
-            logger.warning(
-                "missing optional dependency %s (extra %s) for PDF fingerprinting",
-                "pypdf",
-                "pdf",
-            )
-            raise MissingDependencyError(
+        PdfReader = require_optional(
+            "pypdf",
+            package="pypdf",
+            extra="pdf",
+            message=(
                 "pypdf is required to fingerprint PDF files; install it with "
-                "'pip install \"fingerprint-engine[pdf]\"'",
-                package="pypdf",
-                extra="pdf",
-            ) from exc
+                "'pip install \"fingerprint-engine[pdf]\"'"
+            ),
+        ).PdfReader
 
         try:
             reader = PdfReader(BytesIO(data))
