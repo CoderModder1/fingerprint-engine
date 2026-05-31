@@ -163,10 +163,10 @@ class EmbeddingFileHandler(FileHandler):
         self._tls = threading.local()
 
     def configure(self, config: FingerprintConfig) -> None:
-        # Forward-compatible config wiring; ``getattr`` keeps the default path
-        # unchanged if these fields are not present on the config yet.
-        self.max_vectors = int(getattr(config, "embedding_max_vectors", self.max_vectors))
-        self.max_dim = int(getattr(config, "embedding_max_dim", self.max_dim))
+        # No config-derived tuning yet: max_vectors/max_dim come from the
+        # constructor. Explicit no-op (the speculative getattr reads of
+        # not-yet-existent config fields were removed).
+        return
 
     @classmethod
     def can_handle(

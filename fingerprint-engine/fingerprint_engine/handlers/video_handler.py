@@ -98,13 +98,10 @@ class VideoFileHandler(FileHandler):
         # ``None`` -> config defaults, so no-arg discovery construction matches
         # the documented defaults while a caller (or config wiring) can tune the
         # cadence and the keyframe cap.
-        config = FingerprintConfig()
         if keyframe_interval_seconds is None:
-            keyframe_interval_seconds = getattr(
-                config, "video_keyframe_interval", _DEFAULT_KEYFRAME_INTERVAL_SECONDS
-            )
+            keyframe_interval_seconds = _DEFAULT_KEYFRAME_INTERVAL_SECONDS
         if max_keyframes is None:
-            max_keyframes = getattr(config, "video_max_keyframes", _DEFAULT_MAX_KEYFRAMES)
+            max_keyframes = _DEFAULT_MAX_KEYFRAMES
         if keyframe_interval_seconds <= 0:
             raise ValueError("keyframe_interval_seconds must be positive")
         if max_keyframes < 0:
@@ -113,13 +110,11 @@ class VideoFileHandler(FileHandler):
         self.max_keyframes = int(max_keyframes)
 
     def configure(self, config: FingerprintConfig) -> None:
-        # Honor config-derived tuning if/when it is added; ``getattr`` keeps this
-        # forward-compatible without requiring the config fields to exist yet, so
-        # the default path is unchanged.
-        self.keyframe_interval_seconds = float(
-            getattr(config, "video_keyframe_interval", self.keyframe_interval_seconds)
-        )
-        self.max_keyframes = int(getattr(config, "video_max_keyframes", self.max_keyframes))
+        # No config-derived tuning yet: the keyframe cadence/cap come from the
+        # constructor. Explicit no-op (the speculative getattr reads of
+        # not-yet-existent config fields were removed); wire config fields here
+        # if/when FingerprintConfig grows them.
+        return
 
     @classmethod
     def can_handle(

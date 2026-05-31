@@ -49,3 +49,34 @@ def test_peak_percentile_boundaries_accepted(boundary: float) -> None:
 def test_peak_threshold_zero_accepted() -> None:
     # Zero is a valid (degenerate) multiplier; only negatives are rejected.
     dataclasses.replace(FingerprintConfig(), peak_threshold=0.0).validate()
+
+
+def test_hash_changing_fields_match_effective_format_version() -> None:
+    # HASH_CHANGING_FIELDS must stay in lock-step with effective_format_version:
+    # every declared field changes the version when set non-default, and a few
+    # representative inert fields do not. Guards a future hash-changing flag added
+    # without an offset (which would silently change hashes at the default stamp).
+    from fingerprint_engine.core.models import (
+        FINGERPRINT_FORMAT_VERSION,
+        HASH_CHANGING_FIELDS,
+        effective_format_version,
+    )
+
+    base = FINGERPRINT_FORMAT_VERSION
+    assert effective_format_version(FingerprintConfig()) == base
+
+    changers = {"freq_quantization": 2, "window_bank": (512, 1024), "image_mode": "phash"}
+    assert set(changers) == set(HASH_CHANGING_FIELDS)
+    for field, value in changers.items():
+        cfg = dataclasses.replace(FingerprintConfig(), **{field: value})
+        assert effective_format_version(cfg) != base, field
+
+    # Representative INERT fields (tuning + resource limits) must NOT move it.
+    for field, value in {
+        "window_size": 2048,
+        "peak_threshold": 2.0,
+        "max_file_size_bytes": 1024,
+        "max_image_pixels": 1000,
+    }.items():
+        cfg = dataclasses.replace(FingerprintConfig(), **{field: value})
+        assert effective_format_version(cfg) == base, field

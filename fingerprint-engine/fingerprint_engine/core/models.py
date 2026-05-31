@@ -53,6 +53,16 @@ _FORMAT_BUMP_FREQ_QUANTIZATION = 1000
 _FORMAT_BUMP_WINDOW_BANK = 2000
 _FORMAT_BUMP_IMAGE_PHASH = 4000
 
+# The FingerprintConfig fields whose NON-default value changes the hash
+# derivation (and therefore effective_format_version). This is the EXPLICIT
+# single source of truth for "which config knobs are hash-changing", co-located
+# with the version logic so the coupling is greppable rather than buried in the
+# body of effective_format_version below. Adding a new hash-changing flag means
+# adding it here AND giving it an offset above; test_models pins that this set
+# matches the fields effective_format_version actually branches on, so a future
+# hash-changing field added without an offset is caught.
+HASH_CHANGING_FIELDS: tuple[str, ...] = ("freq_quantization", "window_bank", "image_mode")
+
 
 def effective_format_version(config: FingerprintConfig) -> int:
     """Return the hash-derivation format version a ``config`` records.
