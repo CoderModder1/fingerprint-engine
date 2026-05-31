@@ -1,111 +1,86 @@
 {
+  "_note": "CURRENT (post-optimization) benchmark, captured 2026-05-29 on the code at HEAD (after d1bbdad batched lookups, ee5c303 server-side offset aggregation, 84d400d stop-hash pruning). Bounded re-run at sizes 200 and 1000 (the original baseline went to 2000). stop_hash pruning is NOT applied here (search measures the unpruned index). Environment: macOS (Darwin 25.x, Apple Silicon arm64), CPython 3.13.13, single-threaded. The superseded pre-optimization 2000-file numbers are preserved in pre-optimization-results.json.",
   "corpus": {
-    "files": 2000,
+    "files": 1000,
     "failures": 0,
-    "total_MB": 34.5,
-    "available_pool": 2000
+    "total_MB": 17.9,
+    "roots": [
+      "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13",
+      "/Users/auto/Desktop/Claude/fingerprint-engine/.venv/lib/python3.13/site-packages"
+    ],
+    "available_pool": 1000
   },
   "fingerprint_pass": {
-    "seconds": 70.96,
-    "files_per_sec": 28.2,
-    "MB_per_sec": 0.49,
-    "total_hashes": 7285108,
-    "avg_hashes_per_file": 3642.6
+    "seconds": 32.95,
+    "files_per_sec": 30.3,
+    "MB_per_sec": 0.54,
+    "total_hashes": 3692225,
+    "avg_hashes_per_file": 3692.2
   },
   "sizes": [
     {
       "corpus_files": 200,
-      "postings": 669002,
-      "snapshot_MB": 16.6,
+      "postings": 666709,
+      "snapshot_MB": 16.5,
       "indexing": {
-        "memory_add_files_per_sec": 103.5,
-        "sqlite_add_files_per_sec": 29.5,
-        "sqlite_db_MB": 119.2
+        "memory_add_files_per_sec": 212.7,
+        "sqlite_add_files_per_sec": 32.4,
+        "sqlite_db_MB": 119.1
       },
       "query_memory": {
         "queries": 50,
-        "mean_ms": 25.047,
-        "p50_ms": 12.006,
-        "p95_ms": 76.76,
-        "max_ms": 209.523,
+        "mean_ms": 26.299,
+        "p50_ms": 13.888,
+        "p95_ms": 78.922,
+        "max_ms": 210.603,
         "recall_at_1": 0.96,
         "mean_self_confidence": 1.0,
-        "mean_best_other_confidence": 0.1847
+        "mean_best_other_confidence": 0.1931
       },
       "query_sqlite": {
         "queries": 50,
-        "mean_ms": 158.091,
-        "p50_ms": 79.202,
-        "p95_ms": 482.552,
-        "max_ms": 1322.516,
+        "mean_ms": 192.351,
+        "p50_ms": 149.624,
+        "p95_ms": 397.573,
+        "max_ms": 816.084,
         "recall_at_1": 0.96,
         "mean_self_confidence": 1.0,
-        "mean_best_other_confidence": 0.1847
+        "mean_best_other_confidence": 0.1931
       }
     },
     {
       "corpus_files": 1000,
-      "postings": 3662479,
-      "snapshot_MB": 91.1,
+      "postings": 3692225,
+      "snapshot_MB": 91.8,
       "indexing": {
-        "memory_add_files_per_sec": 274.1,
-        "sqlite_add_files_per_sec": 9.3,
-        "sqlite_db_MB": 653.1
+        "memory_add_files_per_sec": 305.9,
+        "sqlite_add_files_per_sec": 10.7,
+        "sqlite_db_MB": 660.0
       },
       "query_memory": {
         "queries": 50,
-        "mean_ms": 191.317,
-        "p50_ms": 114.255,
-        "p95_ms": 467.036,
-        "max_ms": 1296.991,
+        "mean_ms": 224.584,
+        "p50_ms": 97.767,
+        "p95_ms": 750.909,
+        "max_ms": 1577.539,
         "recall_at_1": 1.0,
         "mean_self_confidence": 1.0,
-        "mean_best_other_confidence": 0.0528
+        "mean_best_other_confidence": 0.0447
       },
       "query_sqlite": {
         "queries": 50,
-        "mean_ms": 6633.375,
-        "p50_ms": 4070.417,
-        "p95_ms": 20881.109,
-        "max_ms": 35000.6,
+        "mean_ms": 1252.008,
+        "p50_ms": 828.161,
+        "p95_ms": 3130.366,
+        "max_ms": 5132.156,
         "recall_at_1": 1.0,
         "mean_self_confidence": 1.0,
-        "mean_best_other_confidence": 0.0528
-      }
-    },
-    {
-      "corpus_files": 2000,
-      "postings": 7243836,
-      "snapshot_MB": 180.1,
-      "indexing": {
-        "memory_add_files_per_sec": 187.7,
-        "sqlite_add_files_per_sec": 5.6,
-        "sqlite_db_MB": 1294.9
-      },
-      "query_memory": {
-        "queries": 50,
-        "mean_ms": 318.914,
-        "p50_ms": 107.619,
-        "p95_ms": 1068.512,
-        "max_ms": 2118.312,
-        "recall_at_1": 1.0,
-        "mean_self_confidence": 1.0,
-        "mean_best_other_confidence": 0.0391
-      },
-      "query_sqlite": {
-        "queries": 50,
-        "mean_ms": 30696.263,
-        "p50_ms": 9964.833,
-        "p95_ms": 95815.995,
-        "max_ms": 190736.392,
-        "recall_at_1": 1.0,
-        "mean_self_confidence": 1.0,
-        "mean_best_other_confidence": 0.0391
+        "mean_best_other_confidence": 0.0447
       },
       "near_dup_memory": {
         "edited_queries": 30,
         "recall_at_1": 1.0,
-        "mean_confidence": 0.982
+        "mean_confidence": 0.98
       }
     }
   ]

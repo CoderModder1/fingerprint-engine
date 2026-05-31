@@ -1,2 +1,5 @@
 # macOS
 .DS_Store
+
+# PR scratch (untracked by convention; delete once the PR is open)
+/PR_DESCRIPTION.md

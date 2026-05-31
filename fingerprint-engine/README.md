@@ -181,8 +181,14 @@ built at 1024. Two design choices keep that window stable across size changes:
   small fixed window (`default_signal_window = 512`) instead of inheriting the
   audio-tuned 4096 default. So a file and a *truncated copy / excerpt* of it use
   the same window and still match (their hashes are a subset relation), rather
-  than landing on different length-adaptive windows. Audio keeps the 4096 window,
-  which is why a short clip matches its full track at the correct time offset.
+  than landing on different length-adaptive windows. **Audio** fingerprints with
+  a multi-resolution **window bank `(512, 1024, 2048, 4096)` by default** (as of
+  fingerprint format **v2**), so audio excerpt/clip matching works out of the box
+  (recall@1 ~1.0) — the smallest window lets an excerpt align to its parent. This
+  was a known limitation of the former single-window mode (global signal
+  normalisation and the global peak threshold both shift over a sub-segment); the
+  v2 float64-accumulated reductions plus the default bank resolve it, at ~N× the
+  audio postings. See `benchmarks/accuracy.py`, which measures it.
 - **Canonical image normalisation.** Every image is resampled to a fixed
   256×256 grayscale grid before the signal is built, so the *same picture at a
   different resolution* (or after lossy re-encoding) maps to a comparable signal.
@@ -194,6 +200,58 @@ windows globally (useful for experiments; all files then share one window).
 What is **not** supported (and is outside the Shazam model): true geometric or
 time-stretch invariance — e.g. cropping/rotating an image, or time-stretching
 audio — because those change the underlying signal sequence, not just its scale.
+
+## Tuning: opt-in matching settings
+
+The defaults are tuned for exact/near-duplicate detection. **Audio** additionally
+matches excerpts/clips out of the box (a multi-resolution window bank is the
+audio default as of format **v2**). The other matching refinements below ship
+**opt-in and off by default**; enable them per use-case. The numbers are from the
+reproducible harness in `benchmarks/accuracy.py` (run
+`python benchmarks/accuracy.py --mode hard`).
+
+> **Hash compatibility:** settings marked *hash-changing* alter the derived
+> hashes, so an index built with them is **not** comparable to a default index —
+> you must re-index, and the query must use the same setting. The engine stamps a
+> `fingerprint_format_version` and **warns (or raises, with `strict_format=True`)
+> on a query/index format mismatch**, so a mismatch can't silently return wrong
+> matches. Settings marked *search-time* leave hashes untouched (no re-index).
+
+| Goal | Setting | Effect (hard corpus) | Cost / caveat | Kind |
+|------|---------|----------------------|---------------|------|
+| **Audio excerpt / clip matching** | *on by default* (audio uses `default_window_bank=(512,1024,2048,4096)`) | excerpt/clip recall@1 **~1.0** | ~N× more audio hashes/file; included in the v2 default | *default (v2)* |
+| **Window bank for ALL handlers** | `FingerprintConfig(window_bank=(512, 1024, 2048, 4096))` | extends multi-resolution matching to text/binary/etc. (overrides the per-handler audio default globally) | ~N× more hashes/file — up to ~8× for images; index + query must share the bank | *hash-changing* |
+| **Fuzzy / multi-edit text near-dups** | `search(query, offset_tolerance=1)` (or `Calibration(offset_tolerance=1)`) | multi-edit recall 0.83 → 0.90; scatter 0.90 → 0.97 | small, no measured precision loss | *search-time* |
+| **Image resize / crop / rotate robustness** | `FingerprintConfig(image_mode="phash")` | crop/rotate/jpeg recall up vs the raster default | weaker impostor separation — **use a stricter cutoff (~0.2–0.3, not 0.05)** via `Calibration(per_handler={"image_phash": 0.25})` | *hash-changing* |
+| **Bound query cost on a large corpus** | `search(query, candidate_limit=N)` | lossless when `N` ≥ true match set; sub-linear candidate scan | a tight `N` on a dense corpus can drop low-overlap tail matches | *search-time* |
+| Spectral-shift tolerance (niche) | `FingerprintConfig(freq_quantization=2)` | raises confidence on shifted spectra | **net-negative recall + worse precision on general near-dups — not recommended as a blanket setting** | *hash-changing* |
+
+> **pHash is its own handler.** `image_mode="phash"` selects a distinct handler
+> (the raster handler stays the default and claims images under `image_mode="raster"`;
+> the two are mutually exclusive). Fingerprints made in phash mode are labelled
+> `handler="image_phash"`, so the stricter cutoff is keyed on **`"image_phash"`**
+> (not `"image"`) — `Calibration(per_handler={"image_phash": 0.25})` — and the raster
+> `"image"` operating point is untouched. The recommended cutoff is also exposed as
+> `IMAGE_PHASH_RECOMMENDED_MIN_CONFIDENCE` (0.25) / `IMAGE_PHASH_RECOMMENDED_CALIBRATION_KEY`
+> in `fingerprint_engine.handlers.image_phash_handler`.
+
+```python
+# Audio excerpt/clip matching is ON BY DEFAULT (v2) -- no config needed:
+from fingerprint_engine.core.fingerprinter import Fingerprinter
+fingerprinter = Fingerprinter()                 # audio uses its default window bank
+
+# To extend the multi-resolution bank to EVERY handler (text/binary/...), set it
+# globally (re-index required; the query must use the same config):
+from fingerprint_engine.core.models import FingerprintConfig
+global_bank_cfg = FingerprintConfig(window_bank=(512, 1024, 2048, 4096))
+
+# Example: a resize/crop/rotate-tolerant image index using the dedicated pHash
+# handler, with the stricter cutoff it needs keyed on its own handler name.
+from fingerprint_engine.core.models import Calibration
+phash_cfg = FingerprintConfig(image_mode="phash")        # routes images to "image_phash"
+phash_fp = Fingerprinter(phash_cfg)                      # index + queries both use phash_cfg
+calibration = Calibration(per_handler={"image_phash": 0.25})  # stricter cutoff, raster untouched
+```
 
 ## Extension Guide
 
@@ -235,7 +293,15 @@ identically and scores stay comparable:
   use `fakeredis`, no server needed.
 - **`PostgresHashIndex`** — server-grade shared/durable store; postings in an
   indexed table, metadata as `JSONB`. Requires `psycopg` and a running server;
-  integration tests run when `FINGERPRINT_TEST_PG_DSN` is set.
+  the gated integration tests run when `FINGERPRINT_TEST_PG_DSN` is set, which CI
+  does against a live Postgres service container on every push.
+
+All four backends produce **identical** `SearchResult` rankings for the same
+index contents and query (one shared scoring path on the base class). This is
+enforced by cross-backend parity tests — in-memory/SQLite/Redis run everywhere,
+and Postgres parity (search ranking, tie-breaks, `add_many`, snapshot interop,
+the surrogate key, `candidate_limit`, and concurrent access) is proven by the
+`@requires_pg` suite against the live Postgres service in CI.
 
 ```bash
 # CLI: pick a backend with --backend (default: memory)
@@ -267,10 +333,17 @@ Keep `query(hash_code)` returning postings with `file_id`, `hash_code`, and
 
 ## Tests
 
+Install the dev extra (handlers, backends, and the test/lint/type-check tools —
+this is the single source of truth for dev dependencies; there is no
+`requirements.txt`), then run the suite from the repo root:
+
 ```bash
-cd /Users/auto/Desktop/Claude/fingerprint-engine
+pip install -e ".[dev]"
 pytest
 ```
+
+`ruff check .` and `mypy fingerprint_engine` are also part of the dev toolchain
+and are installed by the `[dev]` extra.
 
 ## Benchmark
 

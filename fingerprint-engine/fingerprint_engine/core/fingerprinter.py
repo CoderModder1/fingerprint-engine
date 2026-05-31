@@ -5,18 +5,177 @@ from __future__ import annotations
 import hashlib
 import importlib
 import inspect
+import logging
+import os
 import pkgutil
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterable
+from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 from fingerprint_engine.handlers.base import FileHandler
 
+from .exceptions import FileTooLargeError, MissingDependencyError, NoHandlerError
 from .fft_pipeline import FFTFingerprintPipeline
-from .models import Fingerprint, FingerprintConfig, SearchResult
+from .models import (
+    FORMAT_VERSION_KEY,
+    Fingerprint,
+    FingerprintConfig,
+    SearchResult,
+    effective_format_version,
+)
+
+logger = logging.getLogger(__name__)
+
+# Read files in fixed-size chunks when only the content hash is needed (no
+# fingerprinting), so a large file is never pulled fully into memory just to
+# learn its sha256. 1 MiB balances syscall count against peak memory.
+_SHA_CHUNK_BYTES = 1024 * 1024
+
+
+def expand_paths(
+    paths: Iterable[str | Path],
+    *,
+    errors: list[tuple[str, Exception]] | None = None,
+) -> list[Path]:
+    """Expand a mix of files and directories into a sorted list of regular files.
+
+    Each input path is handled independently and fail-soft:
+
+    * a regular file is kept as-is;
+    * a directory is walked recursively (``os.walk``) and every regular file
+      under it is collected;
+    * anything else (a broken symlink, a path that disappears mid-walk, a
+      special device, or an unreadable directory) is skipped -- recorded in the
+      optional ``errors`` collector as a ``(str(path), exc)`` tuple when one is
+      supplied, otherwise simply dropped.
+
+    The result is de-duplicated by resolved path and sorted, so the same
+    directory tree always expands to the same ordered file list regardless of
+    filesystem iteration order or repeated/overlapping inputs. Symlinks are not
+    followed during the directory walk, which prevents both cycle loops and
+    escaping the tree being ingested.
+
+    A missing top-level path is surfaced as :class:`FileNotFoundError` in
+    ``errors`` (or dropped) rather than raised, so one bad argument never aborts
+    the whole expansion -- matching the fail-soft batch philosophy of
+    :meth:`Fingerprinter.fingerprint_many`.
+    """
+
+    def _record(path_str: str, exc: Exception) -> None:
+        logger.debug("expand_paths skipping %s: %s: %s", path_str, type(exc).__name__, exc)
+        if errors is not None:
+            errors.append((path_str, exc))
+
+    collected: set[Path] = set()
+    for raw in paths:
+        source = Path(raw)
+        try:
+            if source.is_dir():
+                # followlinks=False (default): never traverse symlinked dirs, so
+                # the walk cannot loop on a cycle or escape the tree.
+                for dirpath, _dirnames, filenames in os.walk(source):
+                    base = Path(dirpath)
+                    for name in filenames:
+                        candidate = base / name
+                        if candidate.is_file():
+                            collected.add(candidate)
+            elif source.is_file():
+                collected.add(source)
+            elif not source.exists():
+                _record(str(source), FileNotFoundError(source))
+            else:
+                # Exists but is neither a regular file nor a directory (FIFO,
+                # socket, device, broken symlink target): nothing to fingerprint.
+                _record(str(source), OSError(f"not a regular file or directory: {source}"))
+        except OSError as exc:
+            _record(str(source), exc)
+    return sorted(collected)
+
+
+def file_content_sha256(path: str | Path, *, max_file_size_bytes: int = 0) -> str:
+    """Compute the sha256 hex digest of a file's bytes, read in chunks.
+
+    This is the same digest the fingerprinter stores as ``content_sha256`` /
+    ``file_id`` (``hashlib.sha256`` over the raw file bytes), but computed
+    *without* decoding or fingerprinting -- so incremental ingest can learn a
+    file's identity cheaply and skip files already present in the index.
+
+    ``max_file_size_bytes`` mirrors :attr:`FingerprintConfig.max_file_size_bytes`:
+    when positive, a file larger than the limit raises :class:`FileTooLargeError`.
+    The limit is enforced BOTH up front (from ``stat``) AND as a running byte
+    counter across the chunked read, so a file that grows after the stat -- or
+    whose stat under-reports its readable length -- cannot bypass the cap. 0
+    means unlimited. Non-regular inputs (FIFO/socket/device, or a vanished path)
+    are rejected up front: they report ``st_size == 0`` so the stat-only cap
+    would pass them, and an unbounded read of a FIFO would block forever.
+    """
+
+    source = Path(path)
+    if not source.is_file():
+        raise OSError(f"{source}: not a regular file")
+    if max_file_size_bytes > 0:
+        size = source.stat().st_size
+        if size > max_file_size_bytes:
+            raise FileTooLargeError(
+                f"{source}: file size {size} bytes exceeds max_file_size_bytes "
+                f"limit of {max_file_size_bytes} bytes",
+                size=size,
+                limit=max_file_size_bytes,
+            )
+    digest = hashlib.sha256()
+    read_total = 0
+    with source.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_SHA_CHUNK_BYTES), b""):
+            read_total += len(chunk)
+            if max_file_size_bytes > 0 and read_total > max_file_size_bytes:
+                raise FileTooLargeError(
+                    f"{source}: read {read_total} bytes, exceeding max_file_size_bytes "
+                    f"limit of {max_file_size_bytes} bytes (file grew after stat?)",
+                    size=read_total,
+                    limit=max_file_size_bytes,
+                )
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# Per-worker Fingerprinter, lazily built by ``_process_worker_init`` so the
+# ProcessPoolExecutor reconstructs ONE Fingerprinter per worker process (rather
+# than re-pickling the whole instance for every submitted path). On macOS the
+# default start method is 'spawn', so workers re-import this module and rebuild
+# the Fingerprinter from the picklable (config, handlers_package) pair handed to
+# the initializer -- both are trivially importable/picklable.
+_WORKER_FINGERPRINTER: Fingerprinter | None = None
+
+
+def _process_worker_init(config: FingerprintConfig, handlers_package: str) -> None:
+    """Initializer run once per worker process: build the shared Fingerprinter.
+
+    Holding the Fingerprinter in a module global keeps fingerprinting itself
+    free of any per-task pickling and produces hashes byte-identical to the
+    in-process Fingerprinter (same config, same discovered handlers, same
+    pipeline) -- the worker is a pure relocation of CPU-bound work, not a
+    behavior change.
+    """
+
+    global _WORKER_FINGERPRINTER
+    _WORKER_FINGERPRINTER = Fingerprinter(config=config, handlers_package=handlers_package)
+
+
+def _process_worker_fingerprint(path: str | Path) -> Fingerprint:
+    """Worker entry point: fingerprint one path with the per-worker instance.
+
+    Top-level (module-scope) so it is importable/picklable under the 'spawn'
+    start method. Any exception propagates back through the future exactly as in
+    thread mode, preserving the fail-soft / skip_errors semantics in the caller.
+    """
+
+    if _WORKER_FINGERPRINTER is None:  # pragma: no cover - initializer always runs first
+        raise RuntimeError("process worker was not initialized")
+    return _WORKER_FINGERPRINTER.fingerprint_file(path)
 
 
 class FileProcessor(ABC):
@@ -31,6 +190,10 @@ class FileProcessor(ABC):
         self,
         paths: Iterable[str | Path],
         max_workers: int | None = None,
+        *,
+        skip_errors: bool = True,
+        errors: list[tuple[str, Exception]] | None = None,
+        executor: Literal["thread", "process"] = "thread",
     ) -> list[Fingerprint]:
         """Fingerprint many files."""
 
@@ -45,11 +208,22 @@ class Fingerprinter(FileProcessor):
     ) -> None:
         self.config = config or FingerprintConfig()
         self.config.validate()
+        # The hash-derivation format version this config records (default config
+        # -> the baseline FINGERPRINT_FORMAT_VERSION; an opt-in hash-changing flag
+        # -> a distinct value). Stamped into every Fingerprint.config below so the
+        # format travels with the fingerprint into the index/snapshot. It is a
+        # metadata-only stamp: it is NOT consumed by the FFT pipeline and never
+        # enters a hash payload, so it changes no hash code and no ranking.
+        self._format_version = effective_format_version(self.config)
         self.pipeline = FFTFingerprintPipeline(self.config)
         self.handlers_package = handlers_package
         self.handlers = self.discover_handlers(handlers_package)
         if not self.handlers:
             raise RuntimeError("no file handlers discovered")
+        # Handlers are discovered with no constructor args; push config-derived
+        # per-handler settings (e.g. the PDF page cap) onto them now.
+        for handler in self.handlers:
+            handler.configure(self.config)
         self._handler_pipelines = self._build_handler_pipelines()
 
     def discover_handlers(self, package_name: str) -> list[FileHandler]:
@@ -75,9 +249,16 @@ class Fingerprinter(FileProcessor):
 
         A fixed window keeps a content type's fingerprints comparable across
         files of different lengths, so excerpts/truncations of the same content
-        still align. Applied only under the default config; an explicitly
-        customized window_size/hop_size is honored globally instead (so callers
-        retain full control and the unit tests' explicit windows are unchanged).
+        still align. The per-handler pipeline is therefore built with
+        ``fixed_window=True``: the declared window is *authoritative* and is not
+        shrunk as a function of per-file length (which would shift the time grid
+        and silently break cross-length matching); it only adapts as a last
+        resort for inputs too short to yield a usable frame pair, with a warning.
+
+        Applied only under the default config; an explicitly customized
+        window_size/hop_size is honored globally instead (so callers retain full
+        control, the global ``--window-size`` override stays length-adaptive,
+        and the unit tests' explicit windows are unchanged).
         """
 
         defaults = FingerprintConfig()
@@ -89,12 +270,34 @@ class Fingerprinter(FileProcessor):
         if not using_defaults:
             return pipelines
         for handler in self.handlers:
+            bank = getattr(handler, "default_window_bank", None)
+            if bank and not self.config.window_bank:
+                # Per-handler multi-resolution bank (e.g. audio's excerpt-matching
+                # default), applied only when the caller has not set a GLOBAL
+                # window_bank (which would already govern every handler via the
+                # main pipeline). The bank sub-pipeline folds each window into its
+                # hashes; see FFTFingerprintPipeline.fingerprint_signal.
+                bank = tuple(bank)
+                # The framework's OWN default bank must not be gated by the
+                # caller's max_window_bank_size -- that cap governs CALLER-supplied
+                # global banks. Raise the sub-config's cap to fit the default, so a
+                # caller lowering the knob below the default bank size cannot crash
+                # Fingerprinter construction (it previously failed for ALL types).
+                pipelines[handler.name] = FFTFingerprintPipeline(
+                    replace(
+                        self.config,
+                        window_bank=bank,
+                        max_window_bank_size=max(self.config.max_window_bank_size, len(bank)),
+                    )
+                )
+                continue
             window = getattr(handler, "default_signal_window", None)
             if not window:
                 continue
             hop = getattr(handler, "default_signal_hop", None) or max(1, window // 4)
             pipelines[handler.name] = FFTFingerprintPipeline(
-                replace(self.config, window_size=window, hop_size=hop)
+                replace(self.config, window_size=window, hop_size=hop),
+                fixed_window=True,
             )
         return pipelines
 
@@ -107,15 +310,36 @@ class Fingerprinter(FileProcessor):
         if not source.is_file():
             raise IsADirectoryError(source)
 
+        # Bound the OOM vector from untrusted input: stat the file and reject it
+        # BEFORE read_bytes() pulls the whole thing into memory, so a huge file
+        # never gets loaded. 0 = unlimited (opt-out). See SECURITY.md.
+        limit = self.config.max_file_size_bytes
+        if limit > 0:
+            size = source.stat().st_size
+            if size > limit:
+                raise FileTooLargeError(
+                    f"{source}: file size {size} bytes exceeds max_file_size_bytes "
+                    f"limit of {limit} bytes",
+                    size=size,
+                    limit=limit,
+                )
+
         content = source.read_bytes()
         content_sha256 = hashlib.sha256(content).hexdigest()
         candidates = self._rank_handlers(source, content[:8192])
         errors: list[str] = []
+        top_handler_name = candidates[0][1].name if candidates else None
 
         for _score, handler in candidates:
             try:
                 pipeline = self._handler_pipelines.get(handler.name, self.pipeline)
-                payload = handler.load(source)
+                # Thread the bytes we already read (line above) into the handler
+                # instead of letting it re-open the file. This makes the
+                # fingerprinted bytes provably identical to the ones
+                # content_sha256/file_id/size_bytes describe (closing the
+                # split-read TOCTOU), and means the handler decode is bounded by
+                # the already-size-capped buffer rather than an unbounded re-read.
+                payload = handler.load(source, content=content)
                 signal = handler.to_signal(payload)
                 landmarks, hashes = handler.extract_peaks(signal, pipeline)
                 effective_window, effective_hop = pipeline.effective_params(signal)
@@ -137,31 +361,149 @@ class Fingerprinter(FileProcessor):
                         RuntimeWarning,
                         stacklevel=2,
                     )
+                if handler.name != top_handler_name:
+                    # A higher-ranked candidate was tried first and failed; the
+                    # routing fell back to this one. Surface it so the demotion
+                    # is observable without changing behavior.
+                    logger.info(
+                        "handler %s won for %s after %s higher-ranked candidate(s) failed",
+                        handler.name,
+                        source,
+                        len(errors),
+                    )
+                config = self.config.to_dict()
+                # Stamp the hash-derivation format version alongside the tuning
+                # parameters. Additive: it adds a key, never alters one, so
+                # config["window_size"] etc. and the produced hashes are unchanged.
+                config[FORMAT_VERSION_KEY] = self._format_version
                 return Fingerprint(
                     file_id=content_sha256,
                     path=str(source.resolve()),
                     handler=handler.name,
                     size_bytes=len(content),
                     content_sha256=content_sha256,
-                    config=self.config.to_dict(),
+                    config=config,
                     landmarks=landmarks,
                     hashes=hashes,
                     metadata=metadata,
                 )
+            except MissingDependencyError as exc:
+                # The correct handler exists but its optional dependency is not
+                # installed. Re-raise loudly instead of silently demoting to a
+                # lower-priority handler (e.g. binary), which would produce
+                # fingerprints incomparable to those made with the dependency
+                # installed and silently corrupt the index.
+                logger.warning(
+                    "handler %s for %s is missing optional dependency %s (extra %s)",
+                    handler.name,
+                    source,
+                    exc.package,
+                    exc.extra,
+                )
+                raise
+            except FileTooLargeError:
+                # A hard resource limit tripped INSIDE the handler (the image
+                # decode-bomb pixel cap). Like the pre-read size guard, this is
+                # not a "try the next handler" condition: propagate it so the
+                # fail-soft batch path SKIPS the file instead of silently
+                # demoting it to an incomparable binary fingerprint.
+                raise
             except Exception as exc:
+                logger.debug("handler %s failed for %s: %s", handler.name, source, exc)
                 errors.append(f"{handler.name}: {exc}")
 
-        raise RuntimeError(f"no handler could fingerprint {source}: {'; '.join(errors)}")
+        raise NoHandlerError(f"no handler could fingerprint {source}: {'; '.join(errors)}")
 
     def fingerprint_many(
         self,
         paths: Iterable[str | Path],
         max_workers: int | None = None,
+        *,
+        skip_errors: bool = True,
+        errors: list[tuple[str, Exception]] | None = None,
+        executor: Literal["thread", "process"] = "thread",
     ) -> list[Fingerprint]:
-        """Fingerprint a batch concurrently while preserving input order."""
+        """Fingerprint a batch concurrently while preserving input order.
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            return list(executor.map(self.fingerprint_file, paths))
+        Fail-soft by default (``skip_errors=True``): every path is submitted, the
+        results are gathered in input order, and any failure (missing file,
+        directory, oversized input, no handler, missing dependency, decode error,
+        ...) is skipped -- so one bad file never aborts the batch and the good ones
+        still come back. With ``skip_errors=False`` the legacy behavior is
+        preserved: the first failure propagates.
+
+        Pass ``errors`` to collect failures structurally: each skipped path appends
+        a ``(str(path), exc)`` tuple in input order, letting callers (e.g. the CLI)
+        report ``type``/``message`` without parsing warning text. When no collector
+        is supplied, a :class:`RuntimeWarning` naming the path and error is still
+        emitted for callers that rely on it.
+
+        ``executor`` selects the parallelism strategy and is opt-in:
+
+        * ``"thread"`` (default) -- a :class:`ThreadPoolExecutor`, identical to the
+          previous behavior. Best for I/O-bound batches and the only mode that
+          changes nothing for existing callers.
+        * ``"process"`` -- a :class:`ProcessPoolExecutor`. ``build_hashes`` and the
+          peak extraction are GIL-bound pure Python, so threads barely parallelize
+          CPU-bound fingerprinting; processes give true parallelism. Each worker
+          rebuilds one :class:`Fingerprinter` from this instance's
+          ``(config, handlers_package)`` via :func:`_process_worker_init`, so the
+          produced hashes are byte-identical to thread mode -- only *where* the
+          work runs changes, never the output.
+
+        Order preservation, ``skip_errors`` fail-soft semantics, the ``errors``
+        collector, and the RuntimeWarning fallback are identical across both modes.
+        """
+
+        ordered = list(paths)
+        pool, worker = self._build_executor(executor, max_workers)
+        with pool:
+            futures = [pool.submit(worker, path) for path in ordered]
+            if not skip_errors:
+                return [future.result() for future in futures]
+            results: list[Fingerprint] = []
+            for path, future in zip(ordered, futures, strict=True):
+                try:
+                    results.append(future.result())
+                except Exception as exc:  # noqa: BLE001 - fail-soft: surface and skip
+                    logger.warning(
+                        "skipping %s: %s: %s", path, type(exc).__name__, exc
+                    )
+                    if errors is not None:
+                        errors.append((str(path), exc))
+                    else:
+                        warnings.warn(
+                            f"skipping {path}: {type(exc).__name__}: {exc}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+            return results
+
+    def _build_executor(
+        self,
+        executor: Literal["thread", "process"],
+        max_workers: int | None,
+    ) -> tuple[Executor, Callable[[str | Path], Fingerprint]]:
+        """Resolve the (pool, per-path worker callable) for ``fingerprint_many``.
+
+        The pool is returned unentered so the caller owns its ``with`` block. The
+        worker callable is the *only* difference between modes: thread mode calls
+        this instance's bound ``fingerprint_file`` directly (shared memory); process
+        mode routes through the top-level :func:`_process_worker_fingerprint`, which
+        uses the per-worker Fingerprinter built by the initializer. Both produce the
+        same Fingerprint for the same path.
+        """
+
+        if executor == "thread":
+            return ThreadPoolExecutor(max_workers=max_workers), self.fingerprint_file
+        if executor == "process":
+            pool = ProcessPoolExecutor(
+                max_workers=max_workers,
+                initializer=_process_worker_init,
+                initargs=(self.config, self.handlers_package),
+            )
+            return pool, _process_worker_fingerprint
+        raise ValueError(f"unknown executor {executor!r}; expected 'thread' or 'process'")
 
     def search_file(self, path: str | Path, index, top_k: int = 10) -> list[SearchResult]:
         fingerprint = self.fingerprint_file(path)

@@ -1,0 +1,133 @@
+{
+  "corpus": {
+    "files": 500,
+    "failures": 0,
+    "total_MB": 8.0,
+    "roots": [
+      "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13",
+      "/Users/auto/Desktop/Claude/fingerprint-engine/.venv/lib/python3.13/site-packages"
+    ],
+    "available_pool": 500
+  },
+  "fingerprint_pass": {
+    "seconds": 11.4,
+    "files_per_sec": 43.9,
+    "MB_per_sec": 0.7,
+    "total_hashes": 1604389,
+    "avg_hashes_per_file": 3208.8
+  },
+  "sizes": [
+    {
+      "corpus_files": 200,
+      "postings": 666709,
+      "snapshot_MB": 16.5,
+      "indexing": {
+        "memory_add_files_per_sec": 467.9,
+        "sqlite_add_files_per_sec": 34.7,
+        "sqlite_db_MB": 119.1,
+        "sqlite_ingest": {
+          "submitted_files": 200,
+          "persisted_files": 200,
+          "add_per_file_files_per_sec": 34.7,
+          "add_many_files_per_sec": 103.9,
+          "speedup": 3.0,
+          "add_per_file_db_MB": 119.1,
+          "add_many_db_MB": 119.3
+        }
+      },
+      "query_memory": {
+        "queries": 25,
+        "mean_ms": 32.671,
+        "p50_ms": 13.139,
+        "p95_ms": 79.198,
+        "max_ms": 205.597,
+        "recall_at_1": 1.0,
+        "mean_self_confidence": 1.0,
+        "mean_best_other_confidence": 0.2368
+      },
+      "query_sqlite": {
+        "queries": 25,
+        "mean_ms": 221.222,
+        "p50_ms": 145.601,
+        "p95_ms": 432.458,
+        "max_ms": 788.711,
+        "recall_at_1": 1.0,
+        "mean_self_confidence": 1.0,
+        "mean_best_other_confidence": 0.2368
+      }
+    },
+    {
+      "corpus_files": 500,
+      "postings": 1604389,
+      "snapshot_MB": 39.8,
+      "indexing": {
+        "memory_add_files_per_sec": 463.4,
+        "sqlite_add_files_per_sec": 21.0,
+        "sqlite_db_MB": 286.5,
+        "sqlite_ingest": {
+          "submitted_files": 500,
+          "persisted_files": 500,
+          "add_per_file_files_per_sec": 18.8,
+          "add_many_files_per_sec": 82.0,
+          "speedup": 4.4,
+          "add_per_file_db_MB": 286.5,
+          "add_many_db_MB": 286.5
+        }
+      },
+      "query_memory": {
+        "queries": 25,
+        "mean_ms": 58.357,
+        "p50_ms": 32.475,
+        "p95_ms": 128.949,
+        "max_ms": 252.252,
+        "recall_at_1": 1.0,
+        "mean_self_confidence": 1.0,
+        "mean_best_other_confidence": 0.0285
+      },
+      "query_sqlite": {
+        "queries": 25,
+        "mean_ms": 447.708,
+        "p50_ms": 330.716,
+        "p95_ms": 846.372,
+        "max_ms": 1260.654,
+        "recall_at_1": 1.0,
+        "mean_self_confidence": 1.0,
+        "mean_best_other_confidence": 0.0285
+      },
+      "near_dup_memory": {
+        "edited_queries": 25,
+        "recall_at_1": 1.0,
+        "mean_confidence": 0.984
+      }
+    }
+  ],
+  "fanout_sweep": [
+    {
+      "constellation_fanout": 6,
+      "max_peaks_per_frame": 8,
+      "files": 120,
+      "avg_hashes_per_file": 3724.7,
+      "postings": 446959,
+      "snapshot_MB": 11.11,
+      "recall_at_1": 1.0
+    },
+    {
+      "constellation_fanout": 4,
+      "max_peaks_per_frame": 5,
+      "files": 120,
+      "avg_hashes_per_file": 2193.2,
+      "postings": 263182,
+      "snapshot_MB": 6.57,
+      "recall_at_1": 1.0
+    },
+    {
+      "constellation_fanout": 3,
+      "max_peaks_per_frame": 4,
+      "files": 120,
+      "avg_hashes_per_file": 1455.4,
+      "postings": 174648,
+      "snapshot_MB": 4.39,
+      "recall_at_1": 1.0
+    }
+  ]
+}

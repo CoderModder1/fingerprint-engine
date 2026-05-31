@@ -2,15 +2,43 @@
 
 from __future__ import annotations
 
+import importlib
+import logging
 import mimetypes
 from abc import ABC, abstractmethod
+from io import BytesIO
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import numpy as np
 
+from fingerprint_engine.core.exceptions import MissingDependencyError
 from fingerprint_engine.core.fft_pipeline import FFTFingerprintPipeline
-from fingerprint_engine.core.models import ConstellationHash, LandmarkPoint
+from fingerprint_engine.core.models import ConstellationHash, FingerprintConfig, LandmarkPoint
+
+logger = logging.getLogger(__name__)
+
+
+def require_optional(module: str, *, package: str, extra: str, message: str) -> ModuleType:
+    """Import an optional-dependency module, or fail loud with ``MissingDependencyError``.
+
+    Centralizes the lazy-import-or-fail-loud pattern the dependency-backed handlers
+    share (PDF/image/audio/video): import ``module`` and return it, or -- on
+    ``ImportError`` -- log a warning and raise
+    :class:`MissingDependencyError` (carrying ``package``/``extra``, which
+    :meth:`Fingerprinter.fingerprint_file` reads to fail loudly rather than
+    silently demote to a lower-priority handler). The caller takes the symbol it
+    needs off the returned module (e.g. ``require_optional("pypdf", ...).PdfReader``).
+    ``message`` is the user-visible error text and is passed through verbatim, so
+    each handler keeps its own install hint.
+    """
+
+    try:
+        return importlib.import_module(module)
+    except ImportError as exc:
+        logger.warning("missing optional dependency %s (extra %s): %s", package, extra, message)
+        raise MissingDependencyError(message, package=package, extra=extra) from exc
 
 
 class FileHandler(ABC):
@@ -28,6 +56,14 @@ class FileHandler(ABC):
     # window would shift that grid and break matching). None -> use config.
     default_signal_window: int | None = None
     default_signal_hop: int | None = None
+    # Optional per-handler multi-resolution window bank, applied under the default
+    # config (and only when no global ``FingerprintConfig.window_bank`` is set).
+    # When present, the handler fingerprints the signal once per window in the
+    # bank, folding the window size into each hash so window-w codes only collide
+    # with window-w codes -- recovering the cross-length / excerpt matching a
+    # single fixed window misses, at ~N x the postings. Audio sets this so
+    # excerpt/clip matching works by default. None -> single-window behaviour.
+    default_window_bank: tuple[int, ...] | None = None
 
     @classmethod
     def can_handle(
@@ -36,20 +72,38 @@ class FileHandler(ABC):
         mime_type: str | None = None,
         sample: bytes | None = None,
     ) -> float:
-        """Return a confidence score between 0 and 1."""
+        """Return a confidence score between 0 and 1.
+
+        Every candidate signal (extension, exact MIME, MIME prefix) is scored
+        and the *strongest* one wins. Returning the first match in priority
+        order would let a weak signal (e.g. an extension match, 0.75) mask a
+        stronger one (an exact MIME match, 0.80) on the same file, so the MAX
+        is taken instead. 0.0 means no evidence at all.
+        """
 
         suffix = Path(path).suffix.lower()
+        score = 0.0
         if suffix in cls.supported_extensions:
-            return 0.75
+            score = max(score, 0.75)
         if mime_type and mime_type in cls.supported_mime_types:
-            return 0.80
+            score = max(score, 0.80)
         if mime_type and any(mime_type.startswith(prefix) for prefix in cls.supported_mime_prefixes):
-            return 0.70
-        return 0.0
+            score = max(score, 0.70)
+        return score
 
     @abstractmethod
-    def load(self, path: str | Path) -> Any:
-        """Load a file into handler-specific payload form."""
+    def load(self, path: str | Path, *, content: bytes | None = None) -> Any:
+        """Load a file into handler-specific payload form.
+
+        ``content`` is the file's already-read bytes when the caller has them.
+        :class:`Fingerprinter` reads each file ONCE -- for its content hash and
+        identity (``content_sha256``/``file_id``) -- and threads those exact
+        bytes here, so the bytes that get fingerprinted are provably the same
+        bytes the stored identity describes: no second disk read, and no
+        time-of-check/time-of-use window where a concurrent writer could make the
+        fingerprinted bytes diverge from the recorded digest. ``None`` (the
+        direct/legacy call form) means read from ``path``.
+        """
 
     @abstractmethod
     def to_signal(self, payload: Any) -> np.ndarray:
@@ -69,6 +123,16 @@ class FileHandler(ABC):
 
         return {}
 
+    def configure(self, config: FingerprintConfig) -> None:  # noqa: B027 - intentional optional no-op hook
+        """Apply config-derived per-handler settings. Default is a no-op.
+
+        :class:`Fingerprinter` calls this once on each discovered handler so a
+        handler can pull limits/tuning from the active config -- handlers are
+        discovered and instantiated with no constructor arguments, so this is
+        how a config value (e.g. the PDF page cap) reaches them. Override to
+        read what the handler needs.
+        """
+
     @staticmethod
     def sniff_mime(path: str | Path) -> str | None:
         mime_type, _encoding = mimetypes.guess_type(str(path))
@@ -77,3 +141,28 @@ class FileHandler(ABC):
     @staticmethod
     def read_bytes(path: str | Path) -> bytes:
         return Path(path).read_bytes()
+
+    @staticmethod
+    def read_content(path: str | Path, content: bytes | None) -> bytes:
+        """The single-read contract as one definition: the already-read bytes, or
+        read ``path`` once when ``content`` is ``None``.
+
+        :class:`Fingerprinter` reads each file ONCE and threads those bytes here
+        (so the fingerprinted bytes are provably the bytes the stored identity
+        describes -- no second read, no TOCTOU). Centralizing the idiom keeps that
+        security contract in one place rather than copied into every handler.
+        """
+
+        return content if content is not None else Path(path).read_bytes()
+
+    @staticmethod
+    def content_source(path: str | Path, content: bytes | None) -> BytesIO | str:
+        """A decoder source for path-or-file-like decoders (PIL/PyAV/np.load).
+
+        Returns the already-read bytes wrapped in a :class:`~io.BytesIO` (the
+        single-read path), or the path as a string. Same single-read contract as
+        :meth:`read_content`, but shaped for decoders that take a filename *or* a
+        seekable stream; the bytes are byte-identical either way.
+        """
+
+        return BytesIO(content) if content is not None else str(path)

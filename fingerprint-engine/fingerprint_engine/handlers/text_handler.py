@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import string
 from pathlib import Path
 
 import numpy as np
@@ -79,12 +78,19 @@ class TextFileHandler(FileHandler):
                 return 0.0
         if not text:
             return 0.0
-        printable = sum(1 for char in text if char in string.printable or char.isspace())
+        # Score printability on the DECODED code points, not against the
+        # ASCII-only ``string.printable``. The old ASCII test rejected
+        # accent-dense latin-1 prose (>10% bytes >= 0x80) to the binary handler
+        # even though it is perfectly good text. ``str.isprintable()`` accepts
+        # any printable Unicode scalar and rejects C0/C1 control characters;
+        # ``isspace()`` keeps newlines/tabs (which isprintable() reports False
+        # for) counted as legitimate text.
+        printable = sum(1 for char in text if char.isprintable() or char.isspace())
         ratio = printable / len(text)
         return 0.55 if ratio >= 0.90 else 0.0
 
-    def load(self, path: str | Path) -> str:
-        data = self.read_bytes(path)
+    def load(self, path: str | Path, *, content: bytes | None = None) -> str:
+        data = self.read_content(path, content)
         try:
             return data.decode("utf-8")
         except UnicodeDecodeError:
