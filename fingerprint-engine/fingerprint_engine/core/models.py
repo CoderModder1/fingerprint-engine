@@ -137,6 +137,15 @@ class FingerprintConfig:
     # ``image/*`` files are fingerprinted; it is a per-handler routing switch, not
     # a pipeline parameter, so it is validated for membership only.
     image_mode: Literal["raster", "phash"] = "raster"
+    # Decoded-pixel cap for untrusted images (see SECURITY.md). max_file_size_bytes
+    # bounds the COMPRESSED on-disk size, but a tiny highly-compressible image can
+    # still decode to hundreds of megapixels (a ~160 KB PNG -> ~169 Mpx, ~1.6 GB
+    # RSS) -- the engine must not rely on Pillow's lenient warn-then-error-at-2x
+    # default. The image handler checks width*height against this BEFORE decoding
+    # (Image.open is lazy, so the size is read from the header) and raises
+    # FileTooLargeError when it is exceeded. The default ~89.5 Mpx is Pillow's own
+    # decompression-bomb line, far above any real photo; 0 = unlimited (opt-out).
+    max_image_pixels: int = 89_478_485
 
     def validate(self) -> None:
         if self.window_size < 8:
@@ -199,6 +208,8 @@ class FingerprintConfig:
             raise ValueError("max_file_size_bytes must be non-negative (0 = unlimited)")
         if self.max_pdf_pages < 0:
             raise ValueError("max_pdf_pages must be non-negative (0 = unlimited)")
+        if self.max_image_pixels < 0:
+            raise ValueError("max_image_pixels must be non-negative (0 = unlimited)")
         if self.image_mode not in ("raster", "phash"):
             raise ValueError("image_mode must be 'raster' (default/off) or 'phash'")
 

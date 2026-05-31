@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fingerprint_engine.core.exceptions import MissingDependencyError
+from fingerprint_engine.core.exceptions import FileTooLargeError, MissingDependencyError
 from fingerprint_engine.core.models import FingerprintConfig
 
 from .base import FileHandler
@@ -71,7 +71,7 @@ class ImageFileHandler(FileHandler):
     # serves ``"raster"``; the phash subclass overrides this to ``"phash"``.
     _SERVED_MODE = "raster"
 
-    def __init__(self, image_mode: str = "raster") -> None:
+    def __init__(self, image_mode: str = "raster", max_image_pixels: int | None = None) -> None:
         # ``"raster"`` (the default, and what the no-arg discovery uses) is the
         # byte-identical 1D-signal path; ``"phash"`` switches routing to the
         # opt-in pHash handler. ``configure`` re-reads this from the active
@@ -80,12 +80,20 @@ class ImageFileHandler(FileHandler):
         if image_mode not in ("raster", "phash"):
             raise ValueError("image_mode must be 'raster' (default/off) or 'phash'")
         self.image_mode = image_mode
+        # Decoded-pixel cap (decompression-bomb guard). None -> the config default
+        # so the no-arg discovery construction picks it up; configure() re-reads it.
+        if max_image_pixels is None:
+            max_image_pixels = FingerprintConfig().max_image_pixels
+        if max_image_pixels < 0:
+            raise ValueError("max_image_pixels must be non-negative (0 = unlimited)")
+        self.max_image_pixels = max_image_pixels
 
     def configure(self, config: FingerprintConfig) -> None:
-        # Honor the configured image mode so FingerprintConfig.image_mode (and
-        # any future --image-mode flag) reaches the discovered handler. Default
-        # ("raster") leaves the byte-identical raster path in force.
+        # Honor the configured image mode + pixel cap so FingerprintConfig values
+        # reach the discovered handler (and, via inheritance, the phash handler).
+        # Default ("raster") leaves the byte-identical raster path in force.
         self.image_mode = config.image_mode
+        self.max_image_pixels = config.max_image_pixels
 
     def can_handle(  # type: ignore[override]
         self,
@@ -158,7 +166,22 @@ class ImageFileHandler(FileHandler):
 
         with Image.open(path) as image:
             mode = image.mode
-            original_size = (int(image.width), int(image.height))
+            width, height = int(image.width), int(image.height)
+            original_size = (width, height)
+            # Decompression-bomb guard: Image.open is lazy (the size comes from the
+            # header, no pixels decoded yet), so reject an over-cap image BEFORE
+            # convert/resize pulls hundreds of megapixels into memory. A tiny but
+            # highly-compressible file bypasses the on-disk max_file_size_bytes cap;
+            # this bounds the DECODED footprint instead of trusting Pillow's
+            # lenient default. 0 = unlimited (opt-out).
+            if self.max_image_pixels and width * height > self.max_image_pixels:
+                raise FileTooLargeError(
+                    f"{Path(path).name}: decoded image is {width}x{height} = "
+                    f"{width * height} pixels, exceeding max_image_pixels limit of "
+                    f"{self.max_image_pixels}",
+                    size=width * height,
+                    limit=self.max_image_pixels,
+                )
             resampling = getattr(Image, "Resampling", Image).LANCZOS
             grayscale = image.convert("L").resize(self.canonical_size, resampling)
             pixels = np.asarray(grayscale, dtype=np.float32)

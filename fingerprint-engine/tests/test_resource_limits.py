@@ -199,6 +199,7 @@ def test_batch_emits_warning_when_no_error_collector(
     [
         ({"max_file_size_bytes": -1}, "max_file_size_bytes must be non-negative"),
         ({"max_pdf_pages": -1}, "max_pdf_pages must be non-negative"),
+        ({"max_image_pixels": -1}, "max_image_pixels must be non-negative"),
     ],
 )
 def test_validate_rejects_negative_limits(
@@ -216,4 +217,71 @@ def test_default_limits_are_finite_and_sane() -> None:
     assert config.max_file_size_bytes > 0
     # ...while max_pdf_pages defaults to unlimited (handler enforces it).
     assert config.max_pdf_pages == 0
+    # ...and a finite default pixel cap bounds the image decode-bomb vector.
+    assert config.max_image_pixels == 89_478_485
+    assert config.max_image_pixels > 0
     config.validate()
+
+
+def _write_noise_png(path: Path, size: tuple[int, int]) -> Path:
+    import numpy as np
+    from PIL import Image
+
+    rng = np.random.default_rng(0)
+    arr = rng.integers(0, 256, (size[1], size[0], 3), dtype=np.uint8)
+    Image.fromarray(arr, "RGB").save(path)
+    return path
+
+
+def test_image_over_pixel_cap_raises_and_batch_skips_it(
+    tmp_path: Path, fingerprinter_cls: type[_Fingerprinter]
+) -> None:
+    # B1: a compressed image that decodes past max_image_pixels must be rejected
+    # BEFORE decode (the on-disk size cap cannot see decoded resolution), and the
+    # rejection must FAIL LOUD -- not silently demote to a binary fingerprint.
+    pytest.importorskip("PIL", exc_type=ImportError)
+    path = _write_noise_png(tmp_path / "img.png", (64, 64))  # 4096 px
+
+    config = dataclasses.replace(FingerprintConfig(), max_image_pixels=100)
+    fingerprinter = fingerprinter_cls(config)
+    with pytest.raises(FileTooLargeError) as excinfo:
+        fingerprinter.fingerprint_file(path)
+    assert excinfo.value.size == 4096
+    assert excinfo.value.limit == 100
+
+    # Fail-soft batch SKIPS it (records the error) instead of producing a binary
+    # fingerprint of the same bytes.
+    errors: list[tuple[str, Exception]] = []
+    results = fingerprinter.fingerprint_many([path], errors=errors)
+    assert results == []
+    assert errors and isinstance(errors[0][1], FileTooLargeError)
+
+
+def test_image_under_pixel_cap_fingerprints_as_image(
+    tmp_path: Path, fingerprinter_cls: type[_Fingerprinter]
+) -> None:
+    pytest.importorskip("PIL", exc_type=ImportError)
+    path = _write_noise_png(tmp_path / "img.png", (64, 64))
+
+    # The default cap (~89.5 Mpx) and unlimited (0) both fingerprint a normal image.
+    for cap in (FingerprintConfig().max_image_pixels, 0):
+        fingerprinter = fingerprinter_cls(
+            dataclasses.replace(FingerprintConfig(), max_image_pixels=cap)
+        )
+        assert fingerprinter.fingerprint_file(path).handler == "image"
+
+
+def test_image_pixel_cap_reaches_phash_handler(
+    tmp_path: Path, fingerprinter_cls: type[_Fingerprinter]
+) -> None:
+    # configure() wires the cap to the discovered handler in BOTH image modes,
+    # so the opt-in phash handler (which inherits load()) is guarded too.
+    pytest.importorskip("PIL", exc_type=ImportError)
+    path = _write_noise_png(tmp_path / "img.png", (64, 64))
+
+    config = dataclasses.replace(
+        FingerprintConfig(), image_mode="phash", max_image_pixels=100
+    )
+    fingerprinter = fingerprinter_cls(config)
+    with pytest.raises(FileTooLargeError):
+        fingerprinter.fingerprint_file(path)

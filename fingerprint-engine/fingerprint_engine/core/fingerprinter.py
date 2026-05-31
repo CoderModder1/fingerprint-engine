@@ -359,6 +359,13 @@ class Fingerprinter(FileProcessor):
                     exc.extra,
                 )
                 raise
+            except FileTooLargeError:
+                # A hard resource limit tripped INSIDE the handler (the image
+                # decode-bomb pixel cap). Like the pre-read size guard, this is
+                # not a "try the next handler" condition: propagate it so the
+                # fail-soft batch path SKIPS the file instead of silently
+                # demoting it to an incomparable binary fingerprint.
+                raise
             except Exception as exc:
                 logger.debug("handler %s failed for %s: %s", handler.name, source, exc)
                 errors.append(f"{handler.name}: {exc}")
