@@ -427,8 +427,12 @@ class ArchiveFileHandler(FileHandler):
         # Center in [-1, 1] to sit in the same numeric range as the other
         # handlers' signals before the pipeline's own normalization.
         peak = float(np.max(np.abs(block)))
+        # Return the scaled array directly rather than reassigning ``block``: the
+        # division yields a generically-shaped ndarray, and assigning it back to
+        # the 1-D-typed ``block`` trips the stricter numpy stubs on some
+        # versions (a mypy shape mismatch); behaviour is unchanged.
         if peak > 0.0:
-            block = block / peak
+            return block / peak
         return block
 
     def metadata(self, payload: ArchivePayload) -> dict[str, object]:
