@@ -144,6 +144,11 @@ class ImageFileHandler(FileHandler):
             or sample.startswith(b"GIF87a")
             or sample.startswith(b"GIF89a")
             or sample.startswith(b"BM")
+            # WEBP: "RIFF" <4-byte size> "WEBP". Without this an extension-less /
+            # MIME-less WEBP fell to the binary handler and would not match the
+            # same WEBP fingerprinted with its extension. (.webp is already in
+            # supported_extensions; this covers the content-sniff path.)
+            or (sample.startswith(b"RIFF") and sample[8:12] == b"WEBP")
         ):
             return 0.90
         return 0.0

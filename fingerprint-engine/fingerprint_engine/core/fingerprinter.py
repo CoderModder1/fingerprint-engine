@@ -105,12 +105,18 @@ def file_content_sha256(path: str | Path, *, max_file_size_bytes: int = 0) -> st
     file's identity cheaply and skip files already present in the index.
 
     ``max_file_size_bytes`` mirrors :attr:`FingerprintConfig.max_file_size_bytes`:
-    when positive, a file larger than the limit raises :class:`FileTooLargeError`
-    *before* any bytes are read (the size is taken from ``stat``), bounding the
-    work an oversized/hostile input can trigger. 0 means unlimited.
+    when positive, a file larger than the limit raises :class:`FileTooLargeError`.
+    The limit is enforced BOTH up front (from ``stat``) AND as a running byte
+    counter across the chunked read, so a file that grows after the stat -- or
+    whose stat under-reports its readable length -- cannot bypass the cap. 0
+    means unlimited. Non-regular inputs (FIFO/socket/device, or a vanished path)
+    are rejected up front: they report ``st_size == 0`` so the stat-only cap
+    would pass them, and an unbounded read of a FIFO would block forever.
     """
 
     source = Path(path)
+    if not source.is_file():
+        raise OSError(f"{source}: not a regular file")
     if max_file_size_bytes > 0:
         size = source.stat().st_size
         if size > max_file_size_bytes:
@@ -121,8 +127,17 @@ def file_content_sha256(path: str | Path, *, max_file_size_bytes: int = 0) -> st
                 limit=max_file_size_bytes,
             )
     digest = hashlib.sha256()
+    read_total = 0
     with source.open("rb") as handle:
         for chunk in iter(lambda: handle.read(_SHA_CHUNK_BYTES), b""):
+            read_total += len(chunk)
+            if max_file_size_bytes > 0 and read_total > max_file_size_bytes:
+                raise FileTooLargeError(
+                    f"{source}: read {read_total} bytes, exceeding max_file_size_bytes "
+                    f"limit of {max_file_size_bytes} bytes (file grew after stat?)",
+                    size=read_total,
+                    limit=max_file_size_bytes,
+                )
             digest.update(chunk)
     return digest.hexdigest()
 

@@ -155,7 +155,13 @@ class AudioFileHandler(FileHandler):
         samples = np.asarray(segment.get_array_of_samples(), dtype=np.float32)
         channels = int(segment.channels)
         if channels > 1:
-            samples = samples.reshape((-1, channels)).mean(axis=1)
+            # Truncate to whole frames before de-interleaving: a corrupt/truncated
+            # stream can yield a sample count not divisible by the channel count,
+            # and a bare reshape((-1, channels)) would raise ValueError. Dropping
+            # the trailing partial frame degrades to a best-effort mono signal
+            # instead of failing the whole handler.
+            usable = (samples.size // channels) * channels
+            samples = samples[:usable].reshape((-1, channels)).mean(axis=1)
         max_value = float(1 << (8 * segment.sample_width - 1))
         if max_value > 0:
             samples = samples / max_value

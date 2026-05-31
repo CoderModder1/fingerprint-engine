@@ -271,6 +271,32 @@ def test_image_under_pixel_cap_fingerprints_as_image(
         assert fingerprinter.fingerprint_file(path).handler == "image"
 
 
+def test_file_content_sha256_caps_and_rejects_non_regular(tmp_path: Path) -> None:
+    # B2: the cheap-sha helper used by incremental ingest must enforce the cap on
+    # the bytes (not just trust stat) and reject non-regular inputs (a FIFO/dir
+    # reports st_size==0 and an unbounded read would block forever).
+    import hashlib
+
+    from fingerprint_engine.core.fingerprinter import file_content_sha256
+
+    path = tmp_path / "f.bin"
+    data = b"abc" * 100
+    path.write_bytes(data)
+
+    # Correct digest with no cap and with a cap exactly at the size.
+    assert file_content_sha256(path) == hashlib.sha256(data).hexdigest()
+    assert (
+        file_content_sha256(path, max_file_size_bytes=len(data))
+        == hashlib.sha256(data).hexdigest()
+    )
+    # A file over the cap raises (the stat fast-path).
+    with pytest.raises(FileTooLargeError):
+        file_content_sha256(path, max_file_size_bytes=len(data) - 1)
+    # A non-regular input (a directory) is refused outright.
+    with pytest.raises(OSError):
+        file_content_sha256(tmp_path)
+
+
 def test_image_pixel_cap_reaches_phash_handler(
     tmp_path: Path, fingerprinter_cls: type[_Fingerprinter]
 ) -> None:

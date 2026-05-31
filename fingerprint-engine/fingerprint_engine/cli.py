@@ -300,7 +300,11 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         skipped = [
             {"path": path, "reason": f"{type(exc).__name__}: {exc}"} for path, exc in expand_errors
         ]
-        scanned = len(targets)
+        # `scanned` counts the TRUE input population so the counts block reconciles
+        # (scanned == skipped_existing + newly_indexed + failed). expand_paths
+        # diverts unexpandable arguments (missing/unreadable) into expand_errors,
+        # which are counted in `failed`; including them here keeps the identity.
+        scanned = len(targets) + len(expand_errors)
         skipped_existing = 0
 
         # Incremental ingest: before fingerprinting, drop files whose content is
@@ -354,10 +358,11 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             ],
             "skipped": skipped,
             "counts": {
-                # Every entry in `skipped` is a genuine failure (a bad/unreadable
-                # argument, an un-sha-able file, or a fingerprint error);
-                # already-indexed files are counted in skipped_existing instead
-                # and never appear in `skipped`.
+                # These reconcile exactly: scanned == skipped_existing +
+                # newly_indexed + failed. Every entry in `skipped` is a genuine
+                # failure (a bad/unreadable argument, an un-sha-able file, or a
+                # fingerprint error); already-indexed files are counted in
+                # skipped_existing instead and never appear in `skipped`.
                 "scanned": scanned,
                 "skipped_existing": skipped_existing,
                 "newly_indexed": len(fingerprints),

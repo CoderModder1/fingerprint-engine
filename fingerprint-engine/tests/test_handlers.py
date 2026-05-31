@@ -220,6 +220,18 @@ def test_image_handler_still_accepts_png() -> None:
     assert score > 0.0
 
 
+def test_image_handler_sniffs_webp_without_extension_or_mime() -> None:
+    # B3: an extension-less / MIME-less WEBP (RIFF....WEBP) must be claimed via
+    # the magic-byte sniff, not fall through to the binary handler (which would
+    # not match the same WEBP fingerprinted with its extension present).
+    webp_sample = b"RIFF\x24\x00\x00\x00WEBPVP8 "
+    score = ImageFileHandler().can_handle("noext", mime_type=None, sample=webp_sample)
+    assert score == pytest.approx(0.90)
+    # A RIFF that is NOT WEBP (e.g. a WAV) is not claimed by the image handler.
+    wav_sample = b"RIFF\x24\x00\x00\x00WAVEfmt "
+    assert ImageFileHandler().can_handle("noext", mime_type=None, sample=wav_sample) == 0.0
+
+
 # ---------------------------------------------------------------------------
 # PDF page cap + structural-only warning
 # ---------------------------------------------------------------------------

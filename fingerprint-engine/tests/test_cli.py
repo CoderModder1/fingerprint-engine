@@ -87,6 +87,36 @@ def test_add_skips_bad_path_and_indexes_good(
     assert code2 == 0
     assert json.loads(out2)["file_count"] == 3  # already present; count is stable
 
+    # A8: the counts block reconciles even when an argument fails to expand --
+    # scanned counts the true input population (the failed arg included).
+    counts = payload["counts"]
+    assert counts["scanned"] == counts["skipped_existing"] + counts["newly_indexed"] + counts["failed"]
+    assert counts["scanned"] == 4  # 3 good files + 1 missing
+    assert counts["failed"] == 1
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_add_counts_reconcile_with_incremental(
+    backend: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A8: the identity scanned == skipped_existing + newly_indexed + failed holds
+    # in --incremental mode too, with a good file + a nonexistent argument.
+    good = _write_corpus(tmp_path)
+    base = _backend_argv(backend, tmp_path)
+    # Seed the index so a re-add is counted as skipped_existing.
+    assert _run(base + ["add", str(good[0])], capsys)[0] == 0
+    missing = tmp_path / "ghost.py"
+    code, out, _err = _run(
+        base + ["add", "--incremental", str(good[0]), str(good[1]), str(missing)], capsys
+    )
+    assert code == 0
+    counts = json.loads(out)["counts"]
+    assert counts["scanned"] == counts["skipped_existing"] + counts["newly_indexed"] + counts["failed"]
+    assert counts["scanned"] == 3  # good[0] (existing) + good[1] (new) + missing (failed)
+    assert counts["skipped_existing"] == 1
+    assert counts["newly_indexed"] == 1
+    assert counts["failed"] == 1
+
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_search_self_match(
