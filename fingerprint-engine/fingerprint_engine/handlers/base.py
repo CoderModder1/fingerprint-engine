@@ -28,6 +28,14 @@ class FileHandler(ABC):
     # window would shift that grid and break matching). None -> use config.
     default_signal_window: int | None = None
     default_signal_hop: int | None = None
+    # Optional per-handler multi-resolution window bank, applied under the default
+    # config (and only when no global ``FingerprintConfig.window_bank`` is set).
+    # When present, the handler fingerprints the signal once per window in the
+    # bank, folding the window size into each hash so window-w codes only collide
+    # with window-w codes -- recovering the cross-length / excerpt matching a
+    # single fixed window misses, at ~N x the postings. Audio sets this so
+    # excerpt/clip matching works by default. None -> single-window behaviour.
+    default_window_bank: tuple[int, ...] | None = None
 
     @classmethod
     def can_handle(

@@ -153,19 +153,34 @@ Caveats and guarantees:
   `FingerprintConfig` and the shipped handlers -- is a stable interface. Changing
   it requires re-indexing existing corpora, so it is gated behind a
   **`fingerprint_format_version` bump** and is a **MAJOR** release.
-- Opt-in matching features (for example hash quantization or a multi-window
-  "window bank") are **default-off**. When enabled they change the derived
-  hashes and therefore require re-indexing; introducing such a feature must not
-  alter the default-config hashes (additive, default-preserving), and turning it
-  on is what triggers the future `fingerprint_format_version` bump for indexes
-  built with it. A core-only install (numpy only) and an install with optional
-  handler extras produce the same hashes for the content types they share.
+- Most opt-in matching features (for example hash quantization, or a *global*
+  `window_bank` applied to every handler) are **default-off**: when enabled they
+  change the derived hashes (and bump `effective_format_version` via a per-flag
+  offset) without altering the default-config hashes for callers who leave them
+  off. **Exception (v2):** the *audio* handler now applies a multi-resolution
+  window bank **by default** — a deliberate default-derivation change that was
+  promoted via the v2 `FINGERPRINT_FORMAT_VERSION` bump and a re-index, exactly
+  per the enforcement rule below. A core-only install (numpy only) and an install
+  with optional handler extras produce the same hashes for the content types they
+  share.
 
 #### 4a. `FINGERPRINT_FORMAT_VERSION` — the enforced derivation version
 
 The fingerprint derivation now carries an explicit, machine-checked version,
-implemented as the module constant `FINGERPRINT_FORMAT_VERSION` (currently `1`)
-in `fingerprint_engine/core/models.py`. It is **distinct from the snapshot
+implemented as the module constant `FINGERPRINT_FORMAT_VERSION` (currently `2`)
+in `fingerprint_engine/core/models.py`.
+
+> **v2 (2026-05-31).** The default derivation changed, so a v1 corpus must be
+> re-indexed (the version check below detects a v1 query against a v2 index).
+> Two changes: (1) the signal/spectrogram reductions (`mean`/`std`/`percentile`)
+> now accumulate in **float64** for cross-platform reproducibility — output is
+> identical for the non-audio handlers on real inputs, but it corrects a
+> near-zero-mean signal's normalisation, so **audio** hash codes change; and
+> (2) the **audio** handler now fingerprints with a multi-resolution **window
+> bank by default** (`AudioFileHandler.default_window_bank`), so audio
+> excerpt/clip matching works out of the box at ~N× the audio postings. The
+> seven non-audio handlers are output-identical to v1; only the version *stamp*
+> advances (one version is pinned per index, so the bump is global). It is **distinct from the snapshot
 `schema_version`** (section 1): `schema_version` versions the JSON *container*
 that serializes postings, whereas `FINGERPRINT_FORMAT_VERSION` versions the
 *meaning of the `hash_code` integers* inside it. Two builds can share a snapshot
@@ -246,5 +261,6 @@ old default's, which is exactly the incompatibility the check surfaces.)
       `VERSIONING.md` are current and consistent.
 - [ ] **Accuracy baseline recorded.** The deterministic accuracy harness
       (`benchmarks/accuracy.py` + `tests/test_accuracy.py`) records the shipped
-      recall/precision baseline, including the known audio excerpt/clip-recall
-      limitation, so regressions are detectable.
+      recall/precision baseline. As of v2, audio excerpt/clip recall is part of
+      the *default* baseline (the float64 reductions + the default audio window
+      bank fixed the former limitation), so a regression in it is detectable.

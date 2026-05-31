@@ -270,6 +270,17 @@ class Fingerprinter(FileProcessor):
         if not using_defaults:
             return pipelines
         for handler in self.handlers:
+            bank = getattr(handler, "default_window_bank", None)
+            if bank and not self.config.window_bank:
+                # Per-handler multi-resolution bank (e.g. audio's excerpt-matching
+                # default), applied only when the caller has not set a GLOBAL
+                # window_bank (which would already govern every handler via the
+                # main pipeline). The bank sub-pipeline folds each window into its
+                # hashes; see FFTFingerprintPipeline.fingerprint_signal.
+                pipelines[handler.name] = FFTFingerprintPipeline(
+                    replace(self.config, window_bank=tuple(bank))
+                )
+                continue
             window = getattr(handler, "default_signal_window", None)
             if not window:
                 continue

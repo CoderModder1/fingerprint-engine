@@ -568,3 +568,25 @@ def test_window_bank_effective_params_reports_smallest_window() -> None:
     signal = np.linspace(0.0, 1.0, 16000, dtype=np.float32)
     window, _hop = pipeline.effective_params(signal)
     assert window == 512
+
+
+def test_reductions_accumulate_in_float64_for_cross_platform_determinism() -> None:
+    # v2 determinism fix: normalize_signal's mean/std accumulate in float64, not
+    # float32. float32 reductions drift ~1e-7 with reduction order / SIMD width /
+    # numpy version, which on a near-zero-mean signal (cancellation) shifts the
+    # normalisation enough to flip borderline peaks across platforms. Pin that the
+    # engine centers by the float64 mean/std -- and that this is observable (it
+    # differs from the float32 centering on a moderate-std zero-mean signal).
+    pipe = FFTFingerprintPipeline(FingerprintConfig())
+    rng = np.random.default_rng(0)
+    arr = rng.standard_normal(200_000).astype(np.float32)  # zero-mean, std ~1
+
+    m64 = float(arr.mean(dtype=np.float64))
+    s64 = float(arr.std(dtype=np.float64))
+    expected_f64 = ((arr - m64) / s64).astype(np.float32)
+    assert np.array_equal(pipe.normalize_signal(arr), expected_f64)
+
+    # The fix is observable: float32-accumulated centering would differ.
+    m32, s32 = float(arr.mean()), float(arr.std())
+    expected_f32 = ((arr - m32) / s32).astype(np.float32)
+    assert not np.array_equal(expected_f64, expected_f32)

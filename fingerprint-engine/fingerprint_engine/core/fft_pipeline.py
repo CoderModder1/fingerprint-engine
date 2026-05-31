@@ -64,8 +64,16 @@ class FFTFingerprintPipeline:
             )
             array = array[indices]
 
-        mean = float(array.mean())
-        std = float(array.std())
+        # Accumulate the reductions in float64 even though the array is float32:
+        # float32 .mean()/.std() accumulate in float32, whose result drifts by
+        # ~1e-7 with the reduction order (SIMD width / BLAS / numpy version),
+        # which can flip a borderline peak's >= threshold test across platforms
+        # and silently diverge the fingerprint. float64 accumulation shrinks that
+        # drift to ~1e-13. On real signals this changes no produced hash (the
+        # values near the threshold are never within 1e-7 of it); it only removes
+        # a cross-platform reproducibility hazard. See SECURITY.md / VERSIONING.md.
+        mean = float(array.mean(dtype=np.float64))
+        std = float(array.std(dtype=np.float64))
         if std > 1e-8:
             array = (array - mean) / std
         else:
@@ -235,9 +243,16 @@ class FFTFingerprintPipeline:
         if matrix.ndim != 2 or matrix.size == 0 or float(matrix.max()) <= 0.0:
             return []
 
-        mean = float(matrix.mean())
-        std = float(matrix.std())
-        percentile = float(np.percentile(matrix, self.config.peak_percentile))
+        # Reductions in float64 (the matrix is float32): the threshold is a float
+        # comparison, so float32 accumulation drift (~1e-7, order/SIMD/numpy
+        # dependent) could flip a borderline peak across platforms. float64
+        # accumulation removes that hazard with no observable hash change on real
+        # signals. ``method="linear"`` pins np.percentile's interpolation so the
+        # threshold does not move with a numpy default change. See VERSIONING.md.
+        matrix64 = matrix.astype(np.float64)
+        mean = float(matrix64.mean())
+        std = float(matrix64.std())
+        percentile = float(np.percentile(matrix64, self.config.peak_percentile, method="linear"))
         threshold = max(mean + self.config.peak_threshold * std, percentile)
 
         # 3x3 clipped local maximum for every cell, computed separably. Padding

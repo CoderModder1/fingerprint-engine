@@ -203,38 +203,30 @@ def test_audio_exact_recall_and_separation(tmp_path: Path) -> None:
 _AUDIO_WINDOW_BANK = (512, 1024, 2048, 4096)
 
 
-def test_window_bank_fixes_audio_excerpt_recall(tmp_path: Path) -> None:
+def test_audio_excerpt_recall_works_by_default(tmp_path: Path) -> None:
     pytest.importorskip("scipy", exc_type=ImportError)
-    bank_cfg = FingerprintConfig(window_bank=_AUDIO_WINDOW_BANK)
 
-    # OFF: the documented baseline -- excerpt/clip recall is at the floor.
-    off = evaluate_audio(Fingerprinter(), np.random.default_rng(SEED), AUDIO_CORPUS, tmp_path)
-    off_clip = _mutation(off, "clip_prefix_60pct")["recall_at_1"]
-    off_excerpt = _mutation(off, "excerpt_mid")["recall_at_1"]
+    # v2: the audio handler fingerprints with a multi-resolution window bank BY
+    # DEFAULT, so clip/excerpt matching works out of the box -- no opt-in needed.
+    default = evaluate_audio(Fingerprinter(), np.random.default_rng(SEED), AUDIO_CORPUS, tmp_path)
+    assert _mutation(default, "clip_prefix_60pct")["recall_at_1"] == 1.0
+    assert _mutation(default, "excerpt_mid")["recall_at_1"] == 1.0
 
-    # ON: the same corpus and mutations, fingerprinted at the window bank.
-    on = evaluate_audio(
-        Fingerprinter(config=bank_cfg), np.random.default_rng(SEED), AUDIO_CORPUS, tmp_path
+    # No-regression: exact self-match and the true-vs-impostor separation hold
+    # (the bank adds resolutions, it does not blur identity).
+    assert default.exact_recall_at_1 == 1.0
+    assert default.mean_true_confidence >= 0.5
+    assert default.mean_impostor_confidence < 0.05
+
+    # The bank is genuinely active by default: it ~N-folds postings vs a
+    # single-resolution audio config, so the default carries the documented cost.
+    single = evaluate_audio(
+        Fingerprinter(config=FingerprintConfig(window_bank=(4096,))),
+        np.random.default_rng(SEED),
+        AUDIO_CORPUS,
+        tmp_path,
     )
-    on_clip = _mutation(on, "clip_prefix_60pct")["recall_at_1"]
-    on_excerpt = _mutation(on, "excerpt_mid")["recall_at_1"]
-
-    # The bank must strictly improve at least one excerpt/clip case, and not
-    # regress the other -- the headline result.
-    assert (on_clip > off_clip) or (on_excerpt > off_excerpt)
-    assert on_clip >= off_clip
-    assert on_excerpt >= off_excerpt
-
-    # No-regression guards: exact self-match and the true-vs-impostor separation
-    # must survive the bank (it adds resolutions, it does not blur identity).
-    assert on.exact_recall_at_1 == 1.0
-    assert on.mean_true_confidence >= 0.5
-    assert on.mean_impostor_confidence < 0.05
-
-    # The bank ~N-folds postings (one constellation per window). Confirm the cost
-    # is real and bounded near the bank size, not a free lunch.
-    multiplier = on.avg_hashes_per_file / max(1.0, off.avg_hashes_per_file)
-    assert multiplier > 1.5
+    assert default.avg_hashes_per_file > 1.5 * single.avg_hashes_per_file
 
 
 def test_window_bank_preserves_text_recall(tmp_path: Path) -> None:
@@ -338,20 +330,22 @@ def test_hard_confusability_precision_needs_stricter_cutoff(tmp_path: Path) -> N
     assert rows["freq_quantization:4"]["mean_impostor"] >= default["mean_impostor"]
 
 
-def test_hard_audio_window_bank_recovers_excerpt_recall(tmp_path: Path) -> None:
+def test_audio_window_bank_recall_and_separation_on_hard_corpus(tmp_path: Path) -> None:
     pytest.importorskip("scipy", exc_type=ImportError)
-    # The headline opt-in win: on the hard audio excerpts the default single window
-    # recalls ~0 (whole-signal re-normalisation shifts the fixed-window grid); the
-    # window bank lifts both clip and excerpt recall sharply, at no false-accept
-    # cost on the (distinct) audio corpus.
+    # The audio window bank (now the v2 DEFAULT) recalls hard clip/excerpt
+    # mutations strongly with NO false accepts. NOTE: the v2 float64 reductions
+    # fixed the float32-mean-cancellation that used to floor single-resolution
+    # excerpt recall, so single-resolution is no longer at the floor on these
+    # synthetic corpora -- the bank is the default for real non-stationary audio,
+    # not to clear a synthetic floor. We therefore pin the bank's ABSOLUTE
+    # quality (high recall, clean separation) rather than a delta over single.
     comparisons = {
         c.mutation: c for c in sweep_audio_flags(np.random.default_rng(SEED), HARD_AUDIO_CORPUS, tmp_path)
     }
     for name in ("clip_prefix_60pct", "excerpt_mid"):
         c = comparisons[name]
-        assert c.off_recall < 0.5, f"{name} OFF recall not at the floor: {c.off_recall}"
-        assert c.on_recall > c.off_recall, f"window_bank did not lift {name}: {c.off_recall} -> {c.on_recall}"
         assert c.on_recall >= 0.8, f"window_bank recall too low on {name}: {c.on_recall}"
+        assert c.on_recall >= c.off_recall, f"bank regressed {name}: {c.off_recall} -> {c.on_recall}"
         assert c.on_false_accept == 0.0
 
 

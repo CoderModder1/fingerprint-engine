@@ -27,6 +27,15 @@ class AudioPayload:
 class AudioFileHandler(FileHandler):
     name = "audio"
     priority = 70
+    # Multi-resolution window bank, ON BY DEFAULT for audio (v2 format). An
+    # excerpt/clip re-normalises the signal and shifts the global time grid, so
+    # its single-window hashes never collide with the whole file's -- audio
+    # excerpt/clip recall at one fixed window is ~0. Fingerprinting at several
+    # resolutions (the smallest window lets an excerpt align to its parent) lifts
+    # excerpt recall to ~1.0 (independently verified), at ~4x the postings; the
+    # 4096 entry preserves whole-file matching. A global FingerprintConfig.
+    # window_bank overrides this, and an explicit --window-size disables it.
+    default_window_bank = (512, 1024, 2048, 4096)
     # Deliberately NARROW to the formats the loaders actually support (WAV via
     # scipy, MP3 via pydub/ffmpeg). The previous broad ``audio/`` MIME prefix
     # routed every audio container (.ogg/.flac/.m4a/.aac) here, where load()

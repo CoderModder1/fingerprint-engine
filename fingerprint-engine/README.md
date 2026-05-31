@@ -181,16 +181,14 @@ built at 1024. Two design choices keep that window stable across size changes:
   small fixed window (`default_signal_window = 512`) instead of inheriting the
   audio-tuned 4096 default. So a file and a *truncated copy / excerpt* of it use
   the same window and still match (their hashes are a subset relation), rather
-  than landing on different length-adaptive windows. Audio keeps the 4096 window
-  — but note a short audio *excerpt* does **not** reliably match its full track
-  (global signal normalisation and the global peak threshold both shift when
-  computed over a sub-segment), so audio excerpt/clip matching is a known
-  limitation of the **default single-window mode**, unlike the text/PDF prefix
-  case above. It is **mitigated by the opt-in multi-resolution `window_bank`**
-  config (e.g. `FingerprintConfig(window_bank=(512, 1024, 2048, 4096))`), which
-  raises audio excerpt recall@1 from ~0 to 1.0 at the cost of ~3.4× more hashes
-  per file (index and query indexes must share the same `window_bank`). See
-  `benchmarks/accuracy.py`, which measures both.
+  than landing on different length-adaptive windows. **Audio** fingerprints with
+  a multi-resolution **window bank `(512, 1024, 2048, 4096)` by default** (as of
+  fingerprint format **v2**), so audio excerpt/clip matching works out of the box
+  (recall@1 ~1.0) — the smallest window lets an excerpt align to its parent. This
+  was a known limitation of the former single-window mode (global signal
+  normalisation and the global peak threshold both shift over a sub-segment); the
+  v2 float64-accumulated reductions plus the default bank resolve it, at ~N× the
+  audio postings. See `benchmarks/accuracy.py`, which measures it.
 - **Canonical image normalisation.** Every image is resampled to a fixed
   256×256 grayscale grid before the signal is built, so the *same picture at a
   different resolution* (or after lossy re-encoding) maps to a comparable signal.
@@ -205,11 +203,12 @@ audio — because those change the underlying signal sequence, not just its scal
 
 ## Tuning: opt-in matching settings
 
-The defaults are tuned for exact/near-duplicate detection and are **byte-stable**
-— upgrading the library never changes the hashes you've already indexed. Several
-matching refinements ship **opt-in and off by default**; enable them per
-use-case. The numbers below are from the reproducible harness in
-`benchmarks/accuracy.py` (run `python benchmarks/accuracy.py --mode hard`).
+The defaults are tuned for exact/near-duplicate detection. **Audio** additionally
+matches excerpts/clips out of the box (a multi-resolution window bank is the
+audio default as of format **v2**). The other matching refinements below ship
+**opt-in and off by default**; enable them per use-case. The numbers are from the
+reproducible harness in `benchmarks/accuracy.py` (run
+`python benchmarks/accuracy.py --mode hard`).
 
 > **Hash compatibility:** settings marked *hash-changing* alter the derived
 > hashes, so an index built with them is **not** comparable to a default index —
@@ -220,7 +219,8 @@ use-case. The numbers below are from the reproducible harness in
 
 | Goal | Setting | Effect (hard corpus) | Cost / caveat | Kind |
 |------|---------|----------------------|---------------|------|
-| **Match audio excerpts / clips** | `FingerprintConfig(window_bank=(512, 1024, 2048, 4096))` | excerpt/clip recall@1 **~0 → 1.0** | ~3.4× more hashes/file (sequence) — up to ~8× for images; index + query must share the bank | *hash-changing* |
+| **Audio excerpt / clip matching** | *on by default* (audio uses `default_window_bank=(512,1024,2048,4096)`) | excerpt/clip recall@1 **~1.0** | ~N× more audio hashes/file; included in the v2 default | *default (v2)* |
+| **Window bank for ALL handlers** | `FingerprintConfig(window_bank=(512, 1024, 2048, 4096))` | extends multi-resolution matching to text/binary/etc. (overrides the per-handler audio default globally) | ~N× more hashes/file — up to ~8× for images; index + query must share the bank | *hash-changing* |
 | **Fuzzy / multi-edit text near-dups** | `search(query, offset_tolerance=1)` (or `Calibration(offset_tolerance=1)`) | multi-edit recall 0.83 → 0.90; scatter 0.90 → 0.97 | small, no measured precision loss | *search-time* |
 | **Image resize / crop / rotate robustness** | `FingerprintConfig(image_mode="phash")` | crop/rotate/jpeg recall up vs the raster default | weaker impostor separation — **use a stricter cutoff (~0.2–0.3, not 0.05)** via `Calibration(per_handler={"image_phash": 0.25})` | *hash-changing* |
 | **Bound query cost on a large corpus** | `search(query, candidate_limit=N)` | lossless when `N` ≥ true match set; sub-linear candidate scan | a tight `N` on a dense corpus can drop low-overlap tail matches | *search-time* |
@@ -236,11 +236,14 @@ use-case. The numbers below are from the reproducible harness in
 > in `fingerprint_engine.handlers.image_phash_handler`.
 
 ```python
-# Example: an audio-excerpt-tolerant index (re-index required; query must match).
+# Audio excerpt/clip matching is ON BY DEFAULT (v2) -- no config needed:
 from fingerprint_engine.core.fingerprinter import Fingerprinter
+fingerprinter = Fingerprinter()                 # audio uses its default window bank
+
+# To extend the multi-resolution bank to EVERY handler (text/binary/...), set it
+# globally (re-index required; the query must use the same config):
 from fingerprint_engine.core.models import FingerprintConfig
-audio_cfg = FingerprintConfig(window_bank=(512, 1024, 2048, 4096))
-fingerprinter = Fingerprinter(audio_cfg)        # index + queries both use audio_cfg
+global_bank_cfg = FingerprintConfig(window_bank=(512, 1024, 2048, 4096))
 
 # Example: a resize/crop/rotate-tolerant image index using the dedicated pHash
 # handler, with the stricter cutoff it needs keyed on its own handler name.

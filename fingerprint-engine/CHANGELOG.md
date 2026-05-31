@@ -8,9 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 Tier-1 through Tier-5 hardening: correctness, durability, reliability,
-performance, and the product/operability layer. None of this changes the
-default fingerprint derivation or search ranking -- see `VERSIONING.md` for the
-stability guarantees and the path to 1.0.
+performance, and the product/operability layer. With ONE exception called out
+below (the v2 fingerprint format, which changes audio derivation), none of this
+changes the default fingerprint derivation or search ranking -- see
+`VERSIONING.md` for the stability guarantees and the path to 1.0.
+
+### Changed — BREAKING: fingerprint format v2 (re-index required)
+
+`FINGERPRINT_FORMAT_VERSION` is now `2`. A v1 index must be rebuilt; the
+format-version check detects a v1 query against a v2 index. Two derivation
+changes, both verified to leave the SEVEN non-audio handlers' hash codes
+byte-identical (only the version stamp advances for them) while audio changes:
+
+- **Cross-platform determinism.** The signal/spectrogram reductions
+  (`mean`/`std`/`percentile`) now accumulate in **float64** instead of float32.
+  float32 reductions drift ~1e-7 with reduction order / SIMD width / numpy
+  version, which on a near-zero-mean signal (cancellation) can shift the
+  normalisation and flip a borderline peak across platforms. Output is identical
+  for non-audio handlers on real inputs; it corrects audio's near-zero-mean
+  normalisation (so audio hash codes change). `np.percentile` is pinned to
+  `method="linear"`.
+- **Audio excerpt/clip matching by default.** The audio handler now fingerprints
+  with a multi-resolution window bank `(512, 1024, 2048, 4096)` by default
+  (`AudioFileHandler.default_window_bank`), so excerpt/clip recall works out of
+  the box (previously ~0 at a single window; a documented limitation) at ~N× the
+  audio postings. A global `FingerprintConfig.window_bank` still overrides it and
+  an explicit `--window-size` disables it. (The float64 fix already recovers
+  excerpt recall on stationary audio; the bank is kept on by default for
+  robustness on real non-stationary audio.)
 
 ### Added
 

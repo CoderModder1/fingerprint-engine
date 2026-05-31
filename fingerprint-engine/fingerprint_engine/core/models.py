@@ -25,7 +25,19 @@ from typing import Any, Literal
 # with a default index without flipping any default. The offsets below are the
 # additive per-flag bumps; they are deliberately distinct so a config that
 # enables several flags lands on a value distinct from enabling any one alone.
-FINGERPRINT_FORMAT_VERSION = 1
+# Version 2 (2026-05-31): the default DERIVATION changed in two ways, so a v1
+# corpus must be re-indexed (see VERSIONING.md):
+#   1. signal/spectrogram reductions (mean/std/percentile) now accumulate in
+#      float64 for cross-platform reproducibility (float32 reduction drift could
+#      flip a borderline peak across numpy/BLAS/CPU). Output-identical for
+#      non-audio handlers on real inputs; it shifts a near-zero-mean signal's
+#      normalisation (e.g. audio), which is why audio hash codes change.
+#   2. the audio handler now fingerprints with a multi-resolution window bank by
+#      default (see AudioFileHandler.default_window_bank), so audio excerpt/clip
+#      matching works out of the box. Non-audio handlers are output-identical to
+#      v1; only the version STAMP advances (one version per index, so the bump is
+#      global).
+FINGERPRINT_FORMAT_VERSION = 2
 
 # Key under which the effective format version is recorded in
 # ``Fingerprint.config`` (a metadata-only stamp; it is NOT a tuning parameter,

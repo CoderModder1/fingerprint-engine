@@ -1126,11 +1126,16 @@ def sweep_image_flags(
 def sweep_audio_flags(
     rng: np.random.Generator, size: int, workdir: Path
 ) -> list[FlagComparison]:
-    """OFF (single window) vs ON (window bank) sweep on hard audio excerpts.
+    """Single-resolution vs the multi-resolution window bank on audio excerpts.
 
-    The hard audio mutations are clips/excerpts that re-normalise the whole
-    signal and shift the fixed-window time grid (default recall ~0). A bank of
-    windows lets the query align at whatever window survives the excerpt.
+    OFF is a single-resolution audio fingerprint (window_bank=(4096,)); ON is the
+    multi-resolution bank that is now the audio DEFAULT (v2). NOTE: since the v2
+    float64 reductions fixed the excerpt float32-mean-cancellation artifact,
+    single-resolution audio excerpt recall is no longer at the floor on these
+    synthetic (stationary/segmented) corpora -- both OFF and ON recall well here.
+    The bank is the default for robustness on real non-stationary audio, which
+    these synthetic corpora do not exercise; this sweep mainly reports the
+    storage cost (ON ~Nx the postings) rather than a synthetic recall delta.
     """
 
     import io
@@ -1157,8 +1162,12 @@ def sweep_audio_flags(
 
         return render
 
-    off_index, off_fps, off_waves = _build(FingerprintConfig())
-    off_fp = Fingerprinter()
+    # OFF = single-resolution audio. A global window_bank=(4096,) bypasses the
+    # per-handler audio default bank (see Fingerprinter._build_handler_pipelines)
+    # and fingerprints at one resolution, so this measures single vs multi.
+    single = FingerprintConfig(window_bank=(4096,))
+    off_index, off_fps, off_waves = _build(single)
+    off_fp = Fingerprinter(config=single)
     mutations = [
         ("clip_prefix_60pct", _clip(off_waves, 0.0, 0.6)),
         ("excerpt_mid", _clip(off_waves, 0.2, 0.8)),
