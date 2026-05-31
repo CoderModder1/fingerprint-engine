@@ -164,7 +164,9 @@ def test_audio_load_does_not_hardcode_mp3_format(
 
     path = tmp_path / "clip.mp3"
     path.write_bytes(b"ID3 not really mp3")
-    AudioFileHandler()._load_mp3(path)
+    # _load_mp3 takes the already-read bytes (single-read contract); the public
+    # load() threads them in. from_file must still be called WITHOUT a format kwarg.
+    AudioFileHandler()._load_mp3(path.read_bytes())
 
     assert "format" not in captured["kwargs"]  # type: ignore[operator]
     assert captured["args"] == ()
