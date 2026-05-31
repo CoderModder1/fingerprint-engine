@@ -46,6 +46,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .core.backends import (
+    BACKEND_CHOICES,
+    DEFAULT_POSTGRES_DSN,
+    DEFAULT_REDIS_PREFIX,
+    DEFAULT_REDIS_URL,
+    DEFAULT_SQLITE_PATH,
+    open_backend,
+)
 from .core.dedup import DEFAULT_MIN_CONFIDENCE, find_duplicates
 from .core.exceptions import (
     FileTooLargeError,
@@ -53,13 +61,7 @@ from .core.exceptions import (
     NoHandlerError,
 )
 from .core.fingerprinter import Fingerprinter
-from .core.index import (
-    HashIndex,
-    InMemoryHashIndex,
-    PostgresHashIndex,
-    RedisHashIndex,
-    SQLiteHashIndex,
-)
+from .core.index import HashIndex
 from .core.models import Calibration, Fingerprint, FingerprintConfig
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; never imported at runtime
@@ -117,12 +119,6 @@ ENV_REDIS_URL = "FINGERPRINT_REDIS_URL"
 ENV_REDIS_PREFIX = "FINGERPRINT_REDIS_PREFIX"
 ENV_POSTGRES_DSN = "FINGERPRINT_POSTGRES_DSN"
 
-_DEFAULT_SQLITE_PATH = ".fingerprint_index.sqlite3"
-_DEFAULT_REDIS_URL = "redis://localhost:6379/0"
-_DEFAULT_REDIS_PREFIX = "fpidx"
-_DEFAULT_POSTGRES_DSN = "postgresql://localhost/fingerprint"
-
-
 def build_index(env: dict[str, str] | None = None) -> HashIndex:
     """Construct the index backend selected by the environment.
 
@@ -136,20 +132,19 @@ def build_index(env: dict[str, str] | None = None) -> HashIndex:
 
     source = os.environ if env is None else env
     backend = source.get(ENV_BACKEND, "memory").lower()
-    if backend == "memory":
-        return InMemoryHashIndex()
-    if backend == "sqlite":
-        return SQLiteHashIndex(database=source.get(ENV_SQLITE_PATH, _DEFAULT_SQLITE_PATH))
-    if backend == "redis":
-        return RedisHashIndex(
-            url=source.get(ENV_REDIS_URL, _DEFAULT_REDIS_URL),
-            key_prefix=source.get(ENV_REDIS_PREFIX, _DEFAULT_REDIS_PREFIX),
+    if backend not in BACKEND_CHOICES:
+        raise ValueError(
+            f"unknown {ENV_BACKEND}={backend!r}; expected one of "
+            "'memory', 'sqlite', 'redis', 'postgres'"
         )
-    if backend == "postgres":
-        return PostgresHashIndex(dsn=source.get(ENV_POSTGRES_DSN, _DEFAULT_POSTGRES_DSN))
-    raise ValueError(
-        f"unknown {ENV_BACKEND}={backend!r}; expected one of "
-        "'memory', 'sqlite', 'redis', 'postgres'"
+    # The service's memory backend starts fresh (no memory_path), unlike the CLI
+    # which loads from --index-path; the connection settings come from the env.
+    return open_backend(
+        backend,
+        sqlite_path=source.get(ENV_SQLITE_PATH, DEFAULT_SQLITE_PATH),
+        redis_url=source.get(ENV_REDIS_URL, DEFAULT_REDIS_URL),
+        redis_prefix=source.get(ENV_REDIS_PREFIX, DEFAULT_REDIS_PREFIX),
+        postgres_dsn=source.get(ENV_POSTGRES_DSN, DEFAULT_POSTGRES_DSN),
     )
 
 

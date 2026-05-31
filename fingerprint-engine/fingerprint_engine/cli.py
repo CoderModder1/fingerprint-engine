@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import Any
 
 from fingerprint_engine import __version__
+from fingerprint_engine.core.backends import (
+    DEFAULT_POSTGRES_DSN,
+    DEFAULT_REDIS_PREFIX,
+    DEFAULT_REDIS_URL,
+    DEFAULT_SQLITE_PATH,
+    open_backend,
+)
 from fingerprint_engine.core.dedup import DEFAULT_MIN_CONFIDENCE, find_duplicates
 from fingerprint_engine.core.exceptions import (
     FileTooLargeError,
@@ -23,13 +30,7 @@ from fingerprint_engine.core.fingerprinter import (
     expand_paths,
     file_content_sha256,
 )
-from fingerprint_engine.core.index import (
-    HashIndex,
-    InMemoryHashIndex,
-    PostgresHashIndex,
-    RedisHashIndex,
-    SQLiteHashIndex,
-)
+from fingerprint_engine.core.index import HashIndex
 from fingerprint_engine.core.models import Calibration, Fingerprint, FingerprintConfig
 
 DEFAULT_INDEX_PATH = Path(__file__).with_name(".fingerprint_index.json")
@@ -55,13 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="cap PDF pages decoded per file (0 = unlimited)")
     parser.add_argument("--backend", choices=("memory", "redis", "sqlite", "postgres"),
                         default="memory", help="index backend (default: memory)")
-    parser.add_argument("--redis-url", default="redis://localhost:6379/0",
+    parser.add_argument("--redis-url", default=DEFAULT_REDIS_URL,
                         help="Redis connection URL (used when --backend redis)")
-    parser.add_argument("--redis-prefix", default="fpidx",
+    parser.add_argument("--redis-prefix", default=DEFAULT_REDIS_PREFIX,
                         help="Redis key namespace (used when --backend redis)")
-    parser.add_argument("--sqlite-path", default=".fingerprint_index.sqlite3",
+    parser.add_argument("--sqlite-path", default=DEFAULT_SQLITE_PATH,
                         help="SQLite database path (used when --backend sqlite)")
-    parser.add_argument("--postgres-dsn", default="postgresql://localhost/fingerprint",
+    parser.add_argument("--postgres-dsn", default=DEFAULT_POSTGRES_DSN,
                         help="PostgreSQL connection string (used when --backend postgres)")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -136,14 +137,16 @@ def open_index(args: argparse.Namespace) -> HashIndex:
     """Open the index for the selected backend. Memory loads from --index-path;
     Redis/SQLite connect to a live, already-persistent store."""
 
-    backend = getattr(args, "backend", "memory")
-    if backend == "redis":
-        return RedisHashIndex(url=args.redis_url, key_prefix=args.redis_prefix)
-    if backend == "sqlite":
-        return SQLiteHashIndex(database=args.sqlite_path)
-    if backend == "postgres":
-        return PostgresHashIndex(dsn=args.postgres_dsn)
-    return InMemoryHashIndex.load(Path(args.index_path))
+    # memory_path is always passed, so the memory backend LOADS from --index-path
+    # (the CLI's persistent-file behaviour); the service passes none and is fresh.
+    return open_backend(
+        getattr(args, "backend", "memory"),
+        sqlite_path=args.sqlite_path,
+        redis_url=args.redis_url,
+        redis_prefix=args.redis_prefix,
+        postgres_dsn=args.postgres_dsn,
+        memory_path=args.index_path,
+    )
 
 
 def index_location(args: argparse.Namespace) -> str:
