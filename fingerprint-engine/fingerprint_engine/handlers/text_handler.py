@@ -89,8 +89,8 @@ class TextFileHandler(FileHandler):
         ratio = printable / len(text)
         return 0.55 if ratio >= 0.90 else 0.0
 
-    def load(self, path: str | Path) -> str:
-        data = self.read_bytes(path)
+    def load(self, path: str | Path, *, content: bytes | None = None) -> str:
+        data = content if content is not None else self.read_bytes(path)
         try:
             return data.decode("utf-8")
         except UnicodeDecodeError:

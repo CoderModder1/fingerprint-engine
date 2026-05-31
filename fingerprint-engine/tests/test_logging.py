@@ -34,7 +34,7 @@ def test_handler_failure_emits_debug_record(
     fingerprinter = Fingerprinter(FingerprintConfig())
     image_handler = next(h for h in fingerprinter.handlers if h.name == "image")
 
-    def _raise_decode(_path: Path) -> object:
+    def _raise_decode(_path: Path, *, content: bytes | None = None) -> object:
         raise ValueError("cannot decode image content")
 
     monkeypatch.setattr(image_handler, "load", _raise_decode)
@@ -69,7 +69,7 @@ def test_missing_dependency_emits_warning_record(
     fingerprinter = Fingerprinter(FingerprintConfig())
     image_handler = next(h for h in fingerprinter.handlers if h.name == "image")
 
-    def _raise_missing(_path: Path) -> object:
+    def _raise_missing(_path: Path, *, content: bytes | None = None) -> object:
         raise MissingDependencyError(
             "Pillow is required for image fingerprinting",
             package="Pillow",

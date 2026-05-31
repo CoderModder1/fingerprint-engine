@@ -56,8 +56,18 @@ class FileHandler(ABC):
         return score
 
     @abstractmethod
-    def load(self, path: str | Path) -> Any:
-        """Load a file into handler-specific payload form."""
+    def load(self, path: str | Path, *, content: bytes | None = None) -> Any:
+        """Load a file into handler-specific payload form.
+
+        ``content`` is the file's already-read bytes when the caller has them.
+        :class:`Fingerprinter` reads each file ONCE -- for its content hash and
+        identity (``content_sha256``/``file_id``) -- and threads those exact
+        bytes here, so the bytes that get fingerprinted are provably the same
+        bytes the stored identity describes: no second disk read, and no
+        time-of-check/time-of-use window where a concurrent writer could make the
+        fingerprinted bytes diverge from the recorded digest. ``None`` (the
+        direct/legacy call form) means read from ``path``.
+        """
 
     @abstractmethod
     def to_signal(self, payload: Any) -> np.ndarray:

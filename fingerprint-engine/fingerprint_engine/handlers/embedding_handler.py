@@ -64,6 +64,7 @@ import json
 import logging
 import threading
 from dataclasses import dataclass, replace
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -187,18 +188,18 @@ class EmbeddingFileHandler(FileHandler):
             return 0.80
         return 0.70  # .jsonl
 
-    def load(self, path: str | Path) -> EmbeddingPayload:
+    def load(self, path: str | Path, *, content: bytes | None = None) -> EmbeddingPayload:
         source = Path(path)
         suffix = source.suffix.lower()
 
         if self.embedder is not None:
-            vectors = self._embed_with_plugin(source)
+            vectors = self._embed_with_plugin(source, content)
             origin = f"embedder:{type(self.embedder).__name__}"
         elif suffix in {".npy", ".npz"}:
-            vectors = self._load_npy(source)
+            vectors = self._load_npy(source, content)
             origin = "precomputed_npy"
         elif suffix == ".jsonl":
-            vectors = self._load_jsonl(source)
+            vectors = self._load_jsonl(source, content)
             origin = "precomputed_jsonl"
         else:  # pragma: no cover - guarded by can_handle
             raise MissingDependencyError(
@@ -211,7 +212,7 @@ class EmbeddingFileHandler(FileHandler):
         self._tls.signal_window = dim
         return EmbeddingPayload(vectors=matrix, num_vectors=num_vectors, dim=dim, source=origin)
 
-    def _embed_with_plugin(self, path: Path) -> np.ndarray:
+    def _embed_with_plugin(self, path: Path, content: bytes | None = None) -> np.ndarray:
         """Run the injected embedder, lazily importing nothing ourselves.
 
         The embedder may itself lazily import a heavy runtime (e.g.
@@ -222,7 +223,8 @@ class EmbeddingFileHandler(FileHandler):
 
         try:
             assert self.embedder is not None
-            result = self.embedder.embed(self.read_bytes(path))
+            raw = content if content is not None else self.read_bytes(path)
+            result = self.embedder.embed(raw)
         except ImportError as exc:
             raise MissingDependencyError(
                 "the configured embedder requires an optional model runtime; install with "
@@ -232,10 +234,12 @@ class EmbeddingFileHandler(FileHandler):
         return np.asarray(result, dtype=np.float64)
 
     @staticmethod
-    def _load_npy(path: Path) -> np.ndarray:
+    def _load_npy(path: Path, content: bytes | None = None) -> np.ndarray:
         # numpy is a core dependency, so the precomputed path needs no extra.
         # ``allow_pickle=False`` keeps deserialization safe on untrusted inputs.
-        loaded = np.load(path, allow_pickle=False)
+        # np.load reads identical bytes from a BytesIO as from the path.
+        source: Path | BytesIO = BytesIO(content) if content is not None else path
+        loaded = np.load(source, allow_pickle=False)
         if isinstance(loaded, np.lib.npyio.NpzFile):
             try:
                 array = loaded[loaded.files[0]]
@@ -245,9 +249,12 @@ class EmbeddingFileHandler(FileHandler):
         return np.asarray(loaded, dtype=np.float64)
 
     @staticmethod
-    def _load_jsonl(path: Path) -> np.ndarray:
+    def _load_jsonl(path: Path, content: bytes | None = None) -> np.ndarray:
+        # Iterate lines from the already-read bytes (single-read path) or the
+        # file; StringIO yields the same per-line splits a file handle does.
+        text = content.decode("utf-8") if content is not None else path.read_text(encoding="utf-8")
         rows: list[list[float]] = []
-        with path.open("r", encoding="utf-8") as handle:
+        with StringIO(text) as handle:
             for line in handle:
                 line = line.strip()
                 if not line:

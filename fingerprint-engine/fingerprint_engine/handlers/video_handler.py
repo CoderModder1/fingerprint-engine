@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -165,7 +166,7 @@ class VideoFileHandler(FileHandler):
             return True
         return False
 
-    def load(self, path: str | Path) -> VideoPayload:
+    def load(self, path: str | Path, *, content: bytes | None = None) -> VideoPayload:
         """Decode keyframes at a fixed cadence into canonical grayscale grids.
 
         The video decoder (``av``, i.e. PyAV/ffmpeg) is imported LAZILY here so a
@@ -210,7 +211,10 @@ class VideoFileHandler(FileHandler):
         frame_count = 0
         duration_seconds = 0.0
 
-        with av.open(str(path)) as container:
+        # Decode from the already-read bytes when provided (single-read path);
+        # PyAV reads identical frames from a seekable BytesIO as from the path.
+        video_source = BytesIO(content) if content is not None else str(path)
+        with av.open(video_source, mode="r") as container:
             stream = next((s for s in container.streams if s.type == "video"), None)
             if stream is None:
                 raise MissingDependencyError(

@@ -224,9 +224,9 @@ class ArchiveFileHandler(FileHandler):
         # this handler rather than relying on the base no-op.
         return
 
-    def load(self, path: str | Path) -> ArchivePayload:
+    def load(self, path: str | Path, *, content: bytes | None = None) -> ArchivePayload:
         source = Path(path)
-        data = self.read_bytes(source)
+        data = content if content is not None else self.read_bytes(source)
         archive_type = self._classify(source, data)
         if archive_type == "zip":
             members, truncated = self._read_zip(data)

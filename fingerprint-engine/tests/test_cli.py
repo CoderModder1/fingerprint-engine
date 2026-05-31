@@ -175,7 +175,7 @@ def test_missing_dependency_exits_3(
         real_init(self, *args, **kwargs)
         for handler in self.handlers:
 
-            def _raise(_path: object, _h: object = handler) -> object:
+            def _raise(_path: object, *, content: bytes | None = None, _h: object = handler) -> object:
                 raise MissingDependencyError(
                     "Pillow is required for image fingerprinting",
                     package="Pillow",

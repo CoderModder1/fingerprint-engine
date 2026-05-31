@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -153,7 +154,7 @@ class ImageFileHandler(FileHandler):
             return 0.90
         return 0.0
 
-    def load(self, path: str | Path) -> ImagePayload:
+    def load(self, path: str | Path, *, content: bytes | None = None) -> ImagePayload:
         try:
             from PIL import Image
         except ImportError as exc:
@@ -169,7 +170,11 @@ class ImageFileHandler(FileHandler):
                 extra="image",
             ) from exc
 
-        with Image.open(path) as image:
+        # Decode from the already-read bytes when provided (single-read path);
+        # PIL sniffs the format from the content, so a BytesIO decodes identically
+        # to opening the path. None -> open the path directly (legacy form).
+        source = BytesIO(content) if content is not None else path
+        with Image.open(source) as image:
             mode = image.mode
             width, height = int(image.width), int(image.height)
             original_size = (width, height)

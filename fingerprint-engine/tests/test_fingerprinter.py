@@ -325,7 +325,7 @@ def test_missing_dependency_does_not_fall_back_to_binary(
 
     image_handler = next(h for h in fingerprinter.handlers if h.name == "image")
 
-    def _raise_missing(_path: Path) -> object:
+    def _raise_missing(_path: Path, *, content: bytes | None = None) -> object:
         raise MissingDependencyError(
             "Pillow is required for image fingerprinting",
             package="Pillow",
@@ -352,7 +352,7 @@ def test_decode_error_falls_through_to_other_handlers(
     fingerprinter = Fingerprinter(FingerprintConfig())
     image_handler = next(h for h in fingerprinter.handlers if h.name == "image")
 
-    def _raise_decode(_path: Path) -> object:
+    def _raise_decode(_path: Path, *, content: bytes | None = None) -> object:
         raise ValueError("cannot decode image content")
 
     monkeypatch.setattr(image_handler, "load", _raise_decode)
@@ -373,7 +373,7 @@ def test_no_handler_error_when_all_candidates_fail(
 
     fingerprinter = Fingerprinter(FingerprintConfig())
 
-    def _raise_decode(_self: object, _path: Path) -> object:
+    def _raise_decode(_self: object, _path: Path, *, content: bytes | None = None) -> object:
         raise ValueError("cannot decode")
 
     for handler in fingerprinter.handlers:
@@ -540,3 +540,73 @@ def test_fingerprinter_is_picklable() -> None:
     assert [h.name for h in restored.handlers] == [h.name for h in fingerprinter.handlers]
     assert restored.config == fingerprinter.config
     assert restored.handlers_package == fingerprinter.handlers_package
+
+
+# ---------------------------------------------------------------------------
+# A1: single-read pipeline -- the fingerprinted bytes ARE the identity bytes,
+# and decoding from the threaded buffer matches decoding from disk.
+# ---------------------------------------------------------------------------
+
+
+def test_fingerprint_file_threads_read_bytes_into_handler(tmp_path: Path) -> None:
+    # The fingerprinter reads the file ONCE and hands those exact bytes to the
+    # handler, so content_sha256/file_id describe the SAME bytes that were
+    # fingerprinted -- no second disk read, no time-of-check/time-of-use window.
+    import hashlib
+
+    fingerprinter = Fingerprinter(FingerprintConfig())
+    path = tmp_path / "x.py"
+    data = ("print('hi')\n" * 64).encode("utf-8")
+    path.write_bytes(data)
+
+    text_handler = next(h for h in fingerprinter.handlers if h.name == "text")
+    seen: dict[str, object] = {}
+    real_load = text_handler.load
+
+    def spy(p: object, *, content: bytes | None = None) -> object:
+        seen["content"] = content
+        return real_load(p, content=content)
+
+    text_handler.load = spy  # type: ignore[method-assign]
+    result = fingerprinter.fingerprint_file(path)
+
+    assert seen["content"] == data  # the handler received the exact file bytes
+    assert result.content_sha256 == hashlib.sha256(data).hexdigest()
+    # The stored identity is the digest of EXACTLY the bytes that were fingerprinted.
+    assert result.content_sha256 == hashlib.sha256(seen["content"]).hexdigest()
+
+
+def test_handler_load_disk_and_bytes_paths_agree(tmp_path: Path) -> None:
+    # Decoding from the threaded bytes (the production single-read path) must be
+    # byte-identical to opening the path (the legacy form), for every routed
+    # handler -- this is the invariant the A1 refactor rests on.
+    fingerprinter = Fingerprinter(FingerprintConfig())
+
+    cases: list[Path] = []
+    text = tmp_path / "a.py"
+    text.write_text("def f():\n    return 1\n" * 30, encoding="utf-8")
+    cases.append(text)
+    blob = tmp_path / "a.bin"
+    blob.write_bytes(bytes(range(256)) * 16)
+    cases.append(blob)
+    try:  # image path only when Pillow is installed
+        import numpy as np
+        from PIL import Image
+
+        img = tmp_path / "a.png"
+        rng = np.random.default_rng(7)
+        Image.fromarray(rng.integers(0, 256, (60, 80, 3), dtype=np.uint8), "RGB").save(img)
+        cases.append(img)
+    except ImportError:
+        pass
+
+    for path in cases:
+        content = path.read_bytes()
+        candidates = fingerprinter._rank_handlers(path, content[:8192])
+        _score, handler = candidates[0]
+        pipeline = fingerprinter._handler_pipelines.get(handler.name, fingerprinter.pipeline)
+        _l1, from_disk = handler.extract_peaks(handler.to_signal(handler.load(path)), pipeline)
+        _l2, from_bytes = handler.extract_peaks(
+            handler.to_signal(handler.load(path, content=content)), pipeline
+        )
+        assert [h.hash_code for h in from_disk] == [h.hash_code for h in from_bytes], path.name

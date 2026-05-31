@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -63,17 +64,21 @@ class AudioFileHandler(FileHandler):
             return 0.90
         return 0.0
 
-    def load(self, path: str | Path) -> AudioPayload:
+    def load(self, path: str | Path, *, content: bytes | None = None) -> AudioPayload:
+        # Decode from the already-read bytes when provided (single-read path); the
+        # decoders parse identical bytes from a BytesIO. suffix still comes from
+        # the path so wav/mp3 routing is unchanged. None -> read the path.
+        raw = content if content is not None else self.read_bytes(path)
         suffix = Path(path).suffix.lower()
         if suffix in {".wav", ".wave"}:
-            return self._load_wav(path)
+            return self._load_wav(raw)
         if suffix == ".mp3":
-            return self._load_mp3(path)
+            return self._load_mp3(raw)
 
         try:
-            return self._load_wav(path)
+            return self._load_wav(raw)
         except Exception:
-            return self._load_mp3(path)
+            return self._load_mp3(raw)
 
     def to_signal(self, payload: AudioPayload) -> np.ndarray:
         return np.asarray(payload.samples, dtype=np.float32)
@@ -90,7 +95,7 @@ class AudioFileHandler(FileHandler):
         }
 
     @staticmethod
-    def _load_wav(path: str | Path) -> AudioPayload:
+    def _load_wav(raw: bytes) -> AudioPayload:
         try:
             from scipy.io import wavfile
         except ImportError as exc:
@@ -106,7 +111,7 @@ class AudioFileHandler(FileHandler):
                 extra="audio",
             ) from exc
 
-        sample_rate, data = wavfile.read(path)
+        sample_rate, data = wavfile.read(BytesIO(raw))
         array = np.asarray(data)
         channels = int(array.shape[1]) if array.ndim > 1 else 1
         if array.ndim > 1:
@@ -131,7 +136,7 @@ class AudioFileHandler(FileHandler):
         )
 
     @staticmethod
-    def _load_mp3(path: str | Path) -> AudioPayload:
+    def _load_mp3(raw: bytes) -> AudioPayload:
         try:
             from pydub import AudioSegment
         except ImportError as exc:
@@ -151,7 +156,9 @@ class AudioFileHandler(FileHandler):
         # previous force-decode-as-mp3 turned any non-MP3 input routed here into
         # garbage; letting ffmpeg detect the format keeps a genuinely-MP3 file
         # decoding correctly while a mislabeled one fails cleanly instead.
-        segment = AudioSegment.from_file(path)
+        # from_file accepts a file-like; pydub spools it to a temp for ffmpeg, so
+        # the same bytes are decoded whether they came from disk or the buffer.
+        segment = AudioSegment.from_file(BytesIO(raw))
         samples = np.asarray(segment.get_array_of_samples(), dtype=np.float32)
         channels = int(segment.channels)
         if channels > 1:

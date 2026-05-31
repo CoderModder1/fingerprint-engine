@@ -59,8 +59,8 @@ class PDFFileHandler(FileHandler):
             return 0.95
         return 0.0
 
-    def load(self, path: str | Path) -> PDFPayload:
-        data = self.read_bytes(path)
+    def load(self, path: str | Path, *, content: bytes | None = None) -> PDFPayload:
+        data = content if content is not None else self.read_bytes(path)
         try:
             from pypdf import PdfReader
         except ImportError as exc:

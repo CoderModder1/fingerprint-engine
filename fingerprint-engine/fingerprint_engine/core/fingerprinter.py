@@ -312,7 +312,13 @@ class Fingerprinter(FileProcessor):
         for _score, handler in candidates:
             try:
                 pipeline = self._handler_pipelines.get(handler.name, self.pipeline)
-                payload = handler.load(source)
+                # Thread the bytes we already read (line above) into the handler
+                # instead of letting it re-open the file. This makes the
+                # fingerprinted bytes provably identical to the ones
+                # content_sha256/file_id/size_bytes describe (closing the
+                # split-read TOCTOU), and means the handler decode is bounded by
+                # the already-size-capped buffer rather than an unbounded re-read.
+                payload = handler.load(source, content=content)
                 signal = handler.to_signal(payload)
                 landmarks, hashes = handler.extract_peaks(signal, pipeline)
                 effective_window, effective_hop = pipeline.effective_params(signal)
