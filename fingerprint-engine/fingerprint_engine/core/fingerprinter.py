@@ -277,8 +277,18 @@ class Fingerprinter(FileProcessor):
                 # window_bank (which would already govern every handler via the
                 # main pipeline). The bank sub-pipeline folds each window into its
                 # hashes; see FFTFingerprintPipeline.fingerprint_signal.
+                bank = tuple(bank)
+                # The framework's OWN default bank must not be gated by the
+                # caller's max_window_bank_size -- that cap governs CALLER-supplied
+                # global banks. Raise the sub-config's cap to fit the default, so a
+                # caller lowering the knob below the default bank size cannot crash
+                # Fingerprinter construction (it previously failed for ALL types).
                 pipelines[handler.name] = FFTFingerprintPipeline(
-                    replace(self.config, window_bank=tuple(bank))
+                    replace(
+                        self.config,
+                        window_bank=bank,
+                        max_window_bank_size=max(self.config.max_window_bank_size, len(bank)),
+                    )
                 )
                 continue
             window = getattr(handler, "default_signal_window", None)

@@ -610,3 +610,15 @@ def test_handler_load_disk_and_bytes_paths_agree(tmp_path: Path) -> None:
             handler.to_signal(handler.load(path, content=content)), pipeline
         )
         assert [h.hash_code for h in from_disk] == [h.hash_code for h in from_bytes], path.name
+
+
+def test_low_max_window_bank_size_does_not_crash_construction() -> None:
+    # Regression (v2 review): the per-handler default audio bank (4 windows) must
+    # not be gated by the caller's max_window_bank_size -- that cap governs
+    # CALLER-supplied global banks. A caller lowering it below 4 previously
+    # crashed Fingerprinter() construction for ALL file types.
+    for n in (1, 2, 3):
+        fingerprinter = Fingerprinter(FingerprintConfig(max_window_bank_size=n))  # must not raise
+        audio_pipeline = fingerprinter._handler_pipelines.get("audio")
+        assert audio_pipeline is not None
+        assert audio_pipeline.config.window_bank == (512, 1024, 2048, 4096)
