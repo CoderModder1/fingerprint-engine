@@ -72,7 +72,7 @@ class AudioFileHandler(FileHandler):
         # Decode from the already-read bytes when provided (single-read path); the
         # decoders parse identical bytes from a BytesIO. suffix still comes from
         # the path so wav/mp3 routing is unchanged. None -> read the path.
-        raw = content if content is not None else self.read_bytes(path)
+        raw = self.read_content(path, content)
         suffix = Path(path).suffix.lower()
         if suffix in {".wav", ".wave"}:
             return self._load_wav(raw)

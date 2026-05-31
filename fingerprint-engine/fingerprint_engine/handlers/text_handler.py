@@ -90,7 +90,7 @@ class TextFileHandler(FileHandler):
         return 0.55 if ratio >= 0.90 else 0.0
 
     def load(self, path: str | Path, *, content: bytes | None = None) -> str:
-        data = content if content is not None else self.read_bytes(path)
+        data = self.read_content(path, content)
         try:
             return data.decode("utf-8")
         except UnicodeDecodeError:

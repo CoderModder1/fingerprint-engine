@@ -56,7 +56,7 @@ class PDFFileHandler(FileHandler):
         return 0.0
 
     def load(self, path: str | Path, *, content: bytes | None = None) -> PDFPayload:
-        data = content if content is not None else self.read_bytes(path)
+        data = self.read_content(path, content)
         PdfReader = require_optional(
             "pypdf",
             package="pypdf",

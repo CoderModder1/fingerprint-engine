@@ -226,7 +226,7 @@ class ArchiveFileHandler(FileHandler):
 
     def load(self, path: str | Path, *, content: bytes | None = None) -> ArchivePayload:
         source = Path(path)
-        data = content if content is not None else self.read_bytes(source)
+        data = self.read_content(source, content)
         archive_type = self._classify(source, data)
         if archive_type == "zip":
             members, truncated = self._read_zip(data)

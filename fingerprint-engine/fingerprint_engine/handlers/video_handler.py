@@ -31,7 +31,6 @@ Design (see the module-level constants and ``load``):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -200,7 +199,7 @@ class VideoFileHandler(FileHandler):
 
         # Decode from the already-read bytes when provided (single-read path);
         # PyAV reads identical frames from a seekable BytesIO as from the path.
-        video_source = BytesIO(content) if content is not None else str(path)
+        video_source = self.content_source(path, content)
         with av.open(video_source, mode="r") as container:
             stream = next((s for s in container.streams if s.type == "video"), None)
             if stream is None:

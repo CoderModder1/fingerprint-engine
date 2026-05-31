@@ -64,7 +64,7 @@ import json
 import logging
 import threading
 from dataclasses import dataclass, replace
-from io import BytesIO, StringIO
+from io import StringIO
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -223,7 +223,7 @@ class EmbeddingFileHandler(FileHandler):
 
         try:
             assert self.embedder is not None
-            raw = content if content is not None else self.read_bytes(path)
+            raw = self.read_content(path, content)
             result = self.embedder.embed(raw)
         except ImportError as exc:
             raise MissingDependencyError(
@@ -238,7 +238,7 @@ class EmbeddingFileHandler(FileHandler):
         # numpy is a core dependency, so the precomputed path needs no extra.
         # ``allow_pickle=False`` keeps deserialization safe on untrusted inputs.
         # np.load reads identical bytes from a BytesIO as from the path.
-        source: Path | BytesIO = BytesIO(content) if content is not None else path
+        source = FileHandler.content_source(path, content)
         loaded = np.load(source, allow_pickle=False)
         if isinstance(loaded, np.lib.npyio.NpzFile):
             try:
@@ -252,7 +252,7 @@ class EmbeddingFileHandler(FileHandler):
     def _load_jsonl(path: Path, content: bytes | None = None) -> np.ndarray:
         # Iterate lines from the already-read bytes (single-read path) or the
         # file; StringIO yields the same per-line splits a file handle does.
-        text = content.decode("utf-8") if content is not None else path.read_text(encoding="utf-8")
+        text = FileHandler.read_content(path, content).decode("utf-8")
         rows: list[list[float]] = []
         # newline=None enables universal-newline translation (lone \r, \r\n, \n all
         # split), matching the path-form's text-mode read_text(). Without it the

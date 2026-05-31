@@ -16,7 +16,6 @@ handler declines and the phash handler claims them instead.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -165,7 +164,7 @@ class ImageFileHandler(FileHandler):
         # Decode from the already-read bytes when provided (single-read path);
         # PIL sniffs the format from the content, so a BytesIO decodes identically
         # to opening the path. None -> open the path directly (legacy form).
-        source = BytesIO(content) if content is not None else path
+        source = self.content_source(path, content)
         with Image.open(source) as image:
             mode = image.mode
             width, height = int(image.width), int(image.height)

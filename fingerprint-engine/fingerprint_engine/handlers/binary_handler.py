@@ -27,7 +27,7 @@ class BinaryFileHandler(FileHandler):
         return 0.05
 
     def load(self, path: str | Path, *, content: bytes | None = None) -> bytes:
-        return content if content is not None else self.read_bytes(path)
+        return self.read_content(path, content)
 
     def to_signal(self, payload: bytes) -> np.ndarray:
         pipeline = FFTFingerprintPipeline()

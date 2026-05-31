@@ -6,6 +6,7 @@ import importlib
 import logging
 import mimetypes
 from abc import ABC, abstractmethod
+from io import BytesIO
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -140,3 +141,28 @@ class FileHandler(ABC):
     @staticmethod
     def read_bytes(path: str | Path) -> bytes:
         return Path(path).read_bytes()
+
+    @staticmethod
+    def read_content(path: str | Path, content: bytes | None) -> bytes:
+        """The single-read contract as one definition: the already-read bytes, or
+        read ``path`` once when ``content`` is ``None``.
+
+        :class:`Fingerprinter` reads each file ONCE and threads those bytes here
+        (so the fingerprinted bytes are provably the bytes the stored identity
+        describes -- no second read, no TOCTOU). Centralizing the idiom keeps that
+        security contract in one place rather than copied into every handler.
+        """
+
+        return content if content is not None else Path(path).read_bytes()
+
+    @staticmethod
+    def content_source(path: str | Path, content: bytes | None) -> BytesIO | str:
+        """A decoder source for path-or-file-like decoders (PIL/PyAV/np.load).
+
+        Returns the already-read bytes wrapped in a :class:`~io.BytesIO` (the
+        single-read path), or the path as a string. Same single-read contract as
+        :meth:`read_content`, but shaped for decoders that take a filename *or* a
+        seekable stream; the bytes are byte-identical either way.
+        """
+
+        return BytesIO(content) if content is not None else str(path)
