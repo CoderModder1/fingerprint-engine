@@ -24,6 +24,7 @@ from .core.exceptions import (
     InvalidSnapshotError,
     MissingDependencyError,
     NoHandlerError,
+    SnapshotWriteRefused,
 )
 from .core.fingerprinter import Fingerprinter
 from .core.index import (
@@ -78,6 +79,7 @@ __all__ = [
     "RedisHashIndex",
     "SQLiteHashIndex",
     "SearchResult",
+    "SnapshotWriteRefused",
     "__version__",
     "effective_format_version",
     "find_duplicates",

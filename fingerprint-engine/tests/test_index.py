@@ -12,7 +12,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from fingerprint_engine.core.exceptions import FingerprintError, InvalidSnapshotError
+from fingerprint_engine.core.exceptions import (
+    FingerprintError,
+    InvalidSnapshotError,
+    SnapshotWriteRefused,
+)
 from fingerprint_engine.core.index import (
     SNAPSHOT_SCHEMA_VERSION,
     InMemoryHashIndex,
@@ -233,6 +237,86 @@ def test_load_raises_when_primary_corrupt_and_no_backup(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="corrupt"):
         InMemoryHashIndex.load(index_path)
+
+
+def test_save_refuses_empty_over_nonempty_and_preserves_both_copies(tmp_path: Path) -> None:
+    # A2: an empty (zero-file) save over a populated primary would clobber the
+    # only good copy (the empty primary loads cleanly, so .bak never fires).
+    # It must be refused, leaving BOTH the primary and any backup untouched.
+    index_path = tmp_path / "index.json"
+
+    populated = InMemoryHashIndex()
+    populated.add(make_fingerprint("file-a", [1, 2, 3]))
+    populated.save(index_path)
+    populated.add(make_fingerprint("file-b", [4, 5]))
+    populated.save(index_path)  # now a .bak (file-a) exists next to the primary
+    primary_before = index_path.read_text(encoding="utf-8")
+    backup = index_path.with_name("index.json.bak")
+    backup_before = backup.read_text(encoding="utf-8")
+
+    empty = InMemoryHashIndex()
+    with pytest.raises(SnapshotWriteRefused) as excinfo:
+        empty.save(index_path)
+    assert excinfo.value.existing_file_count == 2
+
+    # Neither the primary nor the backup was touched by the refused save.
+    assert index_path.read_text(encoding="utf-8") == primary_before
+    assert backup.read_text(encoding="utf-8") == backup_before
+    assert InMemoryHashIndex.load(index_path).file_count == 2
+    # No stray temp file leaked from the aborted write.
+    assert not any(p.name.endswith(".tmp") for p in tmp_path.iterdir())
+
+
+def test_save_empty_is_allowed_with_force_and_over_absent_or_empty(tmp_path: Path) -> None:
+    # The guard fires ONLY for empty-over-non-empty. An empty save over an
+    # absent or already-empty primary is fine, and force=True overrides the guard.
+    empty = InMemoryHashIndex()
+    fresh = tmp_path / "fresh.json"
+    empty.save(fresh)  # over absent primary -> allowed
+    assert InMemoryHashIndex.load(fresh).file_count == 0
+
+    empty.save(fresh)  # over an already-empty primary -> allowed
+    assert InMemoryHashIndex.load(fresh).file_count == 0
+
+    populated = InMemoryHashIndex()
+    populated.add(make_fingerprint("file-a", [1, 2, 3]))
+    forced = tmp_path / "forced.json"
+    populated.save(forced)
+    InMemoryHashIndex().save(forced, force=True)  # explicit override -> allowed
+    assert InMemoryHashIndex.load(forced).file_count == 0
+
+
+def test_concurrent_saves_to_same_path_do_not_race_or_lose_writes(tmp_path: Path) -> None:
+    # A3: two threads saving the same destination in one process previously
+    # shared a PID-only temp name and raced (FileNotFoundError / torn write).
+    # With a unique-per-writer temp, every save completes and the file is always
+    # a valid, fully-written snapshot.
+    index_path = tmp_path / "index.json"
+    index = InMemoryHashIndex()
+    index.add(make_fingerprint("file-a", [1, 2, 3]))
+    index.save(index_path)  # seed so all saves are non-empty (guard never fires)
+
+    errors: list[Exception] = []
+    barrier = threading.Barrier(8)
+
+    def _saver() -> None:
+        barrier.wait()
+        try:
+            for _ in range(12):
+                index.save(index_path)
+        except Exception as exc:  # noqa: BLE001 - capture any race for the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_saver) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    # The destination is always a complete, loadable snapshot and no temp leaked.
+    assert InMemoryHashIndex.load(index_path).file_count == 1
+    assert not any(p.name.endswith(".tmp") for p in tmp_path.iterdir())
 
 
 def test_redis_backend_search_matches_in_memory() -> None:

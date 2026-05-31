@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import threading
 import time
+import uuid
 import warnings
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
@@ -17,7 +18,11 @@ from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
-from .exceptions import FormatVersionMismatchError, InvalidSnapshotError
+from .exceptions import (
+    FormatVersionMismatchError,
+    InvalidSnapshotError,
+    SnapshotWriteRefused,
+)
 from .models import (
     FINGERPRINT_FORMAT_VERSION,
     FORMAT_VERSION_KEY,
@@ -93,6 +98,25 @@ def _in_hash_range(hash_code: int) -> bool:
     """Whether ``hash_code`` fits the unsigned 64-bit posting range."""
 
     return _HASH_CODE_MIN <= hash_code <= _HASH_CODE_MAX
+
+
+def _fsync_path(path: Path) -> None:
+    """Best-effort fsync of a file's data blocks (never raises on an unsupported FS).
+
+    Used to make a freshly written backup durable before the primary is
+    replaced. Like the parent-directory fsync, this is best-effort: not every
+    platform/filesystem supports it, so a failure is swallowed rather than
+    allowed to break the save.
+    """
+
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 _BackendMethod = TypeVar("_BackendMethod", bound=Callable[..., Any])
@@ -686,7 +710,7 @@ class HashIndex(ABC):
         )
         return results[:top_k]
 
-    def save(self, path: str | Path) -> None:
+    def save(self, path: str | Path, *, force: bool = False) -> None:
         """Write a portable JSON snapshot durably (same schema for every backend).
 
         Crash-safe: the snapshot is written to a temp file in the SAME directory
@@ -694,10 +718,23 @@ class HashIndex(ABC):
         ``fsync``-ed, then atomically renamed over the destination. After the
         rename the parent directory is ``fsync``-ed (best-effort) so the rename
         itself is durable across power loss. The prior contents (if any) are
-        preserved at ``<dest>.bak`` first, so a corrupt or truncated primary can
-        fall back on load. A failed write never leaves a partial primary file
-        behind. The written JSON carries a ``schema_version`` for forward
-        compatibility (see :data:`SNAPSHOT_SCHEMA_VERSION`).
+        copied to ``<dest>.bak`` first and that backup's data is ``fsync``-ed
+        before the primary is replaced, so a corrupt or truncated primary can
+        fall back on load even across a crash mid-replace. A failed write never
+        leaves a partial primary file behind. The written JSON carries a
+        ``schema_version`` for forward compatibility (see
+        :data:`SNAPSHOT_SCHEMA_VERSION`).
+
+        Data-loss guard: an EMPTY (zero-file) snapshot is refused with
+        :class:`SnapshotWriteRefused` when it would overwrite an existing
+        NON-EMPTY primary -- a freshly created, emptied, or failed-rebuild index
+        saved over a populated corpus would otherwise clobber the only good copy
+        (the empty primary loads cleanly, so the ``.bak`` fallback never fires).
+        Pass ``force=True`` to override when emptying the snapshot is intended.
+
+        Concurrency: the temp file is uniquely named per writer (pid + random),
+        so two threads saving the same destination cannot tear or unlink each
+        other's in-flight write; the last full save wins atomically.
         """
 
         destination = Path(path)
@@ -711,16 +748,34 @@ class HashIndex(ABC):
         # metadata, or the schema container, so the round-tripped index is
         # otherwise byte-identical.
         payload[SNAPSHOT_FORMAT_VERSION_KEY] = self._format_version
-        tmp = destination.with_name(f"{destination.name}.{os.getpid()}.tmp")
+
+        # Refuse a destructive empty save (see the data-loss guard above). Only
+        # an empty-over-non-empty save is blocked, so a normal save -- and an
+        # empty save over an absent/empty/corrupt primary -- is unaffected.
+        if not force and not payload.get("files"):
+            existing_count = self._existing_snapshot_file_count(destination)
+            if existing_count > 0:
+                raise SnapshotWriteRefused(
+                    f"refusing to overwrite a non-empty index snapshot at "
+                    f"{destination} ({existing_count} files) with an EMPTY one; "
+                    "pass force=True if emptying the snapshot is intentional",
+                    existing_file_count=existing_count,
+                )
+
+        tmp = destination.with_name(f"{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         try:
             with tmp.open("w", encoding="utf-8") as handle:
                 json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
-            # Keep a backup of the existing good snapshot before overwriting it.
+            # Keep a backup of the existing good snapshot before overwriting it,
+            # and fsync the backup's DATA so the crash-safe fallback is durable
+            # before the primary is swapped (the dir fsync below covers its
+            # directory entry).
             if destination.exists():
                 backup = destination.with_name(f"{destination.name}.bak")
                 shutil.copy2(destination, backup)
+                _fsync_path(backup)
             os.replace(tmp, destination)
             # fsync the parent directory so the rename (the directory entry) is
             # durable too. Best-effort: not all platforms/filesystems support
@@ -735,6 +790,27 @@ class HashIndex(ABC):
                 pass
         finally:
             tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _existing_snapshot_file_count(destination: Path) -> int:
+        """Best-effort file count of the existing primary snapshot (0 if none/unreadable).
+
+        Used only by the empty-save guard in :meth:`save`. A missing or
+        unparseable primary returns 0 so the guard never blocks overwriting a
+        corrupt or absent file -- it protects only a readable, non-empty corpus.
+        """
+
+        if not destination.exists():
+            return 0
+        try:
+            with destination.open("r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return 0
+        if not isinstance(existing, dict):
+            return 0
+        files = existing.get("files")
+        return len(files) if isinstance(files, dict) else 0
 
     @staticmethod
     def _read_snapshot(path: str | Path) -> dict | None:

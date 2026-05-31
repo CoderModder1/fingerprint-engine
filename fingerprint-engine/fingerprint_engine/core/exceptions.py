@@ -37,6 +37,23 @@ class InvalidSnapshotError(FingerprintError, ValueError):
     """
 
 
+class SnapshotWriteRefused(FingerprintError):
+    """A :meth:`HashIndex.save` was refused to prevent silent data loss.
+
+    Raised when an *empty* (zero-file) snapshot would overwrite an existing
+    *non-empty* primary snapshot. Without this guard, saving a freshly created,
+    emptied, or failed-rebuild index over a populated corpus would clobber the
+    primary with a valid-but-empty file -- and, on a second such save, the
+    ``.bak`` too -- destroying the only recoverable copy. Pass ``force=True`` to
+    :meth:`HashIndex.save` to override when emptying the snapshot is intentional.
+    Carries the ``existing_file_count`` that would have been lost.
+    """
+
+    def __init__(self, message: str, *, existing_file_count: int) -> None:
+        super().__init__(message)
+        self.existing_file_count = existing_file_count
+
+
 class FormatVersionMismatchError(FingerprintError):
     """A query was searched against an index built with a different hash format.
 
