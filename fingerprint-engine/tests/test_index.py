@@ -369,6 +369,37 @@ def test_sqlite_add_rolls_back_on_posting_failure(tmp_path: Path) -> None:
     assert index.search(make_fingerprint("file-b", [4, 5]))[0].file_id == "file-b"
 
 
+def test_redis_mutators_run_under_the_per_index_lock() -> None:
+    # A5: fakeredis serializes commands so the read-modify-write race cannot be
+    # reproduced in-env; assert directly that add()/remove() acquire the per-index
+    # RLock (the same in-process concurrency guard the SQL backends use). add()'s
+    # nested remove() re-enters the re-entrant lock, so add() acquires twice.
+    index = RedisHashIndex(client=_fake_redis())
+    assert isinstance(index._lock, type(threading.RLock()))
+
+    class _CountingLock:
+        def __init__(self, real: object) -> None:
+            self._real = real
+            self.enters = 0
+
+        def __enter__(self) -> object:
+            self.enters += 1
+            return self._real.__enter__()
+
+        def __exit__(self, *args: object) -> object:
+            return self._real.__exit__(*args)
+
+    counting = _CountingLock(index._lock)
+    index._lock = counting  # type: ignore[assignment]
+    index.add(make_fingerprint("file-a", [1, 2, 3]))
+    assert counting.enters >= 2  # add() + its nested remove()
+    before = counting.enters
+    index.remove("file-a")
+    assert counting.enters > before
+    # The lock did not change behaviour: the add/remove round-trip still works.
+    assert index.file_count == 0
+
+
 def test_redis_backend_search_matches_in_memory() -> None:
     redis_index = RedisHashIndex(client=_fake_redis(), key_prefix="t1")
     mem_index = InMemoryHashIndex()

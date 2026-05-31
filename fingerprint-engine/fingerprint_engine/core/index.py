@@ -1296,8 +1296,17 @@ class RedisHashIndex(HashIndex):
         <p>:npostings        INT  total posting count
         <p>:format_version   STRING corpus hash-format version (only if non-default)
 
-    Concurrency: a ``redis-py`` client and its pipelines are thread-safe, so this
-    backend needs no extra lock (unlike the single-connection SQL backends).
+    Concurrency: a ``redis-py`` client and its pipelines are thread-safe at the
+    command level, but :meth:`add`/:meth:`add_many`/:meth:`remove` are
+    multi-step read-modify-write sequences (read a file's existing postings,
+    then issue the dependent removals/inserts and adjust the ``npostings``
+    counter). Under the shared FastAPI-threadpool index two such sequences on
+    the same ``file_id`` would interleave -- double-counting postings and the
+    counter and skewing search confidence -- so the mutators are serialized by a
+    per-index :class:`threading.RLock` (the ``@_synchronized`` decorator), the
+    same in-process contract the SQL backends use. (Cross-process atomicity for
+    multiple service instances on one real Redis is a separate, deferred concern
+    -- a per-process lock cannot cover it; see SECURITY.md.)
     """
 
     def __init__(
@@ -1307,6 +1316,11 @@ class RedisHashIndex(HashIndex):
         key_prefix: str = "fpidx",
         **client_kwargs,
     ) -> None:
+        # Serializes the read-modify-write mutators (add/add_many/remove) within
+        # one process. RLock (not Lock) because add() calls remove() and both are
+        # @_synchronized; uncontended on the single-threaded path so output is
+        # unchanged. See the class docstring for the cross-process caveat.
+        self._lock = threading.RLock()
         self.key_prefix = key_prefix
         if client is not None:
             self._redis = client
@@ -1349,6 +1363,7 @@ class RedisHashIndex(HashIndex):
         value = self._redis.get(self._key("npostings"))
         return int(value) if value else 0
 
+    @_synchronized
     def add(self, fingerprint: Fingerprint) -> None:
         self._record_format_version(fingerprint)
         self.remove(fingerprint.file_id)
@@ -1374,6 +1389,7 @@ class RedisHashIndex(HashIndex):
             pipe.incrby(self._key("npostings"), len(entries))
         pipe.execute()
 
+    @_synchronized
     def add_many(self, fingerprints: Iterable[Fingerprint]) -> None:
         """Batch the whole ingest into one read + one write pipeline.
 
@@ -1449,6 +1465,7 @@ class RedisHashIndex(HashIndex):
             pipe.incrby(self._key("npostings"), net_delta)
         pipe.execute()
 
+    @_synchronized
     def remove(self, file_id: str) -> None:
         raw = self._redis.lrange(self._key("f", file_id), 0, -1)
         if not raw:
