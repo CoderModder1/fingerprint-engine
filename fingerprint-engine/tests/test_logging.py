@@ -129,7 +129,10 @@ def test_search_emits_timing_debug_record(
     debug_records = [
         record
         for record in caplog.records
-        if record.levelno == logging.DEBUG and record.name == "fingerprint_engine.core.index"
+        # The index subsystem logs under the fingerprint_engine.core.index package
+        # (search() lives in the .base submodule after the package split).
+        if record.levelno == logging.DEBUG
+        and record.name.startswith("fingerprint_engine.core.index")
     ]
     assert any(
         record.getMessage().startswith("search:") and "results in" in record.getMessage()
