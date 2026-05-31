@@ -1867,6 +1867,39 @@ def test_candidate_limit_reduces_candidate_set_below_corpus() -> None:
         assert [r.file_id for r in limited] == ["alpha", "beta"], name
 
 
+def test_candidate_limit_keeps_repeated_code_high_vote_match_across_backends() -> None:
+    # A6 regression: a match dominated by ONE code repeated at many COHERENT
+    # offsets has huge ALIGNED votes but few DISTINCT shared codes. The old
+    # prefilter counted distinct codes (+1 per code), UNDER-counting such a match,
+    # so a tight candidate_limit dropped the true #1 below low-vote decoys that
+    # merely share more distinct codes. Ranking on shared POSTINGS (query x file
+    # multiplicity = a true upper bound on aligned votes) keeps it.
+    coherent = [(1, off) for off in range(0, 1000, 50)]  # code 1 at 20 offsets
+    query = fp_with_hashes(
+        "q", coherent + [(2, 5), (3, 6), (10, 7), (11, 8), (12, 9), (13, 10), (14, 11)]
+    )
+    # TRUE: code 1 at those 20 offsets shifted by a constant delta (-> ~20 aligned
+    # votes), plus codes 2,3 -> only 3 DISTINCT shared codes.
+    true_file = fp_with_hashes(
+        "true", [(1, off + 100) for off in range(0, 1000, 50)] + [(2, 500), (3, 600)]
+    )
+    # 8 decoys each share 5 DISTINCT query codes (10..14), so under the old
+    # distinct-code ranking they (5) out-ranked TRUE (3) and a limit of 5 dropped
+    # it. They share only 5 postings, far below TRUE's ~402.
+    decoys = [
+        fp_with_hashes(f"decoy{i}", [(10, 0), (11, 0), (12, 0), (13, 0), (14, 0)])
+        for i in range(8)
+    ]
+    for name, index in _parity_backends():
+        for fp in [true_file, *decoys]:
+            index.add(fp)
+        # candidate_limit (5) < decoy count (8): under distinct-code ranking the
+        # decoys would fill the candidate set and exclude TRUE. It must survive.
+        top = index.search(query, top_k=1, candidate_limit=5)
+        assert top and top[0].file_id == "true", name
+        assert top[0].aligned_votes >= 20, (name, top[0].aligned_votes)
+
+
 def test_candidate_limit_zero_returns_no_results_across_backends() -> None:
     corpus = _prefilter_corpus()
     query = _prefilter_query()

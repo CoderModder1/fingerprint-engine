@@ -419,25 +419,28 @@ class HashIndex(ABC):
         BYTE-IDENTICAL to behaviour before this option existed -- the prefilter
         code below is never entered. When set to a positive integer it caps the
         cost of large-corpus search with a cheap, sublinear-in-corpus candidate
-        prefilter: files are first ranked by SHARED-HASH COUNT (how many distinct
-        query hash codes touch each file -- a single batched posting lookup, no
-        per-posting offset arithmetic), and only the top ``candidate_limit`` files
-        proceed to the exact offset-histogram aggregation and scoring.
+        prefilter: files are first ranked by SHARED-POSTING COUNT (for each file,
+        the sum over shared codes of query-multiplicity x file-posting-count -- a
+        single batched posting lookup, no per-posting offset arithmetic), and only
+        the top ``candidate_limit`` files proceed to the exact offset-histogram
+        aggregation and scoring.
 
-        Exactness/recall trade-off: shared-hash count is a monotone UPPER BOUND on
-        a file's aligned votes (a hash can only vote at the winning offset if it
-        is shared at all), so for a high-overlap match -- a self-match, a
-        near-duplicate -- the true file is guaranteed to be among the highest
-        shared-hash-count files and thus in the candidate set. When the candidate
-        set is a SUPERSET of the true top-``top_k`` (the normal case for a
-        generous ``candidate_limit``), the final ranking is IDENTICAL to full
+        Exactness/recall trade-off: that shared-posting count is the file's TOTAL
+        offset-histogram votes across all offsets, hence a monotone UPPER BOUND on
+        its ALIGNED votes (the count at the single best offset), so for a
+        high-overlap match -- a self-match, a near-duplicate, even one dominated
+        by a single code repeated at many coherent offsets -- the true file is
+        guaranteed to be among the highest
+        shared-posting-count files and thus in the candidate set. When the
+        candidate set is a SUPERSET of the true top-``top_k`` (the normal case for
+        a generous ``candidate_limit``), the final ranking is IDENTICAL to full
         search: scoring runs unchanged on the surviving files and the dropped
         files could never have out-ranked them. The only files a too-tight limit
         can drop are *low*-overlap ones -- weak partial matches that share few
-        hashes but happen to align coherently -- so set ``candidate_limit``
+        postings but happen to align coherently -- so set ``candidate_limit``
         comfortably above ``top_k`` to keep recall at 1.0 for genuine matches.
-        Ties in shared-hash count at the cut boundary are broken deterministically
-        (count DESC, then file_id ASC) so the candidate set is reproducible.
+        Ties in shared-posting count at the cut boundary are broken
+        deterministically (count DESC, then file_id ASC) so the set is reproducible.
 
         ``strict_format`` controls the HASH-FORMAT compatibility check. The query
         fingerprint's :attr:`Fingerprint.format_version` is compared with this
@@ -498,19 +501,31 @@ class HashIndex(ABC):
     def _select_candidates(
         self, fingerprint: Fingerprint, candidate_limit: int | None
     ) -> set[str] | None:
-        """Cheap shared-hash candidate prefilter; ``None`` (default) = OFF.
+        """Cheap shared-posting candidate prefilter; ``None`` (default) = OFF.
 
         Returns ``None`` when ``candidate_limit`` is ``None`` (the default) so the
         caller runs the full exact search on every file -- the byte-identical
         legacy path. When ``candidate_limit`` is a non-negative int, returns the
-        set of the top-``candidate_limit`` ``file_id`` ranked by SHARED-HASH COUNT
-        (the number of distinct query hash codes whose posting list contains the
-        file). This count is computed from the SAME batched :meth:`query_many`
-        fetch the exact aggregation would do, but without any per-posting offset
-        arithmetic, and -- crucially -- is a monotone upper bound on a file's
-        aligned votes, so a high-overlap match (self / near-dup) is always
-        retained. The cut is deterministic: shared-hash count DESC, then file_id
-        ASC, so a boundary tie is resolved reproducibly.
+        set of the top-``candidate_limit`` ``file_id`` ranked by SHARED-POSTING
+        COUNT: for each file, ``sum over shared codes of (query multiplicity x
+        file posting count)``.
+
+        That sum is the file's TOTAL offset-histogram votes across all offsets,
+        so it is a genuine monotone UPPER BOUND on the file's ALIGNED votes
+        (aligned votes are the count at the single best offset, which can never
+        exceed the total). A high-overlap match -- including one dominated by a
+        single code repeated at many coherent offsets -- is therefore always
+        retained, so a generous ``candidate_limit`` keeps recall at 1.0. (The
+        earlier prefilter counted only DISTINCT shared codes, +1 per code; that
+        UNDER-counts a repeated-code match -- a code at N coherent offsets is N
+        aligned votes but only +1 -- so a too-tight limit could silently drop the
+        true #1. Counting postings, not distinct codes, fixes that.)
+
+        Computed from the SAME batched :meth:`query_many` fetch the exact
+        aggregation would do, but without the per-posting offset arithmetic, so
+        it stays the cheap prefilter. The cut is deterministic: shared-posting
+        count DESC, then file_id ASC, so a boundary tie is reproducible across
+        backends.
 
         ``candidate_limit == 0`` selects no files (an explicit empty search). A
         negative limit is rejected so the cut is always well defined.
@@ -520,14 +535,18 @@ class HashIndex(ABC):
             return None
         if candidate_limit < 0:
             raise ValueError("candidate_limit must be non-negative or None (None = off)")
+        # Query-side multiplicity per code (duplicates matter: a code occurring
+        # k times in the query contributes k votes per matching file posting).
+        query_mult: Counter[int] = Counter(qh.hash_code for qh in fingerprint.hashes)
         shared: Counter[str] = Counter()
-        postings_by_code = self.query_many({qh.hash_code for qh in fingerprint.hashes})
-        for postings in postings_by_code.values():
-            # One vote per (file) per distinct query code: a code present in the
-            # query that hits this file contributes exactly one to its shared
-            # count, regardless of how many times it occurs in the file.
-            for file_id in {posting.file_id for posting in postings}:
-                shared[file_id] += 1
+        postings_by_code = self.query_many(set(query_mult))
+        for code, postings in postings_by_code.items():
+            qm = query_mult[code]
+            # File-side multiplicity of this code; qm * fm is the code's total
+            # vote contribution (across all offsets) for that file. Summed over
+            # codes this dominates aligned_votes -- a true upper bound.
+            for file_id, fm in Counter(posting.file_id for posting in postings).items():
+                shared[file_id] += qm * fm
         if len(shared) <= candidate_limit:
             return set(shared)
         # count DESC, then file_id ASC -- deterministic, independent of insertion
