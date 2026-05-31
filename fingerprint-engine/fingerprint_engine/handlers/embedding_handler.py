@@ -254,7 +254,11 @@ class EmbeddingFileHandler(FileHandler):
         # file; StringIO yields the same per-line splits a file handle does.
         text = content.decode("utf-8") if content is not None else path.read_text(encoding="utf-8")
         rows: list[list[float]] = []
-        with StringIO(text) as handle:
+        # newline=None enables universal-newline translation (lone \r, \r\n, \n all
+        # split), matching the path-form's text-mode read_text(). Without it the
+        # content (single-read) form would parse a classic-Mac lone-\r .jsonl as one
+        # giant line and diverge from the disk form.
+        with StringIO(text, newline=None) as handle:
             for line in handle:
                 line = line.strip()
                 if not line:

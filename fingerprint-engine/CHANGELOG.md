@@ -129,6 +129,49 @@ text/image/audio/archive corpus across the SQLite and in-memory backends).
   and gets the advertised vector-sequence fingerprint instead of a structural
   archive one. Ordinary `.zip`/`.tar`/`.tar.gz` routing is unchanged.
 
+#### Second adversarial audit (2026-05-31)
+
+A second deep multi-agent audit (14 verified findings). All fixed; default
+fingerprint hash codes verified byte-identical old-vs-new across ALL eight routed
+handlers (text, binary, image, audio/WAV, archive, embedding `.npy`/`.jsonl`,
+video).
+
+- **Single-read pipeline (identity TOCTOU).** `fingerprint_file` read each file
+  twice — once for `content_sha256`/`file_id`, then again inside the handler's
+  `load()` — so a concurrent writer between the reads could make the stored
+  identity describe different bytes than the hashes were derived from (silent
+  dedup/identity corruption), and the second read bypassed `max_file_size_bytes`.
+  `FileHandler.load` now takes the already-read bytes; the fingerprinted bytes
+  are provably the bytes the identity describes.
+- **Durable `save()`.** An empty (zero-file) snapshot saved over a populated
+  primary clobbered the only recoverable copy (and, on a second save, the `.bak`
+  too); it is now refused with `SnapshotWriteRefused` unless `force=True`.
+  Concurrent same-process saves shared a PID-only temp name and raced
+  (`FileNotFoundError`/lost write); the temp is now uniquely named per writer.
+  The `.bak` is `fsync`-ed before the primary is replaced.
+- **SQLite `add()`** now rolls back on failure (no committed phantom zero-posting
+  file), and `ConstellationHash` rejects hash codes outside the unsigned-64 range
+  at construction so every backend behaves identically (the SQL backends would
+  otherwise overflow while in-memory silently accepted).
+- **`RedisHashIndex`** mutators (`add`/`add_many`/`remove`) now serialize under a
+  per-index re-entrant lock, matching the SQL backends' concurrency contract
+  (the multi-step read-modify-write otherwise double-counted postings under the
+  shared service threadpool).
+- **`candidate_limit`** prefilter now ranks on shared-POSTING count (a true upper
+  bound on aligned votes) instead of distinct-code count, so a tight limit can no
+  longer drop a genuine match dominated by a code repeated at coherent offsets.
+- **Snapshot load** counts and warns on dropped malformed/out-of-range postings,
+  and `from_dict` recomputes `hash_count` from the postings actually loaded so a
+  degraded snapshot's match confidence stays calibrated.
+- **Image decode bomb:** new `max_image_pixels` (default ~89.5 Mpx; `0` =
+  unlimited) rejects an over-cap image from its header BEFORE decode, so a tiny
+  highly-compressible file can no longer decode to hundreds of megapixels.
+- Smaller robustness fixes: `file_content_sha256` enforces a running byte cap and
+  rejects non-regular files; WEBP is recognised by its magic bytes; MP3
+  de-interleaving tolerates a non-frame-aligned sample count; and the CLI `add`
+  counts block reconciles (`scanned == skipped_existing + newly_indexed +
+  failed`).
+
 ## [0.1.0] - 2026-05-29
 
 Baseline release.

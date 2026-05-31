@@ -200,6 +200,23 @@ def test_embedding_jsonl_loads_object_and_bare_forms(tmp_path: Path) -> None:
     assert payload.source == "precomputed_jsonl"
 
 
+def test_embedding_jsonl_load_disk_and_bytes_agree_on_lone_cr(tmp_path: Path) -> None:
+    # A1 regression: the single-read content form must parse line endings the same
+    # way the path form does. read_text() does universal-newline translation, so a
+    # classic-Mac lone-\r .jsonl splits into N vectors; the content (bytes) form
+    # must match (it previously kept it as one line -> JSONDecodeError -> demotion).
+    path = tmp_path / "emb.jsonl"
+    body = "\r".join(json.dumps([float(i), float(i + 1), float(i + 2)]) for i in range(5))
+    path.write_bytes(body.encode("utf-8"))  # lone-\r separators, no trailing newline
+
+    handler = EmbeddingFileHandler()
+    from_disk = handler.load(path)
+    from_bytes = handler.load(path, content=path.read_bytes())
+    assert from_disk.num_vectors == 5
+    assert from_bytes.num_vectors == 5
+    assert np.array_equal(from_disk.vectors, from_bytes.vectors)
+
+
 def test_embedding_single_vector_is_one_frame(tmp_path: Path) -> None:
     path = tmp_path / "one.npy"
     np.save(path, np.arange(16, dtype=np.float32))
