@@ -1216,6 +1216,67 @@ def test_postgres_ranking_matches_in_memory_byte_identical(pg_index) -> None:
 
 
 @requires_pg
+def test_postgres_candidate_limit_matches_in_memory(pg_index) -> None:
+    # A6 for Postgres: the shared-POSTING candidate prefilter (base-class
+    # _select_candidates over PG's query_many) must keep a repeated-code high-vote
+    # match under a tight limit AND rank identically to in-memory. _parity_backends
+    # excludes PG, so this is where PG candidate_limit parity is proven.
+    coherent = [(1, off) for off in range(0, 1000, 50)]
+    query = fp_with_hashes(
+        "q", coherent + [(2, 5), (3, 6), (10, 7), (11, 8), (12, 9), (13, 10), (14, 11)]
+    )
+    true_file = fp_with_hashes(
+        "true", [(1, off + 100) for off in range(0, 1000, 50)] + [(2, 500), (3, 600)]
+    )
+    decoys = [
+        fp_with_hashes(f"decoy{i}", [(10, 0), (11, 0), (12, 0), (13, 0), (14, 0)]) for i in range(8)
+    ]
+    mem = InMemoryHashIndex()
+    for fingerprint in [true_file, *decoys]:
+        mem.add(fingerprint)
+        pg_index.add(fingerprint)
+
+    def tuples(index, limit):  # noqa: ANN001, ANN202 - test helper
+        return [
+            (r.file_id, r.offset, r.aligned_votes, r.score)
+            for r in index.search(query, top_k=10, candidate_limit=limit)
+        ]
+
+    for limit in (5, 100, None):
+        assert tuples(pg_index, limit) == tuples(mem, limit), limit
+    top = pg_index.search(query, top_k=1, candidate_limit=5)
+    assert top and top[0].file_id == "true"
+
+
+@requires_pg
+def test_postgres_concurrent_add_and_search_stay_consistent(pg_index) -> None:
+    # The @_synchronized per-index lock must keep concurrent add()/search() on one
+    # shared Postgres connection (as the FastAPI threadpool issues) consistent --
+    # no InterfaceError, no torn multi-statement section, no miscounted postings.
+    file_ids = [f"file-{i}" for i in range(20)]
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(len(file_ids))
+
+    def worker(file_id: str) -> None:
+        try:
+            barrier.wait()
+            pg_index.add(make_fingerprint(file_id, [1, 2, 3]))
+            pg_index.search(make_fingerprint("query", [1, 2, 3]), top_k=5)
+        except BaseException as exc:  # noqa: BLE001 - surface any thread failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(fid,)) for fid in file_ids]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert pg_index.file_count == len(file_ids)
+    assert pg_index.posting_count == 3 * len(file_ids)
+
+
+@requires_pg
 def test_postgres_snapshot_interop_preserves_postings_metadata_and_ranks(pg_index, tmp_path: Path) -> None:
     # INVARIANT 3 for Postgres: a Postgres-written snapshot loads into the
     # in-memory backend with identical postings, metadata, and ranks.

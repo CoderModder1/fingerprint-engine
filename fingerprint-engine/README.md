@@ -293,7 +293,15 @@ identically and scores stay comparable:
   use `fakeredis`, no server needed.
 - **`PostgresHashIndex`** — server-grade shared/durable store; postings in an
   indexed table, metadata as `JSONB`. Requires `psycopg` and a running server;
-  integration tests run when `FINGERPRINT_TEST_PG_DSN` is set.
+  the gated integration tests run when `FINGERPRINT_TEST_PG_DSN` is set, which CI
+  does against a live Postgres service container on every push.
+
+All four backends produce **identical** `SearchResult` rankings for the same
+index contents and query (one shared scoring path on the base class). This is
+enforced by cross-backend parity tests — in-memory/SQLite/Redis run everywhere,
+and Postgres parity (search ranking, tie-breaks, `add_many`, snapshot interop,
+the surrogate key, `candidate_limit`, and concurrent access) is proven by the
+`@requires_pg` suite against the live Postgres service in CI.
 
 ```bash
 # CLI: pick a backend with --backend (default: memory)

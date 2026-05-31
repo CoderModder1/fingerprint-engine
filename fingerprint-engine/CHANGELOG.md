@@ -37,6 +37,16 @@ byte-identical (only the version stamp advances for them) while audio changes:
   excerpt recall on stationary audio; the bank is kept on by default for
   robustness on real non-stationary audio.)
 
+### Tests / CI
+
+- The "all four backends rank identically" guarantee is now proven for Postgres
+  in CI: the workflow runs a live Postgres 16 service container with
+  `FINGERPRINT_TEST_PG_DSN` set and `psycopg` installed (via the `[dev]`/`[all]`
+  extras), so the gated `@requires_pg` parity suite executes for real on every
+  push. Added Postgres parity coverage for `candidate_limit` (the shared-posting
+  prefilter) and a Postgres concurrency test that exercises the `@_synchronized`
+  per-index lock under concurrent `add`/`search` on one shared connection.
+
 ### Added
 
 - Exception hierarchy in `fingerprint_engine.core.exceptions`: a base
