@@ -319,6 +319,56 @@ def test_concurrent_saves_to_same_path_do_not_race_or_lose_writes(tmp_path: Path
     assert not any(p.name.endswith(".tmp") for p in tmp_path.iterdir())
 
 
+def test_constellation_hash_rejects_out_of_range_code() -> None:
+    # A4 (model boundary): a hash code outside the unsigned-64 range cannot be
+    # constructed, so every backend rejects the same input identically instead
+    # of InMemory accepting it while the SQL backends overflow their column.
+    from fingerprint_engine.core.models import _HASH_CODE_MAX
+
+    # In-range codes (including the boundary) construct fine.
+    for ok in (0, 1, _HASH_CODE_MAX):
+        ConstellationHash(hash_code=ok, time_offset=0, anchor_time=0,
+                          target_time=0, freq1=0, freq2=0, delta_t=0)
+    for bad in (-1, _HASH_CODE_MAX + 1, 2**65):
+        with pytest.raises(ValueError, match="unsigned 64-bit"):
+            ConstellationHash(hash_code=bad, time_offset=0, anchor_time=0,
+                              target_time=0, freq1=0, freq2=0, delta_t=0)
+
+
+class _PostingInsertFails:
+    """Connection proxy that fails the postings INSERT, to exercise add() rollback."""
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+
+    def executemany(self, sql: str, params: object):  # noqa: ANN001 - test proxy
+        if "INSERT INTO postings" in sql:
+            raise sqlite3.OperationalError("simulated posting insert failure")
+        return self._real.executemany(sql, params)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._real, name)
+
+
+def test_sqlite_add_rolls_back_on_posting_failure(tmp_path: Path) -> None:
+    # A4 (rollback): a failure after the files INSERT must not leave a committed
+    # phantom file (zero postings) that the next successful commit flushes.
+    index = SQLiteHashIndex(str(tmp_path / "idx.sqlite3"))
+    real_conn = index._conn
+    index._conn = _PostingInsertFails(real_conn)  # type: ignore[assignment]
+    with pytest.raises(sqlite3.OperationalError):
+        index.add(make_fingerprint("file-a", [1, 2, 3]))
+    index._conn = real_conn  # restore for assertions
+
+    # No phantom row survived the failed add, and a later good add is unpolluted.
+    assert index.file_count == 0
+    assert not index.contains("file-a")
+    index.add(make_fingerprint("file-b", [4, 5]))
+    assert index.file_count == 1
+    assert index.contains("file-b")
+    assert index.search(make_fingerprint("file-b", [4, 5]))[0].file_id == "file-b"
+
+
 def test_redis_backend_search_matches_in_memory() -> None:
     redis_index = RedisHashIndex(client=_fake_redis(), key_prefix="t1")
     mem_index = InMemoryHashIndex()

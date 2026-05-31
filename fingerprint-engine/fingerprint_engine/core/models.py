@@ -230,6 +230,17 @@ class LandmarkPoint:
         )
 
 
+# Unsigned 64-bit bound for posting hash codes. A code outside this range is
+# rejected at construction (see ConstellationHash.__post_init__): the SQL
+# backends store ``code - 2**63`` in a signed-64 INTEGER column, so an
+# out-of-range code overflows there while InMemoryHashIndex would silently
+# accept it -- a cross-backend divergence (and, without add() rollback, a
+# committed phantom file). Validating once at the model keeps every backend
+# identical. Mirrors core/index.py's _HASH_CODE_MIN/_HASH_CODE_MAX.
+_HASH_CODE_MIN = 0
+_HASH_CODE_MAX = (1 << 64) - 1
+
+
 @dataclass(frozen=True, slots=True)
 class ConstellationHash:
     """A searchable code derived from a pair of landmark peaks."""
@@ -241,6 +252,17 @@ class ConstellationHash:
     freq1: int
     freq2: int
     delta_t: int
+
+    def __post_init__(self) -> None:
+        # Fail loud on a hash code the durable backends cannot represent, so all
+        # backends reject the same input identically (see the bound above). The
+        # engine's handlers never emit out-of-range codes, so this never fires on
+        # a default fingerprint -- it guards hand-built/external/migrated input.
+        if not (_HASH_CODE_MIN <= self.hash_code <= _HASH_CODE_MAX):
+            raise ValueError(
+                f"hash_code {self.hash_code} is outside the unsigned 64-bit "
+                f"range [{_HASH_CODE_MIN}, {_HASH_CODE_MAX}]"
+            )
 
     def to_tuple(self) -> tuple[int, int]:
         return self.hash_code, self.time_offset

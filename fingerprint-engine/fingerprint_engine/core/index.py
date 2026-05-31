@@ -1766,22 +1766,31 @@ class SQLiteHashIndex(HashIndex):
             "landmark_count": fingerprint.landmark_count,
             **fingerprint.metadata,
         }
-        # remove() above deleted any prior files row, so this INSERT allocates a
-        # fresh surrogate id (cursor.lastrowid). Postings carry that file_ref, not
-        # the 64-char file_id string.
-        cursor = self._conn.execute(
-            "INSERT INTO files (file_id, metadata) VALUES (?, ?)",
-            (fingerprint.file_id, json.dumps(metadata, sort_keys=True)),
-        )
-        file_ref = cursor.lastrowid
-        self._conn.executemany(
-            "INSERT INTO postings (file_ref, hash_code, time_offset) VALUES (?, ?, ?)",
-            [
-                (file_ref, self._encode(item.hash_code), int(item.time_offset))
-                for item in fingerprint.hashes
-            ],
-        )
-        self._conn.commit()
+        try:
+            # remove() above deleted any prior files row, so this INSERT allocates
+            # a fresh surrogate id (cursor.lastrowid). Postings carry that
+            # file_ref, not the 64-char file_id string.
+            cursor = self._conn.execute(
+                "INSERT INTO files (file_id, metadata) VALUES (?, ?)",
+                (fingerprint.file_id, json.dumps(metadata, sort_keys=True)),
+            )
+            file_ref = cursor.lastrowid
+            self._conn.executemany(
+                "INSERT INTO postings (file_ref, hash_code, time_offset) VALUES (?, ?, ?)",
+                [
+                    (file_ref, self._encode(item.hash_code), int(item.time_offset))
+                    for item in fingerprint.hashes
+                ],
+            )
+            self._conn.commit()
+        except BaseException:
+            # Without this, a failure after the files INSERT (e.g. a posting
+            # insert error) left the files row in an open, uncommitted
+            # transaction that the NEXT successful commit silently flushed --
+            # a committed phantom file with zero postings. Mirror add_many():
+            # roll the whole add back so it is all-or-nothing.
+            self._conn.rollback()
+            raise
 
     @_synchronized
     def add_many(self, fingerprints: Iterable[Fingerprint]) -> None:
