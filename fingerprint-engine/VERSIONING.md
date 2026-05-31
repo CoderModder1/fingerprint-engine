@@ -228,6 +228,56 @@ value `effective_format_version` already reports for that flag; it changes which
 config is the *default*, so the new default's recorded version differs from the
 old default's, which is exactly the incompatibility the check surfaces.)
 
+The set of hash-changing config fields is declared explicitly as
+`models.HASH_CHANGING_FIELDS` (kept in lock-step with `effective_format_version`
+by a test), so "which knobs change the derivation" is greppable rather than
+implicit in the function body.
+
+#### 4b. Handler-local derivation changes — the over-bump, the escape hatch, and the target model
+
+`FINGERPRINT_FORMAT_VERSION` is a **single scalar pinned per index**, but an
+index may hold a *mix* of handlers (text + image + audio + …). So a derivation
+change confined to ONE handler still forces a **global** bump and a re-index of
+the *unchanged* handlers' corpora. The v2 release is exactly this case: only the
+audio derivation changed (float64 reductions + the default window bank), yet the
+seven non-audio handlers — byte-identical in output — were re-stamped v2 and a v1
+corpus of them must be rebuilt. The version's granularity (whole-corpus) does not
+match compatibility's true granularity (per-handler).
+
+**Escape hatch (adopted, the cheap option).** A *handler-local* derivation change
+need not be shipped as a global default bump. It can instead ship as a new
+**opt-in flag with its own `_FORMAT_BUMP_*` offset** (the mechanism already in
+`effective_format_version`): callers who leave it off keep matching at the
+baseline, and only opt-in users get the new version — no forced re-index of
+unchanged corpora. The v2 audio bank was promoted to default-on *by deliberate
+choice* (it makes the "Shazam-style" excerpt-matching claim honest out of the
+box); a future handler-local change MAY instead stay opt-in until a coordinated
+major bump. Prefer this for any change that touches a single handler.
+
+**Target model (designed, not yet built): a composite per-handler version.**
+The structurally correct fix is to make the recorded version a small mapping of
+*handler-family → derivation version* (e.g. `{"audio": 2, "default": 1}`) instead
+of one scalar, so a per-handler bump leaves the other families untouched. Sketch:
+
+- `effective_format_version` returns the composite for a config; `Fingerprint`
+  carries its handler's entry; the index pins the *union* of the families it
+  holds rather than one number.
+- `_check_format_version` resolves compatibility **per handler family**: a query
+  is compatible iff the index's version for *that family* matches. An audio-only
+  v→v+1 bump then flags only audio queries/corpora; text/image stay compatible.
+- **Migration:** a legacy scalar `v` maps to the uniform composite `{"*": v}`
+  (and an absent stamp still reads as the current default), so existing snapshots
+  load unchanged under the tolerant "absent ⇒ default" rule.
+
+This is deliberately deferred (it is a snapshot-schema-level change — see §1 — and
+must preserve the cross-backend ranking parity invariant), and is the recommended
+direction *if/when* mixed-handler corpora with independently-evolving handlers
+become a real workload. The heavier alternative — a per-file or per-posting
+version tag allowing side-by-side same-handler versions in one index — is
+**explicitly out of scope** unless that capability is actually required, because
+it is the only option that touches every backend's storage layout and the shared
+scoring path (the two riskiest surfaces in the codebase).
+
 ## 1.0 definition-of-done checklist
 
 `1.0.0` is tagged when **all** of the following are true:
