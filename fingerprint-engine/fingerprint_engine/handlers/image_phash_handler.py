@@ -22,7 +22,6 @@ from __future__ import annotations
 import hashlib
 import logging
 from functools import lru_cache
-from pathlib import Path
 
 import numpy as np
 
@@ -177,35 +176,13 @@ class ImagePHashHandler(ImageFileHandler):
     # given config), not by priority, so this never competes with raster.
     priority = ImageFileHandler.priority
 
-    # The mode this handler SERVES. ``can_handle`` returns a score only when the
-    # active (configured) mode equals this; otherwise it declines.
+    # The mode this handler SERVES. Routing reuses the inherited
+    # ImageFileHandler.can_handle gate verbatim -- it reads ``self._SERVED_MODE``
+    # (``"phash"`` here) and ``self.image_mode``, so under the default
+    # ``"raster"`` mode this handler declines every file and the raster handler
+    # claims images unchanged; only under ``"phash"`` does it claim them. There is
+    # no need to re-declare can_handle or __init__ (both are inherited intact).
     _SERVED_MODE = "phash"
-
-    def __init__(self, image_mode: str = "raster") -> None:
-        super().__init__(image_mode)
-
-    def can_handle(  # type: ignore[override]
-        self,
-        path: str | Path,
-        mime_type: str | None = None,
-        sample: bytes | None = None,
-    ) -> float:
-        """Claim images only when the active mode is ``"phash"``.
-
-        Overridden as an INSTANCE method (the base ``can_handle`` is a
-        classmethod, but ``_rank_handlers`` calls it on instances) so it can read
-        the per-instance ``image_mode`` that ``configure`` set from the active
-        config. Under the default ``"raster"`` mode this returns ``0.0`` for every
-        file, so the phash handler never participates in routing and the raster
-        handler's claim -- and therefore the whole default fingerprint path -- is
-        unchanged. The underlying image scoring reuses the raster handler's shared
-        ``_image_score`` classmethod (the identical scoring body), so when phash
-        mode IS active this handler claims exactly the files raster would have.
-        """
-
-        if self.image_mode != self._SERVED_MODE:
-            return 0.0
-        return self._image_score(path, mime_type, sample)
 
     def extract_peaks(
         self,
@@ -253,11 +230,6 @@ class ImagePHashHandler(ImageFileHandler):
 
     def metadata(self, payload: ImagePayload) -> dict[str, object]:
         return {
-            "width": payload.width,
-            "height": payload.height,
-            "original_width": payload.original_size[0],
-            "original_height": payload.original_size[1],
-            "mode": payload.mode,
-            "image_mode": self.image_mode,
+            **self._image_metadata(payload),
             "signal_strategy": "canonical_256x256_dct_phash",
         }

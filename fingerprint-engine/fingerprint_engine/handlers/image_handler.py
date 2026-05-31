@@ -198,7 +198,14 @@ class ImageFileHandler(FileHandler):
     def to_signal(self, payload: ImagePayload) -> np.ndarray:
         return (payload.pixels.reshape(-1) - 127.5) / 127.5
 
-    def metadata(self, payload: ImagePayload) -> dict[str, object]:
+    def _image_metadata(self, payload: ImagePayload) -> dict[str, object]:
+        """The image metadata shared by the raster and phash handlers.
+
+        Both report the same canonical/original dimensions, mode, and active
+        image_mode; each handler's :meth:`metadata` adds only its own
+        ``signal_strategy``. Single source of truth for the shared keys.
+        """
+
         return {
             "width": payload.width,
             "height": payload.height,
@@ -206,5 +213,10 @@ class ImageFileHandler(FileHandler):
             "original_height": payload.original_size[1],
             "mode": payload.mode,
             "image_mode": self.image_mode,
+        }
+
+    def metadata(self, payload: ImagePayload) -> dict[str, object]:
+        return {
+            **self._image_metadata(payload),
             "signal_strategy": "canonical_256x256_grayscale_intensity",
         }
