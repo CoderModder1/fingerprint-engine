@@ -119,6 +119,29 @@ def _fsync_path(path: Path) -> None:
         pass
 
 
+def _index_metadata(fingerprint: Fingerprint) -> dict[str, Any]:
+    """The per-file metadata dict every backend stores for a fingerprint.
+
+    Single source of truth for the index-metadata shape, so all four backends
+    store an identical record -- which is what makes list_files/iter_metadata and
+    snapshot interop parity hold. ``**fingerprint.metadata`` is merged LAST so a
+    handler's extra keys never shadow the canonical fields. The SQL/Redis backends
+    json.dumps(..., sort_keys=True) it (so insertion order is normalized there);
+    InMemory stores it directly and to_dict serializes it.
+    """
+
+    return {
+        "file_id": fingerprint.file_id,
+        "path": fingerprint.path,
+        "handler": fingerprint.handler,
+        "size_bytes": fingerprint.size_bytes,
+        "content_sha256": fingerprint.content_sha256,
+        "hash_count": fingerprint.hash_count,
+        "landmark_count": fingerprint.landmark_count,
+        **fingerprint.metadata,
+    }
+
+
 _BackendMethod = TypeVar("_BackendMethod", bound=Callable[..., Any])
 
 
@@ -1084,16 +1107,7 @@ class InMemoryHashIndex(HashIndex):
             self.remove(fingerprint.file_id)
             entries = [(item.hash_code, item.time_offset) for item in fingerprint.hashes]
             self._file_entries[fingerprint.file_id] = entries
-            self._metadata[fingerprint.file_id] = {
-                "file_id": fingerprint.file_id,
-                "path": fingerprint.path,
-                "handler": fingerprint.handler,
-                "size_bytes": fingerprint.size_bytes,
-                "content_sha256": fingerprint.content_sha256,
-                "hash_count": fingerprint.hash_count,
-                "landmark_count": fingerprint.landmark_count,
-                **fingerprint.metadata,
-            }
+            self._metadata[fingerprint.file_id] = _index_metadata(fingerprint)
             surrogate = self._intern_file_id(fingerprint.file_id)
             for hash_code, time_offset in entries:
                 # Store the compact (surrogate, time_offset) int pair; the str
@@ -1435,16 +1449,7 @@ class RedisHashIndex(HashIndex):
         self.remove(fingerprint.file_id)
         file_id = fingerprint.file_id
         entries = [(item.hash_code, item.time_offset) for item in fingerprint.hashes]
-        metadata = {
-            "file_id": file_id,
-            "path": fingerprint.path,
-            "handler": fingerprint.handler,
-            "size_bytes": fingerprint.size_bytes,
-            "content_sha256": fingerprint.content_sha256,
-            "hash_count": fingerprint.hash_count,
-            "landmark_count": fingerprint.landmark_count,
-            **fingerprint.metadata,
-        }
+        metadata = _index_metadata(fingerprint)
         pipe = self._redis.pipeline()
         pipe.sadd(self._key("files"), file_id)
         pipe.set(self._key("m", file_id), json.dumps(metadata, sort_keys=True))
@@ -1510,16 +1515,7 @@ class RedisHashIndex(HashIndex):
 
             # --- add() effect for the surviving fingerprint ---
             entries = [(item.hash_code, item.time_offset) for item in fingerprint.hashes]
-            metadata = {
-                "file_id": file_id,
-                "path": fingerprint.path,
-                "handler": fingerprint.handler,
-                "size_bytes": fingerprint.size_bytes,
-                "content_sha256": fingerprint.content_sha256,
-                "hash_count": fingerprint.hash_count,
-                "landmark_count": fingerprint.landmark_count,
-                **fingerprint.metadata,
-            }
+            metadata = _index_metadata(fingerprint)
             pipe.sadd(self._key("files"), file_id)
             pipe.set(self._key("m", file_id), json.dumps(metadata, sort_keys=True))
             for hash_code, time_offset in entries:
@@ -1839,16 +1835,7 @@ class SQLiteHashIndex(HashIndex):
     def add(self, fingerprint: Fingerprint) -> None:
         self._record_format_version(fingerprint)
         self.remove(fingerprint.file_id)
-        metadata = {
-            "file_id": fingerprint.file_id,
-            "path": fingerprint.path,
-            "handler": fingerprint.handler,
-            "size_bytes": fingerprint.size_bytes,
-            "content_sha256": fingerprint.content_sha256,
-            "hash_count": fingerprint.hash_count,
-            "landmark_count": fingerprint.landmark_count,
-            **fingerprint.metadata,
-        }
+        metadata = _index_metadata(fingerprint)
         try:
             # remove() above deleted any prior files row, so this INSERT allocates
             # a fresh surrogate id (cursor.lastrowid). Postings carry that
@@ -1909,16 +1896,7 @@ class SQLiteHashIndex(HashIndex):
         # exists, so they are staged per file and assembled into one bulk insert.
         staged: list[tuple[str, str, list[tuple[int, int]]]] = []
         for file_id, fingerprint in survivors.items():
-            metadata = {
-                "file_id": file_id,
-                "path": fingerprint.path,
-                "handler": fingerprint.handler,
-                "size_bytes": fingerprint.size_bytes,
-                "content_sha256": fingerprint.content_sha256,
-                "hash_count": fingerprint.hash_count,
-                "landmark_count": fingerprint.landmark_count,
-                **fingerprint.metadata,
-            }
+            metadata = _index_metadata(fingerprint)
             staged.append((
                 file_id,
                 json.dumps(metadata, sort_keys=True),
@@ -2419,16 +2397,7 @@ class PostgresHashIndex(HashIndex):
     def add(self, fingerprint: Fingerprint) -> None:
         self._record_format_version(fingerprint)
         self.remove(fingerprint.file_id)
-        metadata = {
-            "file_id": fingerprint.file_id,
-            "path": fingerprint.path,
-            "handler": fingerprint.handler,
-            "size_bytes": fingerprint.size_bytes,
-            "content_sha256": fingerprint.content_sha256,
-            "hash_count": fingerprint.hash_count,
-            "landmark_count": fingerprint.landmark_count,
-            **fingerprint.metadata,
-        }
+        metadata = _index_metadata(fingerprint)
         with self._conn.cursor() as cur:
             # remove() above deleted any prior files row, so RETURNING id yields a
             # fresh surrogate; postings carry that file_ref, not the file_id string.
@@ -2477,16 +2446,7 @@ class PostgresHashIndex(HashIndex):
         # is filled in once the files row is inserted and its id known.
         staged: list[tuple[str, str, list[tuple[int, int]]]] = []
         for file_id, fingerprint in survivors.items():
-            metadata = {
-                "file_id": file_id,
-                "path": fingerprint.path,
-                "handler": fingerprint.handler,
-                "size_bytes": fingerprint.size_bytes,
-                "content_sha256": fingerprint.content_sha256,
-                "hash_count": fingerprint.hash_count,
-                "landmark_count": fingerprint.landmark_count,
-                **fingerprint.metadata,
-            }
+            metadata = _index_metadata(fingerprint)
             staged.append((
                 file_id,
                 json.dumps(metadata, sort_keys=True),
