@@ -893,6 +893,7 @@ class HashIndex(ABC):
         metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
         if not isinstance(files, dict):
             raise InvalidSnapshotError("invalid index snapshot: files must be a mapping")
+        total_dropped = 0
         for file_id, entries in files.items():
             if not isinstance(entries, list):
                 continue
@@ -910,6 +911,18 @@ class HashIndex(ABC):
                 if isinstance(entry, (list, tuple)) and len(entry) == 2
                 and _in_hash_range(int(entry[0]))
             ]
+            # Surface (don't silence) malformed/out-of-range postings: a partial
+            # load is still useful, but a SILENT drop hid a degraded snapshot that
+            # then returned weaker results. Rebuilding via add() below recomputes
+            # hash_count from the kept hashes, so confidence stays calibrated here.
+            dropped = len(entries) - len(hashes)
+            if dropped:
+                total_dropped += dropped
+                logger.warning(
+                    "snapshot file %s: skipped %d malformed/out-of-range posting(s) on load",
+                    file_id,
+                    dropped,
+                )
             meta = metadata.get(file_id, {}) if isinstance(metadata, dict) else {}
             meta = meta if isinstance(meta, dict) else {}
             self.add(
@@ -933,6 +946,14 @@ class HashIndex(ABC):
                         }
                     },
                 )
+            )
+        if total_dropped:
+            logger.warning(
+                "loaded snapshot %s with %d posting(s) skipped as malformed or "
+                "out-of-range; the index is degraded -- re-fingerprint the source "
+                "to restore full recall",
+                path,
+                total_dropped,
             )
         return self
 
@@ -1264,6 +1285,7 @@ class InMemoryHashIndex(HashIndex):
                 for file_id, value in metadata.items()
             }
 
+        total_dropped = 0
         for file_id, entries in files.items():
             normalized_entries: list[tuple[int, int]] = []
             if not isinstance(entries, list):
@@ -1282,6 +1304,31 @@ class InMemoryHashIndex(HashIndex):
                 normalized_entries.append((hash_code, time_offset))
                 index._postings[hash_code].append((surrogate, time_offset))
             index._file_entries[str(file_id)] = normalized_entries
+            # Unlike load_snapshot (which rebuilds via add()), from_dict copies the
+            # snapshot metadata wholesale, so a dropped posting would leave the
+            # stored hash_count STALE -- inflating the confidence denominator and
+            # deflating every match's confidence for that file. Recompute it to the
+            # postings actually loaded, and surface the drop. Only touched when a
+            # drop occurred, so a clean snapshot is byte-identical.
+            dropped = len(entries) - len(normalized_entries)
+            if dropped:
+                total_dropped += dropped
+                meta = index._metadata.setdefault(str(file_id), {})
+                meta["hash_count"] = len(normalized_entries)
+                logger.warning(
+                    "snapshot file %s: skipped %d malformed/out-of-range posting(s); "
+                    "recomputed hash_count to %d",
+                    file_id,
+                    dropped,
+                    len(normalized_entries),
+                )
+        if total_dropped:
+            logger.warning(
+                "loaded index with %d posting(s) skipped as malformed or "
+                "out-of-range; the index is degraded -- re-fingerprint the source "
+                "to restore full recall",
+                total_dropped,
+            )
         return index
 
     @classmethod

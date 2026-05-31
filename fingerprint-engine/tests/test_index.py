@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -1898,6 +1899,46 @@ def test_candidate_limit_keeps_repeated_code_high_vote_match_across_backends() -
         top = index.search(query, top_k=1, candidate_limit=5)
         assert top and top[0].file_id == "true", name
         assert top[0].aligned_votes >= 20, (name, top[0].aligned_votes)
+
+
+def test_from_dict_counts_dropped_postings_and_recomputes_hash_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A7: from_dict copies snapshot metadata wholesale, so a dropped posting left
+    # a STALE hash_count that inflates the confidence denominator (deflating every
+    # match for that file). It must drop + WARN + recompute hash_count to the
+    # postings actually loaded, while leaving a clean file untouched.
+    data = {
+        "backend": "in_memory",
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "files": {
+            # 3 valid postings + a wrong-arity entry + a non-list entry (2 dropped).
+            "file-a": [[1000, 0], [1001, 0], [1002, 0], [1003], "garbage"],
+            "file-b": [[2000, 0], [2001, 0]],  # clean
+        },
+        "metadata": {
+            "file-a": {"file_id": "file-a", "handler": "test", "hash_count": 5},  # STALE
+            "file-b": {"file_id": "file-b", "handler": "test", "hash_count": 2},
+        },
+    }
+    with caplog.at_level(logging.WARNING):
+        index = InMemoryHashIndex.from_dict(data)
+
+    # Degraded file's hash_count recomputed to the kept count; clean file untouched.
+    assert index._metadata["file-a"]["hash_count"] == 3
+    assert index._metadata["file-b"]["hash_count"] == 2
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("skipped 2" in m for m in messages)
+    assert any("degraded" in m for m in messages)
+
+    # Confidence is calibrated to the recomputed count: a query of all 5 intended
+    # codes aligns the 3 survivors -> 3 / min(5, 3) = 1.0, not the deflated
+    # 3 / min(5, 5) = 0.6 the stale hash_count would have produced.
+    query = fp_with_hashes("q", [(1000, 0), (1001, 0), (1002, 0), (1003, 0), (1004, 0)])
+    result = index.search(query, top_k=1)[0]
+    assert result.file_id == "file-a"
+    assert result.aligned_votes == 3
+    assert result.confidence == pytest.approx(1.0)
 
 
 def test_candidate_limit_zero_returns_no_results_across_backends() -> None:
