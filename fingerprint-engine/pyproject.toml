@@ -89,6 +89,10 @@ include = ["fingerprint_engine*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Put the repo root on sys.path so tests import the package without a per-file
+# sys.path bootstrap (the editable install also provides it; this makes a
+# non-installed checkout runnable too).
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 120
