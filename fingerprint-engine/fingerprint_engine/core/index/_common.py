@@ -13,10 +13,8 @@ from typing import Any, TypeVar, cast
 from ..exceptions import (
     InvalidSnapshotError,
 )
-from ..models import (
-    FINGERPRINT_FORMAT_VERSION,
-    Fingerprint,
-)
+from ..format_version import FINGERPRINT_FORMAT_VERSION, coerce_format_version
+from ..models import Fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -70,13 +68,7 @@ def _snapshot_format_version(data: dict[str, object]) -> int:
     search-time compatibility check, never a gate on loadability.
     """
 
-    raw = data.get(SNAPSHOT_FORMAT_VERSION_KEY, FINGERPRINT_FORMAT_VERSION)
-    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
-        return FINGERPRINT_FORMAT_VERSION
-    try:
-        return int(raw)
-    except ValueError:
-        return FINGERPRINT_FORMAT_VERSION
+    return coerce_format_version(data.get(SNAPSHOT_FORMAT_VERSION_KEY, FINGERPRINT_FORMAT_VERSION))
 
 
 def _in_hash_range(hash_code: int) -> bool:
