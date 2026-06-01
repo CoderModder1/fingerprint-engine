@@ -7,6 +7,7 @@ import logging
 import threading
 from collections.abc import Iterable
 
+from ..exceptions import MissingDependencyError
 from ..models import (
     Fingerprint,
     IndexPosting,
@@ -76,9 +77,11 @@ class PostgresHashIndex(HashIndex):
             try:
                 import psycopg
             except ImportError as exc:  # pragma: no cover - exercised only without psycopg
-                raise RuntimeError(
-                    "psycopg is required for PostgresHashIndex; install it with "
-                    "'pip install \"psycopg[binary]\"'"
+                raise MissingDependencyError(
+                    "psycopg is required for PostgresHashIndex; install with "
+                    "'pip install \"fingerprint-engine[postgres]\"'",
+                    package="psycopg",
+                    extra="postgres",
                 ) from exc
             self._conn = psycopg.connect(dsn)
         self._init_schema()

@@ -37,6 +37,29 @@ byte-identical (only the version stamp advances for them) while audio changes:
   excerpt recall on stationary audio; the bank is kept on by default for
   robustness on real non-stationary audio.)
 
+### Changed — pre-1.0 public surface (breaking; locked ahead of the 1.0 freeze)
+
+The public surface was reviewed and corrected while it is still cheap to change,
+before it is frozen at 1.0:
+
+- `SearchResult` field order now matches `to_dict()` and VERSIONING §3 —
+  `confidence` follows `score` — and `confidence` is now a REQUIRED field (its
+  silent `0.0` default, which the default `Calibration` rejects, is gone).
+  Breaking for code that built `SearchResult` positionally or relied on the
+  default; the scoring path (the only constructor) builds by keyword and always
+  sets it, so search behaviour is unchanged.
+- `IndexPosting` — the return type of `HashIndex.query`/`query_many` — is now
+  re-exported from the top-level `fingerprint_engine` package and `__all__`.
+- `RedisHashIndex` / `PostgresHashIndex` now raise `MissingDependencyError`
+  (not a bare `RuntimeError`) when their optional driver is absent, matching the
+  lazy-extras contract; the CLI maps this to exit code 3 (missing dependency).
+- VERSIONING §2 corrected to match the code: the cross-backend snapshot-load
+  contract method is `load_snapshot(path)` (not `load`), `save` is
+  `save(path, *, force=False)`, and `prune_stop_hashes` is documented as
+  unsupported on `RedisHashIndex` (the one non-universal contract method).
+- `Fingerprint` is documented as a deliberately MUTABLE value object (the other
+  six models remain `frozen=True`).
+
 ### Tests / CI
 
 - The "all four backends rank identically" guarantee is now proven for Postgres

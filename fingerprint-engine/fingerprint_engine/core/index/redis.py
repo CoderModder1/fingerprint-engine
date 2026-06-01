@@ -7,6 +7,7 @@ import logging
 import threading
 from collections.abc import Iterable
 
+from ..exceptions import MissingDependencyError
 from ..models import (
     Fingerprint,
     IndexPosting,
@@ -72,8 +73,11 @@ class RedisHashIndex(HashIndex):
             try:
                 import redis
             except ImportError as exc:  # pragma: no cover - exercised only without redis
-                raise RuntimeError(
-                    "redis is required for RedisHashIndex; install it with 'pip install redis'"
+                raise MissingDependencyError(
+                    "redis is required for RedisHashIndex; install with "
+                    "'pip install \"fingerprint-engine[redis]\"'",
+                    package="redis",
+                    extra="redis",
                 ) from exc
             client_kwargs.setdefault("decode_responses", True)
             self._redis = redis.Redis.from_url(url, **client_kwargs)

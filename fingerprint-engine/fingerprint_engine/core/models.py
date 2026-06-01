@@ -256,7 +256,16 @@ class ConstellationHash:
 
 @dataclass
 class Fingerprint:
-    """Fingerprint output for one file."""
+    """Fingerprint output for one file.
+
+    Unlike the other models (all ``frozen=True``), ``Fingerprint`` is a
+    DELIBERATELY MUTABLE value object: it is the working output of fingerprinting,
+    with list/dict fields (``landmarks``/``hashes``/``config``/``metadata``).
+    Freezing it would block attribute REASSIGNMENT only, not in-place mutation of
+    those containers, so it would add ceremony without a real immutability
+    guarantee. Treat a fingerprint as read-only once added to an index (the index
+    pins its ``format_version`` from the first fingerprint added).
+    """
 
     file_id: str
     path: str
@@ -354,15 +363,21 @@ class IndexPosting:
 
 @dataclass(frozen=True)
 class SearchResult:
-    """Ranked match returned from a hash index."""
+    """Ranked match returned from a hash index.
+
+    Field order matches :meth:`to_dict` and VERSIONING.md §3: ``confidence``
+    follows ``score``. ``confidence`` is REQUIRED (it carries no default) -- the
+    scoring path always computes it -- so a result can never silently carry
+    ``confidence=0.0`` (which the default :class:`Calibration` rejects).
+    """
 
     file_id: str
     score: float
+    confidence: float
     aligned_votes: int
     total_votes: int
     unique_hashes: int
     offset: int
-    confidence: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

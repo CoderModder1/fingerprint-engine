@@ -31,10 +31,17 @@ bumps may carry breaking changes; the guarantees below become binding at 1.0.
 
 Anything prefixed with `_`, the `benchmarks/` harness, the test suite, exact log
 message text, exact floating-point `score` *values* (only the ordering and the
-`confidence` semantics are stable -- see below), and internal backend storage
+`confidence` semantics are stable -- see below), internal backend storage
 layouts (the SQLite table DDL, the Redis key layout) that are not the portable
-JSON snapshot. Optional extras' transitive dependency versions float within the
-declared lower bounds in `pyproject.toml`.
+JSON snapshot, and non-`_`-prefixed module-level helper functions that are NOT
+re-exported in the top-level `__all__` (e.g.
+`fingerprint_engine.core.fingerprinter.expand_paths` /
+`file_content_sha256` -- internal utilities the CLI uses, which may change). The
+embedding encode-on-load path -- the `Embedder` protocol and any shipped concrete
+encoder under `fingerprint_engine.handlers.embedders` (e.g. `Model2VecEmbedder`)
+-- is an optional convenience reached via its submodule, NOT part of the frozen
+top-level `__all__` surface. Optional extras' transitive dependency versions
+float within the declared lower bounds in `pyproject.toml`.
 
 ## Stable public interfaces
 
@@ -96,8 +103,16 @@ them with identical observable semantics:
   ingest to skip already-indexed content cheaply.
 - `prune_stop_hashes(max_df_ratio=...)` -- explicit, caller-invoked pruning of
   non-discriminative high document-frequency codes (does **not** run by
-  default).
-- `save(path)` / `load(path)` -- the portable snapshot (section 1).
+  default). Implemented by `InMemoryHashIndex`, `SQLiteHashIndex`, and
+  `PostgresHashIndex`; **`RedisHashIndex` does not implement it** and raises
+  `NotImplementedError` (rebuild from a pruned snapshot instead). It is the one
+  contract method not universal across all four backends; the CLI `prune`
+  subcommand against `--backend redis` therefore exits 4 (operational) with that
+  message rather than pruning.
+- `save(path, *, force=False)` / `load_snapshot(path)` -- the portable snapshot
+  (section 1). (`InMemoryHashIndex` additionally offers a `load(path)`
+  *classmethod* convenience returning a new instance; the cross-backend contract
+  method that loads into an existing index is `load_snapshot`.)
 
 Note: `list_files`, `iter_metadata`, `contains`, `add_many`, and `query_many`
 are part of the contract **now** -- adding them was a backward-compatible
