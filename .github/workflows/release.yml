@@ -1,6 +1,6 @@
 name: Release
 
-# Publish to PyPI on a version tag (e.g. v0.2.0) via OIDC "trusted publishing"
+# Publish to PyPI on a version tag (e.g. v1.0.0) via OIDC "trusted publishing"
 # -- no API token stored in the repo. The push of the tag ALSO triggers ci.yml
 # (its `on: push` matches tags), so the full test matrix runs against the exact
 # tagged commit alongside this build.

@@ -1,10 +1,10 @@
 # Versioning and Compatibility
 
 This document defines what `fingerprint-engine` promises to keep stable, how
-those promises are versioned, and the checklist that must be true to tag the
-first stable release (`1.0.0`). Until then the project is pre-1.0 and the public
-surface may still change; this document is the contract we intend to freeze at
-1.0.
+those promises are versioned, and the checklist that gated the first stable
+release (`1.0.0`). **As of `1.0.0` the public surface is frozen** — see the
+API-freeze sign-off at the end; a backward-incompatible change to any stable
+interface now requires a MAJOR bump. (Before 1.0 the surface could still change.)
 
 ## Semantic versioning policy
 
@@ -293,40 +293,91 @@ version tag allowing side-by-side same-handler versions in one index — is
 it is the only option that touches every backend's storage layout and the shared
 scoring path (the two riskiest surfaces in the codebase).
 
+### 5. CLI surface
+
+The `fingerprint-engine` CLI is a stable public interface. Its full reference
+(every flag, default, and JSON key) is the README "CLI Reference" section; the
+guarantees here are:
+
+- **Subcommands.** The seven subcommands — `fingerprint`, `add`, `search`,
+  `prune`, `list`, `dedup`, and `doctor` — and their documented flags are stable.
+  A new subcommand, a new flag with a default, or a new additive JSON key is
+  MINOR; removing or renaming a subcommand/flag/output key, or changing a flag's
+  meaning, is MAJOR.
+- **Exit codes.** `0` success; `1` input error (no handler, missing file, a
+  directory where a file was expected, or an input over `--max-file-size`); `2`
+  usage error (argparse); `3` missing optional dependency; `4`
+  backend/operational error. These mappings are stable and covered by tests.
+- **JSON output keys.** Each command emits a single JSON object whose documented
+  keys are stable (additive-only). For `doctor` specifically, the report keys —
+  including the per-extra `optional` and `encoders` lists and the top-level
+  `available_encoders` — are part of the stable contract: they were added as
+  backward-compatible extensions and are frozen alongside the rest at 1.0.
+- A `search` result's matched-file `path`/`handler` live under its `metadata`;
+  the `SearchResult` field set itself is governed by §3.
+
 ## 1.0 definition-of-done checklist
 
 `1.0.0` is tagged when **all** of the following are true:
 
-- [ ] **Public API frozen.** `fingerprint_engine.__all__`, the four `HashIndex`
+- [x] **Public API frozen.** `fingerprint_engine.__all__`, the four `HashIndex`
       backends and the full contract in section 2, and the model dataclasses
       (`FingerprintConfig`, `Fingerprint`, `SearchResult`, `Calibration`,
       `LandmarkPoint`, `ConstellationHash`) are reviewed and declared stable.
-- [ ] **Snapshot schema documented and versioned.** `schema_version` is `1`,
+- [x] **Snapshot schema documented and versioned.** `schema_version` is `1`,
       load validates it, and unsupported/invalid snapshots fail with
       `InvalidSnapshotError`. (Met today.)
-- [ ] **Fingerprint derivation pinned.** The default-config derivation is
+- [x] **Fingerprint derivation pinned.** The default-config derivation is
       documented as the stable interface, an explicit `fingerprint_format_version`
       is recorded, and every opt-in matching feature is verified default-off and
       additive (default-config hashes byte-identical with the feature compiled
       in but not enabled).
-- [ ] **CLI contract stable.** The `fingerprint`, `add`, `search`, `prune`,
+- [x] **CLI contract stable.** The `fingerprint`, `add`, `search`, `prune`,
       `list`, `dedup`, and `doctor` subcommands, their flags, JSON output keys,
       and exit codes (0 success; 1 input error; 2 usage; 3 missing dependency;
       4 backend/operational) are documented and covered by tests.
-- [ ] **Dependency boundary verified.** numpy is the only hard runtime
+- [x] **Dependency boundary verified.** numpy is the only hard runtime
       dependency; every other capability is behind an extra
       (`image`/`audio`/`pdf`/`video`/`embeddings`/`redis`/`postgres`/`service`),
       lazily imported, and
       a core-only install imports and runs the core handlers/backends. `doctor`
       reports the true availability.
-- [ ] **Quality gates green.** `pytest`, `ruff check .`, and
+- [x] **Quality gates green.** `pytest`, `ruff check .`, and
       `mypy fingerprint_engine` all pass on every supported Python
       (3.10--3.13) in CI.
-- [ ] **Docs complete.** `README`, `CHANGELOG` (an Unreleased section promoted to
+- [x] **Docs complete.** `README`, `CHANGELOG` (an Unreleased section promoted to
       the `1.0.0` heading), `SECURITY.md`, `LICENSE`/`NOTICE`, and this
       `VERSIONING.md` are current and consistent.
-- [ ] **Accuracy baseline recorded.** The deterministic accuracy harness
+- [x] **Accuracy baseline recorded.** The deterministic accuracy harness
       (`benchmarks/accuracy.py` + `tests/test_accuracy.py`) records the shipped
       recall/precision baseline. As of v2, audio excerpt/clip recall is part of
       the *default* baseline (the float64 reductions + the default audio window
       bank fixed the former limitation), so a regression in it is detectable.
+
+## API-freeze sign-off (1.0.0)
+
+The public surface was reviewed and is **declared stable** as of `1.0.0`
+(2026-06-01). From this release on, the guarantees in *Stable public interfaces*
+(§1–§5) are binding: a backward-incompatible change to any of them requires a
+**MAJOR** bump (`2.0.0`), per the semantic-versioning policy above.
+
+Reviewed and frozen:
+
+- The top-level `import fingerprint_engine` surface — its `__all__`, the four
+  `HashIndex` backends and the full §2 contract, and the model dataclasses
+  (`FingerprintConfig`, `Fingerprint`, `SearchResult`, `Calibration`,
+  `LandmarkPoint`, `ConstellationHash`).
+- The portable snapshot schema (§1), the `SearchResult`/confidence semantics
+  (§3), the default fingerprint derivation and `FINGERPRINT_FORMAT_VERSION` (§4),
+  and the CLI surface — subcommands, flags, exit codes, and JSON keys (§5).
+
+Two surface decisions resolved at sign-off:
+
+- **`doctor` JSON additive keys are in-contract.** The per-extra `optional` and
+  `encoders` lists and the top-level `available_encoders` (added as
+  backward-compatible extensions) are part of the stable CLI contract (§5).
+- **`Model2VecEmbedder` is intentionally *not* frozen.** The
+  `fingerprint_engine.handlers.embedders` encode-on-load path (the `Embedder`
+  protocol and the shipped `Model2VecEmbedder`) stays an optional submodule
+  convenience, deliberately outside the frozen top-level `__all__` (see *What is
+  not covered*), so it can still evolve without a MAJOR bump.

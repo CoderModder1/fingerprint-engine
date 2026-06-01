@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-06-01
+## [1.0.0] - 2026-06-01
+
+First stable release. The public API, the portable snapshot schema, the default
+fingerprint derivation, and the CLI surface are now **frozen** under the
+semantic-versioning policy in `VERSIONING.md` (see its 1.0.0 API-freeze
+sign-off): a backward-incompatible change to any of them now requires a MAJOR
+bump. This release also lands the full hardening work below. (The `0.2.0`
+development version was never tagged or published; its content ships here.)
 
 Tier-1 through Tier-5 hardening: correctness, durability, reliability,
 performance, and the product/operability layer. With ONE exception called out
@@ -285,5 +292,5 @@ Baseline release.
 - Benchmark harness covering fingerprinting throughput, per-backend build rate
   and footprint, query latency, scaling, and accuracy at scale.
 
-[Unreleased]: https://github.com/CoderModder1/fingerprint-engine/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/CoderModder1/fingerprint-engine/releases/tag/v0.2.0
+[Unreleased]: https://github.com/CoderModder1/fingerprint-engine/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/CoderModder1/fingerprint-engine/releases/tag/v1.0.0
