@@ -425,6 +425,76 @@ def test_add_non_incremental_default_reindexes_existing(
     assert second["file_count"] == 3
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param([], id="no-subcommand"),
+        pytest.param(["not-a-command"], id="unknown-subcommand"),
+        pytest.param(["search"], id="missing-required-positional"),
+        pytest.param(["search", "query.py", "--top-k", "not-an-int"], id="bad-int-type"),
+        pytest.param(["--backend", "invalid", "list"], id="bad-backend-choice"),
+    ],
+)
+def test_usage_errors_exit_2(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    # argparse usage errors are raised as SystemExit(2) from parse_args, BEFORE
+    # main()'s try/except runs -- so they surface as the conventional exit code 2
+    # (a usage error), distinct from the library exit codes 1/3/4. main() never
+    # catches SystemExit, so the code propagates unchanged.
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(argv)
+    assert exc_info.value.code == 2
+    # argparse writes its diagnostic to stderr, never stdout.
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err != ""
+
+
+def test_prune_operational_error_exits_4(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A backend that declines an operation (here Redis, whose prune_stop_hashes
+    # raises NotImplementedError -- a RuntimeError subclass) must surface as the
+    # operational exit code 4, not a traceback. open_index is stubbed so the test
+    # needs no live Redis: with the real driver absent, open_index would instead
+    # raise MissingDependencyError (exit 3) before prune is ever reached.
+    class _DecliningIndex:
+        def prune_stop_hashes(self, max_df_ratio: float = 0.1) -> int:
+            raise NotImplementedError(
+                "RedisHashIndex does not support prune_stop_hashes; "
+                "rebuild from a snapshot of a pruned index instead"
+            )
+
+    monkeypatch.setattr(cli, "open_index", lambda args: _DecliningIndex())
+
+    code, out, err = _run(
+        ["--backend", "redis", "prune", "--max-df-ratio", "0.1"], capsys
+    )
+
+    assert code == 4
+    assert out == ""
+    assert "error:" in err
+    assert "prune_stop_hashes" in err
+
+
+def test_corrupt_index_snapshot_exits_4(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An unreadable/corrupt memory snapshot is an operational failure (a
+    # FingerprintError from the index layer), not a usage error: exit 4, clean
+    # one-line stderr, no traceback.
+    bad_index = tmp_path / "corrupt.json"
+    bad_index.write_text("{ this is not valid json", encoding="utf-8")
+    query = _write_corpus(tmp_path)[0]
+
+    code, out, err = _run(
+        ["--index-path", str(bad_index), "search", str(query)], capsys
+    )
+
+    assert code == 4
+    assert out == ""
+    assert "error:" in err
+
+
 def test_doctor_exits_0_and_reports_versions_and_capabilities(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -444,7 +514,7 @@ def test_doctor_exits_0_and_reports_versions_and_capabilities(
 
     # Core capabilities are always available (numpy-only install).
     assert payload["core"]["requires"] == ["numpy"]
-    assert set(payload["core"]["handlers"]) == {"binary", "text", "archive"}
+    assert set(payload["core"]["handlers"]) == {"binary", "text", "archive", "embedding"}
     assert set(payload["core"]["backends"]) == {"memory", "sqlite"}
     # The core handlers/backends are always reported as available.
     assert {"binary", "text", "archive"}.issubset(set(payload["available_handlers"]))
@@ -462,31 +532,54 @@ def test_doctor_reports_every_optional_extra(
     assert code == 0
     extras = json.loads(out)["extras"]
 
-    assert set(extras) == {"image", "audio", "pdf", "redis", "postgres", "service"}
+    assert set(extras) == {
+        "image",
+        "audio",
+        "pdf",
+        "video",
+        "embeddings",
+        "redis",
+        "postgres",
+        "service",
+    }
     for name, report in extras.items():
         assert set(report) == {
             "available",
             "requires",
+            "optional",
             "probes",
             "handlers",
             "backends",
             "services",
+            "encoders",
         }
         assert isinstance(report["available"], bool)
         assert report["requires"], f"{name} must list its required modules"
-        # One probe per required module, each with a stable shape.
-        assert [probe["module"] for probe in report["probes"]] == report["requires"]
+        # One probe per (required + optional) module, in that order, each with a
+        # stable shape. `requires` gates availability; `optional` only adds a
+        # capability (e.g. audio's pydub/MP3), so it is probed but not required.
+        assert [probe["module"] for probe in report["probes"]] == (
+            report["requires"] + report["optional"]
+        )
         for probe in report["probes"]:
             assert isinstance(probe["ok"], bool)
             if not probe["ok"]:
                 assert probe["error"]  # a failed probe explains why
-        # available iff every probe imported successfully.
-        assert report["available"] == all(probe["ok"] for probe in report["probes"])
+        # available iff every REQUIRED module imported (optional modules do not gate).
+        required_ok = {
+            probe["module"]: probe["ok"]
+            for probe in report["probes"]
+            if probe["module"] in report["requires"]
+        }
+        assert report["available"] == all(required_ok[m] for m in report["requires"])
 
     # The capability mapping is correct: these extras unlock these names.
     assert extras["image"]["handlers"] == ["image"]
     assert extras["audio"]["handlers"] == ["audio"]
+    assert extras["audio"]["optional"] == ["pydub"]
     assert extras["pdf"]["handlers"] == ["pdf"]
+    assert extras["video"]["handlers"] == ["video"]
+    assert extras["embeddings"]["encoders"] == ["model2vec"]
     assert extras["redis"]["backends"] == ["redis"]
     assert extras["postgres"]["backends"] == ["postgres"]
     assert extras["service"]["services"] == ["http"]
@@ -501,7 +594,7 @@ def test_doctor_capability_lists_follow_availability(
     # marked unavailable and carrying the import error.
     real_import = cli.importlib.import_module
     optional = {
-        "PIL", "scipy", "pydub", "pypdf", "redis", "psycopg",
+        "PIL", "scipy", "pydub", "pypdf", "av", "model2vec", "redis", "psycopg",
         "fastapi", "uvicorn", "python_multipart",
     }
 
@@ -518,8 +611,10 @@ def test_doctor_capability_lists_follow_availability(
     assert err == ""
     payload = json.loads(out)
     # With no extras importable, only the core capabilities remain available.
-    assert payload["available_handlers"] == sorted({"binary", "text", "archive"})
+    # The embedding handler's precomputed path is numpy-only, so it is core.
+    assert payload["available_handlers"] == sorted({"binary", "text", "archive", "embedding"})
     assert payload["available_backends"] == sorted({"memory", "sqlite"})
+    assert payload["available_encoders"] == []
     for name, report in payload["extras"].items():
         assert report["available"] is False, f"{name} must be unavailable when its deps fail to import"
         assert all(probe["ok"] is False and probe["error"] for probe in report["probes"])

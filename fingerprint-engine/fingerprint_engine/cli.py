@@ -7,6 +7,7 @@ import importlib
 import json
 import platform
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -180,31 +181,49 @@ def summarize_fingerprint(fingerprint: Fingerprint, full: bool = False) -> dict[
     }
 
 
-# Optional extras: which import probe(s) gate each extra, and what
-# handlers/backends become usable once it is installed. Kept as data so the
-# `doctor` report and the diagnosis stay in lock-step with pyproject's
-# [project.optional-dependencies]. Each entry maps the extra name to the
-# importable module names it requires (ALL must import for the extra to be
-# usable) and the human-readable capabilities it unlocks. The core install
-# (numpy only) always provides the binary/text/archive handlers and the
-# in-memory + SQLite backends, reported separately under "core".
-_EXTRA_PROBES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
-    ("image", ("PIL",), ("handler:image",)),
-    # The audio handler needs scipy for WAV and pydub (+ffmpeg) for MP3; both
-    # ship in the single `audio` extra, so the handler is only fully usable when
-    # both import.
-    ("audio", ("scipy", "pydub"), ("handler:audio",)),
-    ("pdf", ("pypdf",), ("handler:pdf",)),
-    ("redis", ("redis",), ("backend:redis",)),
-    ("postgres", ("psycopg",), ("backend:postgres",)),
+# Optional extras: which import probe(s) gate each extra, and what capabilities
+# become usable once it is installed. Kept as data so the `doctor` report stays
+# in lock-step with pyproject's [project.optional-dependencies]. Each entry's
+# REQUIRED modules must all import for the extra's primary capability to be
+# usable; OPTIONAL modules add a further capability (e.g. MP3 decoding) but do
+# not gate availability. Capabilities are tagged `handler:`/`backend:`/
+# `service:`/`encoder:`. The core install (numpy only) always provides the
+# binary/text/archive/embedding handlers and the in-memory + SQLite backends,
+# reported separately under "core".
+@dataclass(frozen=True)
+class _Extra:
+    name: str
+    required: tuple[str, ...]
+    capabilities: tuple[str, ...]
+    optional: tuple[str, ...] = ()
+
+
+_EXTRA_PROBES: tuple[_Extra, ...] = (
+    _Extra("image", ("PIL",), ("handler:image",)),
+    # WAV fingerprinting needs only scipy, so scipy ALONE makes the audio handler
+    # usable; pydub (+ffmpeg, +audioop-lts on Python 3.13) is OPTIONAL and only
+    # adds MP3 decoding. Keying `available` off scipy means a box without a
+    # working pydub still correctly reports audio (WAV) as available, with the
+    # pydub probe surfacing the missing MP3 capability.
+    _Extra("audio", ("scipy",), ("handler:audio",), optional=("pydub",)),
+    _Extra("pdf", ("pypdf",), ("handler:pdf",)),
+    # Video keyframe decoding needs PyAV; frames are canonicalized via Pillow.
+    _Extra("video", ("av", "PIL"), ("handler:video",)),
+    # The embedding HANDLER's precomputed .npy/.npz/.jsonl path is numpy-only and
+    # always available (reported under core); this extra installs model2vec, the
+    # encoder behind the optional encode-on-load path.
+    _Extra("embeddings", ("model2vec",), ("encoder:model2vec",)),
+    _Extra("redis", ("redis",), ("backend:redis",)),
+    _Extra("postgres", ("psycopg",), ("backend:postgres",)),
     # python-multipart is required by Starlette to parse uploads; its canonical
     # import name is ``python_multipart`` (the legacy ``multipart`` alias emits a
     # PendingDeprecationWarning), so probe the canonical name.
-    ("service", ("fastapi", "uvicorn", "python_multipart"), ("service:http",)),
+    _Extra("service", ("fastapi", "uvicorn", "python_multipart"), ("service:http",)),
 )
 
-# Capabilities available with only the core runtime dependency (numpy).
-_CORE_HANDLERS: tuple[str, ...] = ("binary", "text", "archive")
+# Capabilities available with only the core runtime dependency (numpy). The
+# embedding handler's precomputed-vector path is numpy-only, so it is core.
+_CORE_HANDLERS: tuple[str, ...] = ("binary", "text", "archive", "embedding")
 _CORE_BACKENDS: tuple[str, ...] = ("memory", "sqlite")
 
 
@@ -227,37 +246,42 @@ def _doctor_report() -> dict[str, Any]:
     """Build the environment diagnosis emitted by the ``doctor`` command.
 
     Reports the interpreter and engine versions, the always-available core
-    capabilities, and, for each optional extra, whether its dependency imports
-    succeed and which handlers/backends are therefore available. Pure
-    introspection -- it imports candidate modules to test availability but never
-    fingerprints, opens an index, or mutates anything.
+    capabilities, and, for each optional extra, whether its REQUIRED dependencies
+    import (gating availability) plus any OPTIONAL ones, and which
+    handlers/backends/encoders are therefore available. Pure introspection -- it
+    imports candidate modules to test availability but never fingerprints, opens
+    an index, or mutates anything.
     """
+
+    def _caps(capabilities: tuple[str, ...], kind: str) -> list[str]:
+        return sorted(c.split(":", 1)[1] for c in capabilities if c.startswith(f"{kind}:"))
 
     extras: dict[str, Any] = {}
     available_handlers: list[str] = list(_CORE_HANDLERS)
     available_backends: list[str] = list(_CORE_BACKENDS)
-    for extra, modules, capabilities in _EXTRA_PROBES:
-        probes = [_probe_module(module) for module in modules]
-        available = all(probe["ok"] for probe in probes)
-        handlers = sorted(
-            cap.split(":", 1)[1] for cap in capabilities if cap.startswith("handler:")
-        )
-        backends = sorted(
-            cap.split(":", 1)[1] for cap in capabilities if cap.startswith("backend:")
-        )
-        services = sorted(
-            cap.split(":", 1)[1] for cap in capabilities if cap.startswith("service:")
-        )
+    available_encoders: list[str] = []
+    for extra in _EXTRA_PROBES:
+        # Probe required + optional modules; availability is gated by REQUIRED only.
+        probes = [_probe_module(module) for module in (*extra.required, *extra.optional)]
+        ok_by_module = {probe["module"]: probe["ok"] for probe in probes}
+        available = all(ok_by_module[module] for module in extra.required)
+        handlers = _caps(extra.capabilities, "handler")
+        backends = _caps(extra.capabilities, "backend")
+        services = _caps(extra.capabilities, "service")
+        encoders = _caps(extra.capabilities, "encoder")
         if available:
             available_handlers.extend(handlers)
             available_backends.extend(backends)
-        extras[extra] = {
+            available_encoders.extend(encoders)
+        extras[extra.name] = {
             "available": available,
-            "requires": list(modules),
+            "requires": list(extra.required),
+            "optional": list(extra.optional),
             "probes": probes,
             "handlers": handlers,
             "backends": backends,
             "services": services,
+            "encoders": encoders,
         }
     return {
         "python_version": platform.python_version(),
@@ -270,6 +294,7 @@ def _doctor_report() -> dict[str, Any]:
         "extras": extras,
         "available_handlers": sorted(set(available_handlers)),
         "available_backends": sorted(set(available_backends)),
+        "available_encoders": sorted(set(available_encoders)),
     }
 
 

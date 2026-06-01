@@ -9,7 +9,7 @@ The engine has three layers:
 1. Core orchestration
    - `fingerprint_engine/core/fingerprinter.py` discovers `FileHandler` plugins from the `fingerprint_engine/handlers` package.
    - `fingerprint_engine/core/models.py` defines `Fingerprint`, `LandmarkPoint`, `ConstellationHash`, and tuning config dataclasses.
-   - `fingerprint_engine/core/index.py` defines the storage-agnostic `HashIndex` contract plus the default dict-backed index.
+   - `fingerprint_engine/core/index/` defines the storage-agnostic `HashIndex` contract plus the four index backends.
 
 2. FFT-equivalent pipeline
    - `fingerprint_engine/core/fft_pipeline.py` normalizes handler signals, applies sliding windows, runs `numpy.fft.rfft`, extracts adaptive local maxima, builds peak-pair constellations, and hashes `(freq1, freq2, delta_t)` into deterministic integer codes.
@@ -18,6 +18,8 @@ The engine has three layers:
    - Images use flattened grayscale pixel intensity.
    - Audio uses decoded mono samples for WAV, and MP3 via `pydub`/ffmpeg when available.
    - PDFs use extracted page text plus page boundary markers.
+   - Video uses a sequence of canonical keyframes sampled at a fixed temporal cadence (the `[video]` extra: PyAV + Pillow).
+   - Embeddings fingerprint an ordered *sequence* of precomputed dense vectors (`.npy`/`.npz`/`.jsonl`, numpy-only); raw text can be encoded on load via the `[embeddings]` extra (model2vec).
 
 3. Scalability boundaries
    - Handlers are auto-discovered plugins, not selected by hardcoded type switches in the core.
@@ -30,13 +32,38 @@ The engine has three layers:
 ```bash
 cd fingerprint-engine
 python -m pip install -e ".[all]"     # all handlers + backends; installs the `fingerprint-engine` CLI
-# or pick extras: pip install -e ".[image,audio,pdf,redis,postgres]"
+# or pick extras (see the matrix below): pip install -e ".[image,audio,pdf]"
 # or just the core (numpy only): pip install -e .
 ```
 
 This installs the `fingerprint-engine` console command. For development without
-installing, run the CLI as `python -m fingerprint_engine.cli ...`. MP3 support
-requires the `[audio]` extra (`pydub`) and a working ffmpeg installation.
+installing, run the CLI as `python -m fingerprint_engine.cli ...`.
+
+numpy is the only hard runtime dependency; every other capability is behind an
+optional extra, lazily imported (a core-only install never pulls them in). Run
+`fingerprint-engine doctor` to see exactly what is available in your environment.
+
+| Extra | Unlocks | Installs |
+|-------|---------|----------|
+| `image` | image handler (raster + opt-in pHash) | Pillow |
+| `audio` | audio handler — WAV (scipy) + MP3 (pydub/ffmpeg) | scipy, pydub, `audioop-lts` (Python ≥ 3.13) |
+| `pdf` | PDF handler | pypdf |
+| `video` | video keyframe handler | PyAV, Pillow |
+| `embeddings` | encode-on-load encoder for the embedding handler | model2vec (static, no torch) |
+| `redis` | Redis index backend | redis |
+| `postgres` | Postgres index backend | psycopg |
+| `service` | HTTP service (`fingerprint_engine.service`) | fastapi, uvicorn, python-multipart |
+| `all` | every runtime extra above | — |
+
+MP3 support requires the `[audio]` extra and a working ffmpeg install. On
+**Python 3.13** `pydub` additionally needs the `audioop-lts` backport (PEP 594
+removed the stdlib `audioop` module); the `[audio]` extra pins it automatically
+via an environment marker. The embedding handler's precomputed-vector path
+(`.npy`/`.npz`/`.jsonl`) is numpy-only and always available — the `[embeddings]`
+extra is only for encoding raw text on load. **Embedding matching finds shared
+*exact* vector sub-sequences (a near-duplicate stream), not semantic /
+nearest-neighbour similarity** — a full paraphrase shares no vectors and will not
+match.
 
 ## CLI Usage
 
@@ -70,6 +97,115 @@ Tune resolution:
 ```bash
 fingerprint-engine --window-size 2048 --hop-size 512 --fanout 8 fingerprint path/to/file
 ```
+
+## CLI Reference
+
+Every invocation is `fingerprint-engine [GLOBAL OPTIONS] <command> [COMMAND OPTIONS]`.
+All commands emit a single JSON object to **stdout** (pretty-printed, keys sorted);
+errors go to **stderr** as one `error: <message>` line (never a traceback). The
+process exit code classifies the outcome (see [Exit codes](#exit-codes)).
+
+### Global options
+
+These precede the command and apply to whichever command follows.
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--index-path PATH` | `.fingerprint_index.json` (next to the package) | JSON index file for the `memory` backend |
+| `--backend {memory,redis,sqlite,postgres}` | `memory` | Index backend |
+| `--redis-url URL` | `redis://localhost:6379/0` | Redis connection (when `--backend redis`) |
+| `--redis-prefix PREFIX` | `fpidx` | Redis key namespace |
+| `--sqlite-path PATH` | `.fingerprint_index.sqlite3` | SQLite database file (when `--backend sqlite`) |
+| `--postgres-dsn DSN` | `postgresql://localhost/fingerprint` | PostgreSQL DSN (when `--backend postgres`) |
+| `--window-size N` | 4096 | FFT window (samples/elements per frame) |
+| `--hop-size N` | 1024 | FFT hop (frame stride) |
+| `--peak-threshold F` | 1.25 | Minimum spectral-peak magnitude |
+| `--peak-percentile F` | 90.0 | Keep peaks above this magnitude percentile |
+| `--fanout N` | 6 | Constellation pairs per anchor peak (fewer = fewer hashes/file) |
+| `--max-peaks-per-frame N` | 8 | Cap landmark peaks per frame |
+| `--hash-bits N` | 64 | Width of each hash code |
+| `--min-time-frames N` | 16 | Adaptive-window floor (see [Adaptive Windowing](#adaptive-windowing)) |
+| `--min-window-size N` | 16 | Smallest window adaptation will shrink to |
+| `--max-file-size N` | 268435456 | Reject inputs larger than this many bytes (`0` = unlimited) |
+| `--max-pdf-pages N` | 0 | Cap PDF pages decoded per file (`0` = unlimited) |
+
+The fingerprint-tuning flags must match between the files you `add`/`dedup` and
+the queries you `search`, since matching only aligns fingerprints built with the
+same effective window (see [Scale Invariance](#scale-invariance)).
+
+### Commands
+
+**`fingerprint <file>`** — fingerprint one file and print its summary; does not
+touch any index.
+- `--full` — include the full hash list and landmarks (default: a 10-hash sample).
+- JSON keys: `file_id`, `path`, `handler`, `size_bytes`, `content_sha256`,
+  `landmark_count`, `hash_count`, `sample_hashes`, `metadata` (and the full
+  `hashes`/`landmarks` arrays with `--full`).
+
+**`add <files...>`** — fingerprint files and/or directories (walked recursively)
+and add them to the selected backend. Fail-soft: a bad path is reported, not fatal.
+- `--workers N` — parallelism for fingerprinting (default: auto).
+- `--incremental` / `--skip-existing` — skip files whose content sha256 is already
+  indexed; only new/changed files are fingerprinted.
+- JSON keys: `backend`, `index_path`, `indexed_files` (per-file summaries),
+  `skipped` (`{path, reason}` objects), `counts`
+  (`scanned`, `skipped_existing`, `newly_indexed`, `failed` — these reconcile:
+  `scanned == skipped_existing + newly_indexed + failed`), `file_count`,
+  `posting_count`.
+
+**`search <file>`** — fingerprint the query file and rank matches in the index.
+- `--top-k N` — number of results to return (default: 10).
+- `--min-confidence F` — drop matches below this confidence in `[0,1]`
+  (default: none); see [Match Confidence](#match-confidence--calibration).
+- JSON keys: `query` (a fingerprint summary), `backend`, `index_path`, `results`
+  (each with `file_id`, `score`, `confidence`, `aligned_votes`, `total_votes`,
+  `unique_hashes`, `offset`, `metadata` — the matched file's `path`/`handler` are
+  in its `metadata`).
+
+**`prune`** — remove non-discriminative "stop" hash codes from the index in place
+(see [Stop-Hash Pruning](#stop-hash-pruning)).
+- `--max-df-ratio F` — prune codes present in more than this fraction of files
+  (default: 0.1; lower = more aggressive).
+- JSON keys: `backend`, `index_path`, `max_df_ratio`, `pruned_postings`,
+  `file_count`, `posting_count`.
+- Supported by `memory`, `sqlite`, `postgres`; `redis` declines → **exit 4**.
+
+**`list`** — list the files indexed in the selected backend.
+- `--summary` — emit only the counts, omitting the per-file list.
+- JSON keys: `backend`, `index_path`, `file_count`, `posting_count`, and (unless
+  `--summary`) `files` — each `{file_id, path, handler, hash_count}`, sorted by
+  `file_id`.
+
+**`dedup <files...>`** — find exact and near-duplicate files among the given paths.
+Analyses the inputs against each other in a scratch in-memory index; never reads
+or mutates the selected persistent backend. Fail-soft on bad paths.
+- `--workers N` — parallelism for fingerprinting (default: auto).
+- `--min-confidence F` — near-duplicate confidence cutoff in `[0,1]`
+  (default: 0.5; higher = stricter).
+- JSON keys: `min_confidence`, `skipped`, `total_paths`, `total_distinct`,
+  `singletons`, `exact_cluster_count`, `exact_clusters` (`{paths}`),
+  `near_duplicate_cluster_count`, `near_duplicate_clusters` (`{paths, confidence}`).
+
+**`doctor`** — pure environment diagnosis (no index, no I/O on your corpus); always
+exits 0. Reports the interpreter/engine versions, the always-available core
+capabilities, and, per optional extra, whether its dependencies import and which
+handlers/backends/encoders they unlock.
+- JSON keys: `python_version`, `fingerprint_engine_version`, `core`
+  (`requires`/`handlers`/`backends`), `extras` (per-extra `available`, `requires`,
+  `optional`, `probes`, `handlers`, `backends`, `services`, `encoders`),
+  `available_handlers`, `available_backends`, `available_encoders`.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success |
+| `1` | Input error on the query/fingerprint path — no handler for the type, missing file, a directory where a file was expected, or an input over `--max-file-size` |
+| `2` | Usage error (bad/unknown command, missing argument, bad option value) — raised by argument parsing |
+| `3` | A required optional dependency is not installed (`MissingDependencyError`) |
+| `4` | Backend/operational error — backend connect failure, a missing/corrupt index, or an operation a backend declines (e.g. `prune` on `redis`) |
+
+`SystemExit` and `KeyboardInterrupt` are never swallowed.
 
 ## Python Usage
 

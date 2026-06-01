@@ -1,6 +1,6 @@
 """Handler that fingerprints video as a sequence of canonical keyframes.
 
-Heavy-dependency skeleton (item 3). The decode path is behind a LAZY import so
+The decode path is behind a LAZY import so
 importing :mod:`fingerprint_engine` -- and discovering this handler -- never
 requires a video library. When no video backend is installed, :meth:`load`
 raises :class:`MissingDependencyError` pointing at the ``video`` extra, exactly

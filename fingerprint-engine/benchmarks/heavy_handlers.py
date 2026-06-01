@@ -66,6 +66,7 @@ warnings.simplefilter("ignore")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from fingerprint_engine.core.exceptions import MissingDependencyError
 from fingerprint_engine.core.fft_pipeline import FFTFingerprintPipeline
 from fingerprint_engine.core.fingerprinter import Fingerprinter
 from fingerprint_engine.core.index import InMemoryHashIndex
@@ -75,6 +76,7 @@ from fingerprint_engine.core.models import (
     FingerprintConfig,
     effective_format_version,
 )
+from fingerprint_engine.handlers.embedders import DEFAULT_MODEL2VEC_MODEL, Model2VecEmbedder
 from fingerprint_engine.handlers.embedding_handler import EmbeddingFileHandler
 
 # ---------------------------------------------------------------------------
@@ -400,47 +402,10 @@ def run_embedding_benchmark(num_docs: int = 8, num_vectors: int = 60, dim: int =
 
 # ---------------------------------------------------------------------------
 # Encoder (model2vec) synthesis + benchmark -- the REAL encode-on-load path.
+# Model2VecEmbedder is shipped in the package (fingerprint_engine.handlers.
+# embedders, imported at the top of this module); this section only synthesizes
+# corpora and measures that shipped encoder end-to-end.
 # ---------------------------------------------------------------------------
-
-# Cached so a single process (e.g. the pytest module that reuses this benchmark)
-# loads the static model once, not per call. Keyed by model name. The static
-# potion model loads in ~0.3 s from the local cache and needs no torch.
-_STATIC_MODEL_CACHE: dict[str, object] = {}
-
-_DEFAULT_ENCODER_MODEL = "minishlab/potion-base-8M"
-
-
-class Model2VecEmbedder:
-    """Embedder protocol adapter over a model2vec ``StaticModel``.
-
-    Implements ``embed(content: bytes) -> (n_chunks, d)`` by decoding UTF-8,
-    splitting the document into non-empty lines (one paragraph/sentence per
-    line == one chunk == one embedding vector == one FFT frame downstream), and
-    running ``model.encode(chunks)``. The static model is deterministic (no
-    sampling, no torch) so the same text always yields the same vectors, which
-    is what makes the whole encoder benchmark reproducible. The cached model is
-    loaded once per process via :data:`_STATIC_MODEL_CACHE`.
-
-    model2vec is imported LAZILY inside ``__init__`` so importing this benchmark
-    module never requires it; the encoder section / gated test skip cleanly when
-    it is absent.
-    """
-
-    def __init__(self, model_name: str = _DEFAULT_ENCODER_MODEL) -> None:
-        model = _STATIC_MODEL_CACHE.get(model_name)
-        if model is None:
-            from model2vec import StaticModel  # lazy: only when the encoder runs
-
-            model = StaticModel.from_pretrained(model_name)
-            _STATIC_MODEL_CACHE[model_name] = model
-        self._model = model
-
-    def embed(self, content: bytes) -> np.ndarray:
-        text = content.decode("utf-8")
-        chunks = [line.strip() for line in text.splitlines() if line.strip()]
-        if not chunks:  # never hand the model an empty batch
-            chunks = [text]
-        return np.asarray(self._model.encode(chunks), dtype=np.float64)
 
 
 # Deterministic per-doc word pools: a doc draws sentences from these with a
@@ -563,7 +528,7 @@ def run_encoder_benchmark(num_docs: int = 8) -> dict:
 
     try:
         embedder = Model2VecEmbedder()
-    except ImportError as exc:  # model2vec (or its deps) not installed
+    except (ImportError, MissingDependencyError) as exc:  # model2vec (or its deps) absent
         return {"skipped": True, "reason": f"missing encoder dependency: {exc}"}
 
     config = FingerprintConfig()
@@ -655,7 +620,7 @@ def run_encoder_benchmark(num_docs: int = 8) -> dict:
 
     return {
         "skipped": False,
-        "model": _DEFAULT_ENCODER_MODEL,
+        "model": DEFAULT_MODEL2VEC_MODEL,
         "corpus": {"docs": num_docs, "paragraphs_per_doc": 8, "chunking": "one_line_per_chunk"},
         "embedding_dim": dim,
         "self_recall_at_1": round(self_hits / num_docs, 4),

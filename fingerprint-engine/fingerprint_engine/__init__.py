@@ -40,6 +40,7 @@ from .core.models import (
     ConstellationHash,
     Fingerprint,
     FingerprintConfig,
+    IndexPosting,
     LandmarkPoint,
     SearchResult,
     effective_format_version,
@@ -48,7 +49,7 @@ from .core.models import (
 try:
     __version__ = version("fingerprint-engine")
 except PackageNotFoundError:  # pragma: no cover - running from a source tree
-    __version__ = "0.1.0"
+    __version__ = "1.0.0"
 
 # Library logging best practice: attach a NullHandler to the package's top-level
 # logger so emitting records never triggers Python's "No handlers could be found"
@@ -70,6 +71,7 @@ __all__ = [
     "FormatVersionMismatchError",
     "HashIndex",
     "InMemoryHashIndex",
+    "IndexPosting",
     "InvalidSnapshotError",
     "LandmarkPoint",
     "MissingDependencyError",

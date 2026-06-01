@@ -21,7 +21,7 @@ OPTIONAL_DEPS = (
     "pydub",
     "pypdf",
     "av",
-    "sentence_transformers",
+    "model2vec",
     "redis",
     "psycopg",
 )

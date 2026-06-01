@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fingerprint-engine"
-version = "0.1.0"
+version = "1.0.0"
 description = "Universal file fingerprinting engine (Shazam-style) with pluggable index backends"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -33,20 +33,25 @@ dependencies = ["numpy>=1.23"]
 
 [project.optional-dependencies]
 image = ["Pillow>=9.0"]
-audio = ["scipy>=1.9", "pydub>=0.25"]
+# WAV fingerprinting needs only scipy; MP3 additionally needs pydub (+ffmpeg).
+# pydub imports the stdlib `audioop`, which PEP 594 removed in Python 3.13, so on
+# 3.13 the `audioop-lts` backport is required for `import pydub` (hence MP3) to
+# work at all -- pinned with an environment marker so older interpreters, which
+# still ship audioop, do not pull in the backport.
+audio = ["scipy>=1.9", "pydub>=0.25", "audioop-lts; python_version >= '3.13'"]
 pdf = ["pypdf>=3.0"]
 # Video keyframe fingerprinting: PyAV (ffmpeg bindings) decodes frames and
 # Pillow canonicalizes each keyframe to the shared 256x256 grayscale grid. Both
 # are lazily imported by VideoFileHandler, so a core-only install never needs
 # them and importing the package never pulls them in.
 video = ["av>=10.0", "Pillow>=9.0"]
-# Embedding-sequence fingerprinting: the precomputed-vector path (.npy/.jsonl)
-# is numpy-only (the one core dep) and always available. This extra provides a
-# default encoder for the optional encode-on-load path; it is lazily imported
-# only when a concrete Embedder is wired in. A lightweight, no-torch alternative
-# is model2vec (static distilled embeddings, e.g. minishlab/potion-base-8M);
-# benchmarks/heavy_handlers.py uses it to exercise the real encode-on-load path.
-embeddings = ["sentence-transformers>=2.2"]
+# Embedding-sequence fingerprinting: the precomputed-vector path (.npy/.npz/
+# .jsonl) is numpy-only (the one core dep) and ALWAYS available -- this extra is
+# only for the optional encode-on-load path. It installs model2vec (static
+# distilled embeddings, no torch, e.g. minishlab/potion-base-8M), the runtime
+# behind the shipped fingerprint_engine.handlers.embedders.Model2VecEmbedder,
+# which is lazily imported only when that encoder is actually used.
+embeddings = ["model2vec>=0.3"]
 redis = ["redis>=4.0"]
 postgres = ["psycopg[binary]>=3.1"]
 # HTTP service (fingerprint_engine.service): the FastAPI app + the ASGI server
@@ -57,9 +62,10 @@ all = [
     "Pillow>=9.0",
     "scipy>=1.9",
     "pydub>=0.25",
+    "audioop-lts; python_version >= '3.13'",
     "pypdf>=3.0",
     "av>=10.0",
-    "sentence-transformers>=2.2",
+    "model2vec>=0.3",
     "redis>=4.0",
     "psycopg[binary]>=3.1",
     "fastapi>=0.100",
@@ -86,6 +92,11 @@ fingerprint-engine = "fingerprint_engine.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["fingerprint_engine*"]
+
+# Ship the PEP 561 marker so downstream type checkers use the inline annotations
+# (a non-.py data file is not picked up by packages.find on its own).
+[tool.setuptools.package-data]
+fingerprint_engine = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

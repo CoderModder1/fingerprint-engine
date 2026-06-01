@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-01
+
+First stable release. The public API, the portable snapshot schema, the default
+fingerprint derivation, and the CLI surface are now **frozen** under the
+semantic-versioning policy in `VERSIONING.md` (see its 1.0.0 API-freeze
+sign-off): a backward-incompatible change to any of them now requires a MAJOR
+bump. This release also lands the full hardening work below. (The `0.2.0`
+development version was never tagged or published; its content ships here.)
+
 Tier-1 through Tier-5 hardening: correctness, durability, reliability,
 performance, and the product/operability layer. With ONE exception called out
 below (the v2 fingerprint format, which changes audio derivation), none of this
@@ -37,8 +46,35 @@ byte-identical (only the version stamp advances for them) while audio changes:
   excerpt recall on stationary audio; the bank is kept on by default for
   robustness on real non-stationary audio.)
 
+### Changed — pre-1.0 public surface (breaking; locked ahead of the 1.0 freeze)
+
+The public surface was reviewed and corrected while it is still cheap to change,
+before it is frozen at 1.0:
+
+- `SearchResult` field order now matches `to_dict()` and VERSIONING §3 —
+  `confidence` follows `score` — and `confidence` is now a REQUIRED field (its
+  silent `0.0` default, which the default `Calibration` rejects, is gone).
+  Breaking for code that built `SearchResult` positionally or relied on the
+  default; the scoring path (the only constructor) builds by keyword and always
+  sets it, so search behaviour is unchanged.
+- `IndexPosting` — the return type of `HashIndex.query`/`query_many` — is now
+  re-exported from the top-level `fingerprint_engine` package and `__all__`.
+- `RedisHashIndex` / `PostgresHashIndex` now raise `MissingDependencyError`
+  (not a bare `RuntimeError`) when their optional driver is absent, matching the
+  lazy-extras contract; the CLI maps this to exit code 3 (missing dependency).
+- VERSIONING §2 corrected to match the code: the cross-backend snapshot-load
+  contract method is `load_snapshot(path)` (not `load`), `save` is
+  `save(path, *, force=False)`, and `prune_stop_hashes` is documented as
+  unsupported on `RedisHashIndex` (the one non-universal contract method).
+- `Fingerprint` is documented as a deliberately MUTABLE value object (the other
+  six models remain `frozen=True`).
+
 ### Tests / CI
 
+- CLI exit-code coverage for the two previously-untested codes: usage errors
+  (argparse) exit `2`, and operational failures exit `4` — including
+  `prune --backend redis` (the backend declines with `NotImplementedError`) and
+  a corrupt index snapshot on `search`.
 - The "all four backends rank identically" guarantee is now proven for Postgres
   in CI: the workflow runs a live Postgres 16 service container with
   `FINGERPRINT_TEST_PG_DSN` set and `psycopg` installed (via the `[dev]`/`[all]`
@@ -76,8 +112,11 @@ byte-identical (only the version stamp advances for them) while audio changes:
   already indexed, fingerprinting only the misses).
 - CLI `doctor` command: a deps health check that reports the Python and
   `fingerprint-engine` versions and, for each optional extra
-  (image/audio/pdf/redis/postgres/service), whether its dependency imports
-  and which handlers/backends are therefore available. Pure introspection;
+  (image/audio/pdf/video/embeddings/redis/postgres/service), which of its
+  required vs. optional dependencies import and which handlers/backends/encoders
+  are therefore available (the embedding handler's precomputed-vector path is
+  numpy-only, so it is reported under core; `audio` is available with scipy/WAV
+  alone, with pydub/MP3 reported as an optional capability). Pure introspection;
   always exits 0.
 - Stateless FastAPI service (`fingerprint_engine.service`) behind the `service`
   extra, reusing the engine verbatim (no scoring/ranking reimplemented).
@@ -88,7 +127,14 @@ byte-identical (only the version stamp advances for them) while audio changes:
   with finite defaults that bound the OOM/DoS vector; see `SECURITY.md`.
 - Fast, deterministic accuracy harness (`benchmarks/accuracy.py` +
   `tests/test_accuracy.py`) and a large-corpus throughput/footprint/latency
-  benchmark suite.
+  benchmark suite. A recorded accuracy baseline (`benchmarks/accuracy-baseline.json`,
+  seed-pinned) is committed and referenced from `benchmarks/RESULTS.md`.
+- Full CLI reference in the README: all seven subcommands (`fingerprint`, `add`,
+  `search`, `prune`, `list`, `dedup`, `doctor`), their global and per-command
+  flags with defaults, the `0`/`1`/`2`/`3`/`4` exit-code table, and each
+  command's JSON output keys.
+- `py.typed` marker (PEP 561), so downstream type checkers consume the package's
+  inline type annotations.
 - Apache License 2.0 (`LICENSE` + `NOTICE`), declared via the PEP 639 SPDX
   `license = "Apache-2.0"` expression and `license-files`, plus trove
   classifiers in `pyproject.toml`.
@@ -245,3 +291,6 @@ Baseline release.
   configurable resolution and backend selection.
 - Benchmark harness covering fingerprinting throughput, per-backend build rate
   and footprint, query latency, scaling, and accuracy at scale.
+
+[Unreleased]: https://github.com/CoderModder1/fingerprint-engine/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/CoderModder1/fingerprint-engine/releases/tag/v1.0.0
