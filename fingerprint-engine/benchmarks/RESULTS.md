@@ -155,3 +155,34 @@ saving that compounds across millions of postings.
 Integer `file_id` surrogate key + compact posting encoding (footprint), SQL
 `top_k`/`HAVING` query fan-out pushdown, ANN/LSH candidate generation, and
 streaming ingest of very large files.
+
+# Accuracy baseline (matching *quality*, not speed)
+
+Separate from the speed numbers above, the engine's recall/calibration claims are
+pinned by a deterministic, seeded harness (`benchmarks/accuracy.py`) that
+generates a small in-memory corpus + mutation matrix — it touches no real corpus
+and runs in a couple of seconds. The asserted, load-bearing claims live in
+`tests/test_accuracy.py`; a full recorded snapshot is committed as raw data:
+[`accuracy-baseline.json`](accuracy-baseline.json).
+
+- **Recorded:** 2026-06-01, seed `1234`, CPython 3.13.13, with the `image`
+  (Pillow) and `audio` (scipy) extras present (so all three handler sections are
+  populated; on a core-only install the image/audio sections are recorded as
+  skipped instead).
+- **Reproduce:** `python benchmarks/accuracy.py --format json > benchmarks/accuracy-baseline.json`
+  (byte-identical for a fixed seed). Human-readable: add `--format markdown`; the
+  per-flag recall/precision sweep is `--mode hard`.
+
+Headline numbers from the recorded run (exact self-match recall@1, and the
+confidence separation a single accept/reject threshold relies on):
+
+| handler | exact recall@1 | true conf (mean) | impostor conf (mean) | gap | prune lossless |
+|:-------:|:--------------:|:----------------:|:--------------------:|:---:|:--------------:|
+| text    |            1.0 |              1.0 |               0.0084 | 0.9916 | yes (4 415 postings removed) |
+| image   |            1.0 |              1.0 |               0.0345 | 0.9655 | — |
+| audio   |            1.0 |              1.0 |               0.0029 | 0.9971 | — |
+
+True matches sit at confidence ~1.0 while the best impostor stays well under the
+documented 0.05 cutoff across every handler, so one threshold separates them; the
+JSON also carries the per-mutation near-dup recall and the full precision/recall/
+false-accept threshold sweep.

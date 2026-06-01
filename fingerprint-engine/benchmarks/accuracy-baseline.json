@@ -1,0 +1,203 @@
+{
+  "seed": 1234,
+  "handlers": {
+    "text": {
+      "handler": "text",
+      "corpus_size": 36,
+      "avg_hashes_per_file": 1076.3,
+      "exact_recall_at_1": 1.0,
+      "confidence_separation": {
+        "mean_true": 1.0,
+        "min_true": 1.0,
+        "mean_impostor": 0.0084,
+        "max_impostor": 0.012,
+        "gap_mean": 0.9916
+      },
+      "mutations": [
+        {
+          "mutation": "front_insert",
+          "queries": 36,
+          "hits": 36,
+          "recall_at_1": 1.0,
+          "mean_confidence": 0.4739,
+          "min_confidence": 0.371
+        },
+        {
+          "mutation": "append",
+          "queries": 36,
+          "hits": 36,
+          "recall_at_1": 1.0,
+          "mean_confidence": 0.9863,
+          "min_confidence": 0.968
+        },
+        {
+          "mutation": "truncate_prefix",
+          "queries": 36,
+          "hits": 36,
+          "recall_at_1": 1.0,
+          "mean_confidence": 0.9591,
+          "min_confidence": 0.8973
+        },
+        {
+          "mutation": "char_edit_2pct",
+          "queries": 36,
+          "hits": 36,
+          "recall_at_1": 1.0,
+          "mean_confidence": 0.6945,
+          "min_confidence": 0.6108
+        },
+        {
+          "mutation": "char_edit_5pct",
+          "queries": 36,
+          "hits": 36,
+          "recall_at_1": 1.0,
+          "mean_confidence": 0.5793,
+          "min_confidence": 0.4572
+        }
+      ],
+      "prune": {
+        "postings_removed": 4415,
+        "recall_before": 1.0,
+        "recall_after": 1.0,
+        "lossless": true
+      }
+    },
+    "image": {
+      "handler": "image",
+      "corpus_size": 18,
+      "avg_hashes_per_file": 2880.0,
+      "exact_recall_at_1": 1.0,
+      "confidence_separation": {
+        "mean_true": 1.0,
+        "min_true": 1.0,
+        "mean_impostor": 0.0345,
+        "max_impostor": 0.0399,
+        "gap_mean": 0.9655
+      },
+      "mutations": [
+        {
+          "mutation": "resize_downscale",
+          "queries": 18,
+          "hits": 18,
+          "recall_at_1": 1.0,
+          "mean_confidence": 0.5014,
+          "min_confidence": 0.4563
+        },
+        {
+          "mutation": "jpeg_q40",
+          "queries": 18,
+          "hits": 18,
+          "recall_at_1": 1.0,
+          "mean_confidence": 0.2209,
+          "min_confidence": 0.1656
+        },
+        {
+          "mutation": "crop_border_10pct",
+          "queries": 18,
+          "hits": 2,
+          "recall_at_1": 0.1111,
+          "mean_confidence": 0.0271,
+          "min_confidence": 0.0264
+        },
+        {
+          "mutation": "rotate_5deg",
+          "queries": 18,
+          "hits": 1,
+          "recall_at_1": 0.0556,
+          "mean_confidence": 0.0274,
+          "min_confidence": 0.0274
+        }
+      ]
+    },
+    "audio": {
+      "handler": "audio",
+      "corpus_size": 18,
+      "avg_hashes_per_file": 3268.1,
+      "exact_recall_at_1": 1.0,
+      "confidence_separation": {
+        "mean_true": 1.0,
+        "min_true": 1.0,
+        "mean_impostor": 0.0029,
+        "max_impostor": 0.0053,
+        "gap_mean": 0.9971
+      },
+      "mutations": [
+        {
+          "mutation": "clip_prefix_60pct",
+          "queries": 18,
+          "hits": 18,
+          "recall_at_1": 1.0,
+          "mean_confidence": 0.9028,
+          "min_confidence": 0.8683
+        },
+        {
+          "mutation": "excerpt_mid",
+          "queries": 18,
+          "hits": 18,
+          "recall_at_1": 1.0,
+          "mean_confidence": 0.0924,
+          "min_confidence": 0.0644
+        }
+      ]
+    }
+  },
+  "sweep": {
+    "text": [
+      {
+        "threshold": 0.01,
+        "recall": 1.0,
+        "precision": 1.0,
+        "false_accept_rate": 0.0833
+      },
+      {
+        "threshold": 0.02,
+        "recall": 1.0,
+        "precision": 1.0,
+        "false_accept_rate": 0.0
+      },
+      {
+        "threshold": 0.05,
+        "recall": 1.0,
+        "precision": 1.0,
+        "false_accept_rate": 0.0
+      },
+      {
+        "threshold": 0.1,
+        "recall": 1.0,
+        "precision": 1.0,
+        "false_accept_rate": 0.0
+      },
+      {
+        "threshold": 0.2,
+        "recall": 1.0,
+        "precision": 1.0,
+        "false_accept_rate": 0.0
+      },
+      {
+        "threshold": 0.3,
+        "recall": 1.0,
+        "precision": 1.0,
+        "false_accept_rate": 0.0
+      },
+      {
+        "threshold": 0.5,
+        "recall": 1.0,
+        "precision": 1.0,
+        "false_accept_rate": 0.0
+      },
+      {
+        "threshold": 0.7,
+        "recall": 1.0,
+        "precision": 1.0,
+        "false_accept_rate": 0.0
+      },
+      {
+        "threshold": 0.9,
+        "recall": 1.0,
+        "precision": 1.0,
+        "false_accept_rate": 0.0
+      }
+    ]
+  },
+  "skipped": []
+}

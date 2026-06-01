@@ -425,6 +425,76 @@ def test_add_non_incremental_default_reindexes_existing(
     assert second["file_count"] == 3
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param([], id="no-subcommand"),
+        pytest.param(["not-a-command"], id="unknown-subcommand"),
+        pytest.param(["search"], id="missing-required-positional"),
+        pytest.param(["search", "query.py", "--top-k", "not-an-int"], id="bad-int-type"),
+        pytest.param(["--backend", "invalid", "list"], id="bad-backend-choice"),
+    ],
+)
+def test_usage_errors_exit_2(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    # argparse usage errors are raised as SystemExit(2) from parse_args, BEFORE
+    # main()'s try/except runs -- so they surface as the conventional exit code 2
+    # (a usage error), distinct from the library exit codes 1/3/4. main() never
+    # catches SystemExit, so the code propagates unchanged.
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(argv)
+    assert exc_info.value.code == 2
+    # argparse writes its diagnostic to stderr, never stdout.
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err != ""
+
+
+def test_prune_operational_error_exits_4(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A backend that declines an operation (here Redis, whose prune_stop_hashes
+    # raises NotImplementedError -- a RuntimeError subclass) must surface as the
+    # operational exit code 4, not a traceback. open_index is stubbed so the test
+    # needs no live Redis: with the real driver absent, open_index would instead
+    # raise MissingDependencyError (exit 3) before prune is ever reached.
+    class _DecliningIndex:
+        def prune_stop_hashes(self, max_df_ratio: float = 0.1) -> int:
+            raise NotImplementedError(
+                "RedisHashIndex does not support prune_stop_hashes; "
+                "rebuild from a snapshot of a pruned index instead"
+            )
+
+    monkeypatch.setattr(cli, "open_index", lambda args: _DecliningIndex())
+
+    code, out, err = _run(
+        ["--backend", "redis", "prune", "--max-df-ratio", "0.1"], capsys
+    )
+
+    assert code == 4
+    assert out == ""
+    assert "error:" in err
+    assert "prune_stop_hashes" in err
+
+
+def test_corrupt_index_snapshot_exits_4(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An unreadable/corrupt memory snapshot is an operational failure (a
+    # FingerprintError from the index layer), not a usage error: exit 4, clean
+    # one-line stderr, no traceback.
+    bad_index = tmp_path / "corrupt.json"
+    bad_index.write_text("{ this is not valid json", encoding="utf-8")
+    query = _write_corpus(tmp_path)[0]
+
+    code, out, err = _run(
+        ["--index-path", str(bad_index), "search", str(query)], capsys
+    )
+
+    assert code == 4
+    assert out == ""
+    assert "error:" in err
+
+
 def test_doctor_exits_0_and_reports_versions_and_capabilities(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
