@@ -444,7 +444,7 @@ def test_doctor_exits_0_and_reports_versions_and_capabilities(
 
     # Core capabilities are always available (numpy-only install).
     assert payload["core"]["requires"] == ["numpy"]
-    assert set(payload["core"]["handlers"]) == {"binary", "text", "archive"}
+    assert set(payload["core"]["handlers"]) == {"binary", "text", "archive", "embedding"}
     assert set(payload["core"]["backends"]) == {"memory", "sqlite"}
     # The core handlers/backends are always reported as available.
     assert {"binary", "text", "archive"}.issubset(set(payload["available_handlers"]))
@@ -462,31 +462,54 @@ def test_doctor_reports_every_optional_extra(
     assert code == 0
     extras = json.loads(out)["extras"]
 
-    assert set(extras) == {"image", "audio", "pdf", "redis", "postgres", "service"}
+    assert set(extras) == {
+        "image",
+        "audio",
+        "pdf",
+        "video",
+        "embeddings",
+        "redis",
+        "postgres",
+        "service",
+    }
     for name, report in extras.items():
         assert set(report) == {
             "available",
             "requires",
+            "optional",
             "probes",
             "handlers",
             "backends",
             "services",
+            "encoders",
         }
         assert isinstance(report["available"], bool)
         assert report["requires"], f"{name} must list its required modules"
-        # One probe per required module, each with a stable shape.
-        assert [probe["module"] for probe in report["probes"]] == report["requires"]
+        # One probe per (required + optional) module, in that order, each with a
+        # stable shape. `requires` gates availability; `optional` only adds a
+        # capability (e.g. audio's pydub/MP3), so it is probed but not required.
+        assert [probe["module"] for probe in report["probes"]] == (
+            report["requires"] + report["optional"]
+        )
         for probe in report["probes"]:
             assert isinstance(probe["ok"], bool)
             if not probe["ok"]:
                 assert probe["error"]  # a failed probe explains why
-        # available iff every probe imported successfully.
-        assert report["available"] == all(probe["ok"] for probe in report["probes"])
+        # available iff every REQUIRED module imported (optional modules do not gate).
+        required_ok = {
+            probe["module"]: probe["ok"]
+            for probe in report["probes"]
+            if probe["module"] in report["requires"]
+        }
+        assert report["available"] == all(required_ok[m] for m in report["requires"])
 
     # The capability mapping is correct: these extras unlock these names.
     assert extras["image"]["handlers"] == ["image"]
     assert extras["audio"]["handlers"] == ["audio"]
+    assert extras["audio"]["optional"] == ["pydub"]
     assert extras["pdf"]["handlers"] == ["pdf"]
+    assert extras["video"]["handlers"] == ["video"]
+    assert extras["embeddings"]["encoders"] == ["model2vec"]
     assert extras["redis"]["backends"] == ["redis"]
     assert extras["postgres"]["backends"] == ["postgres"]
     assert extras["service"]["services"] == ["http"]
@@ -501,7 +524,7 @@ def test_doctor_capability_lists_follow_availability(
     # marked unavailable and carrying the import error.
     real_import = cli.importlib.import_module
     optional = {
-        "PIL", "scipy", "pydub", "pypdf", "redis", "psycopg",
+        "PIL", "scipy", "pydub", "pypdf", "av", "model2vec", "redis", "psycopg",
         "fastapi", "uvicorn", "python_multipart",
     }
 
@@ -518,8 +541,10 @@ def test_doctor_capability_lists_follow_availability(
     assert err == ""
     payload = json.loads(out)
     # With no extras importable, only the core capabilities remain available.
-    assert payload["available_handlers"] == sorted({"binary", "text", "archive"})
+    # The embedding handler's precomputed path is numpy-only, so it is core.
+    assert payload["available_handlers"] == sorted({"binary", "text", "archive", "embedding"})
     assert payload["available_backends"] == sorted({"memory", "sqlite"})
+    assert payload["available_encoders"] == []
     for name, report in payload["extras"].items():
         assert report["available"] is False, f"{name} must be unavailable when its deps fail to import"
         assert all(probe["ok"] is False and probe["error"] for probe in report["probes"])

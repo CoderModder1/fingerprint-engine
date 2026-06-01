@@ -19,6 +19,7 @@ tiny, so each test runs in well under a few seconds.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +32,17 @@ from benchmarks.heavy_handlers import (
     run_embedding_benchmark,
     run_encoder_benchmark,
     run_video_benchmark,
+)
+
+# model2vec now ships in the [embeddings]/[all] extras, so it is importable in
+# CI -- but the encoder tests download a static model on first use. Gate them
+# behind an explicit opt-in env var (rather than dep-presence) so CI, which does
+# not set it, never downloads a model. Set FINGERPRINT_RUN_ENCODER_TESTS=1 to run
+# them locally.
+_RUN_ENCODER_TESTS = os.environ.get("FINGERPRINT_RUN_ENCODER_TESTS") == "1"
+_requires_encoder_optin = pytest.mark.skipif(
+    not _RUN_ENCODER_TESTS,
+    reason="downloads a model2vec model; set FINGERPRINT_RUN_ENCODER_TESTS=1 to run",
 )
 
 # ---------------------------------------------------------------------------
@@ -90,11 +102,13 @@ def test_embedding_benchmark_length_stable_and_dim_isolated() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Encoder: gated on model2vec (the real encode-on-load path). Skips cleanly when
-# model2vec is absent, so CI never downloads a model.
+# Encoder: the REAL model2vec encode-on-load path. Opt-in only (see
+# _requires_encoder_optin above) because the static model downloads on first use;
+# the importorskip stays as a second guard for an opted-in box lacking model2vec.
 # ---------------------------------------------------------------------------
 
 
+@_requires_encoder_optin
 def test_encoder_benchmark_exact_reuse_matches_and_self_recall_perfect() -> None:
     pytest.importorskip("model2vec", exc_type=ImportError)
 
@@ -123,6 +137,7 @@ def test_encoder_benchmark_exact_reuse_matches_and_self_recall_perfect() -> None
     assert reuse["confidence"] > report["max_impostor_confidence"]
 
 
+@_requires_encoder_optin
 def test_encoder_benchmark_paraphrase_is_not_a_semantic_match() -> None:
     # The documented LIMIT, pinned because model2vec static embeddings are
     # deterministic. A FULL paraphrase (every paragraph reworded, no verbatim

@@ -1,12 +1,14 @@
 """Handler that fingerprints a SEQUENCE of dense embedding vectors.
 
-Heavy-dependency skeleton (item 3). It accepts *precomputed* dense vectors in a
+It accepts *precomputed* dense vectors in a
 numpy-only on-disk form (``.npy`` array, or ``.jsonl`` of per-line vectors), OR
 a pluggable :class:`Embedder` that turns raw content into a vector sequence. The
 precomputed path needs nothing beyond numpy (the one core dep), so it always
-works here; any real embedder (e.g. sentence-transformers) is imported LAZILY
-and raises :class:`MissingDependencyError` for the ``embeddings`` extra when
-absent -- importing :mod:`fingerprint_engine` never pulls in a model runtime.
+works here; the shipped encode-on-load encoder
+(:class:`fingerprint_engine.handlers.embedders.Model2VecEmbedder`, behind the
+``embeddings`` extra) is imported LAZILY and raises
+:class:`MissingDependencyError` for the ``embeddings`` extra when absent --
+importing :mod:`fingerprint_engine` never pulls in a model runtime.
 
 Design -- how dense vectors map onto the constellation / alignment model
 ------------------------------------------------------------------------
@@ -215,10 +217,10 @@ class EmbeddingFileHandler(FileHandler):
     def _embed_with_plugin(self, path: Path, content: bytes | None = None) -> np.ndarray:
         """Run the injected embedder, lazily importing nothing ourselves.
 
-        The embedder may itself lazily import a heavy runtime (e.g.
-        sentence-transformers). If that import fails the embedder should surface
-        it; we wrap a bare ImportError into MissingDependencyError for the
-        ``embeddings`` extra so the failure mode matches the other handlers.
+        The embedder may itself lazily import a model runtime (e.g. model2vec).
+        If that import fails the embedder should surface it; we wrap a bare
+        ImportError into MissingDependencyError for the ``embeddings`` extra so
+        the failure mode matches the other handlers.
         """
 
         try:

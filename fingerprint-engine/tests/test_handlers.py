@@ -172,6 +172,53 @@ def test_audio_load_does_not_hardcode_mp3_format(
     assert captured["args"] == ()
 
 
+def test_pydub_is_importable_wherever_installed() -> None:
+    # Guards the [audio] extra's `audioop-lts; python_version >= '3.13'` pin.
+    # pydub imports the stdlib `audioop`, which PEP 594 removed in Python 3.13, so
+    # without the backport `import pydub` raises on 3.13 and MP3 fingerprinting is
+    # dead even with [audio] installed. A plain importorskip would MASK that by
+    # skipping a broken-but-installed pydub; instead skip ONLY when pydub is not
+    # installed at all, and otherwise require the import to actually succeed.
+    import importlib.util
+
+    if importlib.util.find_spec("pydub") is None:
+        pytest.skip("pydub is not installed")
+    importlib.import_module("pydub")  # must not raise where pydub is installed
+
+
+def test_load_mp3_decodes_a_real_mp3_end_to_end() -> None:
+    # End-to-end REAL decode (not the fake-segment unit test above): synthesize a
+    # short sine, encode it to genuine MP3 bytes via ffmpeg, then decode through
+    # the handler. Skips cleanly where no MP3 *encoder* is available to build the
+    # fixture (e.g. ffmpeg/lame absent), so it adds real coverage where it can
+    # without being flaky.
+    import numpy as np
+
+    pydub = pytest.importorskip("pydub", exc_type=ImportError)
+
+    sample_rate = 8000
+    t = np.arange(int(sample_rate * 0.3)) / sample_rate
+    pcm = (0.3 * np.sin(2 * np.pi * 440 * t) * 32767).astype("<i2").tobytes()
+    segment = pydub.AudioSegment(
+        data=pcm, sample_width=2, frame_rate=sample_rate, channels=1
+    )
+
+    buffer = BytesIO()
+    try:
+        segment.export(buffer, format="mp3")
+    except Exception as exc:  # no MP3 encoder (ffmpeg/lame) on this box
+        pytest.skip(f"no MP3 encoder available to synthesize a fixture: {exc}")
+    mp3_bytes = buffer.getvalue()
+    if not mp3_bytes:
+        pytest.skip("MP3 encoder produced no output")
+
+    payload = AudioFileHandler()._load_mp3(mp3_bytes)
+
+    assert payload.samples.size > 0
+    assert payload.sample_rate > 0
+    assert payload.decoder == "pydub.ffmpeg"
+
+
 # ---------------------------------------------------------------------------
 # Text sniffer: accent-dense latin-1 prose is accepted, not rejected to binary
 # ---------------------------------------------------------------------------

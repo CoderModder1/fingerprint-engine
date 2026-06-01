@@ -134,7 +134,7 @@ def test_embedding_plugin_embedder_missing_runtime_fails_loud(tmp_path: Path) ->
     # as MissingDependencyError for the embeddings extra, not a bare ImportError.
     class _BrokenEmbedder:
         def embed(self, content: bytes) -> np.ndarray:
-            raise ImportError("No module named 'sentence_transformers'")
+            raise ImportError("No module named 'model2vec'")
 
     path = tmp_path / "input.jsonl"
     path.write_text(json.dumps([0.1, 0.2, 0.3]) + "\n", encoding="utf-8")

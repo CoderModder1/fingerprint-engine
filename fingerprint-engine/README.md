@@ -9,7 +9,7 @@ The engine has three layers:
 1. Core orchestration
    - `fingerprint_engine/core/fingerprinter.py` discovers `FileHandler` plugins from the `fingerprint_engine/handlers` package.
    - `fingerprint_engine/core/models.py` defines `Fingerprint`, `LandmarkPoint`, `ConstellationHash`, and tuning config dataclasses.
-   - `fingerprint_engine/core/index.py` defines the storage-agnostic `HashIndex` contract plus the default dict-backed index.
+   - `fingerprint_engine/core/index/` defines the storage-agnostic `HashIndex` contract plus the four index backends.
 
 2. FFT-equivalent pipeline
    - `fingerprint_engine/core/fft_pipeline.py` normalizes handler signals, applies sliding windows, runs `numpy.fft.rfft`, extracts adaptive local maxima, builds peak-pair constellations, and hashes `(freq1, freq2, delta_t)` into deterministic integer codes.
@@ -18,6 +18,8 @@ The engine has three layers:
    - Images use flattened grayscale pixel intensity.
    - Audio uses decoded mono samples for WAV, and MP3 via `pydub`/ffmpeg when available.
    - PDFs use extracted page text plus page boundary markers.
+   - Video uses a sequence of canonical keyframes sampled at a fixed temporal cadence (the `[video]` extra: PyAV + Pillow).
+   - Embeddings fingerprint an ordered *sequence* of precomputed dense vectors (`.npy`/`.npz`/`.jsonl`, numpy-only); raw text can be encoded on load via the `[embeddings]` extra (model2vec).
 
 3. Scalability boundaries
    - Handlers are auto-discovered plugins, not selected by hardcoded type switches in the core.
@@ -30,13 +32,38 @@ The engine has three layers:
 ```bash
 cd fingerprint-engine
 python -m pip install -e ".[all]"     # all handlers + backends; installs the `fingerprint-engine` CLI
-# or pick extras: pip install -e ".[image,audio,pdf,redis,postgres]"
+# or pick extras (see the matrix below): pip install -e ".[image,audio,pdf]"
 # or just the core (numpy only): pip install -e .
 ```
 
 This installs the `fingerprint-engine` console command. For development without
-installing, run the CLI as `python -m fingerprint_engine.cli ...`. MP3 support
-requires the `[audio]` extra (`pydub`) and a working ffmpeg installation.
+installing, run the CLI as `python -m fingerprint_engine.cli ...`.
+
+numpy is the only hard runtime dependency; every other capability is behind an
+optional extra, lazily imported (a core-only install never pulls them in). Run
+`fingerprint-engine doctor` to see exactly what is available in your environment.
+
+| Extra | Unlocks | Installs |
+|-------|---------|----------|
+| `image` | image handler (raster + opt-in pHash) | Pillow |
+| `audio` | audio handler — WAV (scipy) + MP3 (pydub/ffmpeg) | scipy, pydub, `audioop-lts` (Python ≥ 3.13) |
+| `pdf` | PDF handler | pypdf |
+| `video` | video keyframe handler | PyAV, Pillow |
+| `embeddings` | encode-on-load encoder for the embedding handler | model2vec (static, no torch) |
+| `redis` | Redis index backend | redis |
+| `postgres` | Postgres index backend | psycopg |
+| `service` | HTTP service (`fingerprint_engine.service`) | fastapi, uvicorn, python-multipart |
+| `all` | every runtime extra above | — |
+
+MP3 support requires the `[audio]` extra and a working ffmpeg install. On
+**Python 3.13** `pydub` additionally needs the `audioop-lts` backport (PEP 594
+removed the stdlib `audioop` module); the `[audio]` extra pins it automatically
+via an environment marker. The embedding handler's precomputed-vector path
+(`.npy`/`.npz`/`.jsonl`) is numpy-only and always available — the `[embeddings]`
+extra is only for encoding raw text on load. **Embedding matching finds shared
+*exact* vector sub-sequences (a near-duplicate stream), not semantic /
+nearest-neighbour similarity** — a full paraphrase shares no vectors and will not
+match.
 
 ## CLI Usage
 

@@ -300,7 +300,8 @@ scoring path (the two riskiest surfaces in the codebase).
       4 backend/operational) are documented and covered by tests.
 - [ ] **Dependency boundary verified.** numpy is the only hard runtime
       dependency; every other capability is behind an extra
-      (`image`/`audio`/`pdf`/`redis`/`postgres`/`service`), lazily imported, and
+      (`image`/`audio`/`pdf`/`video`/`embeddings`/`redis`/`postgres`/`service`),
+      lazily imported, and
       a core-only install imports and runs the core handlers/backends. `doctor`
       reports the true availability.
 - [ ] **Quality gates green.** `pytest`, `ruff check .`, and

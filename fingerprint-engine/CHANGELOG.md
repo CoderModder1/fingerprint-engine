@@ -76,8 +76,11 @@ byte-identical (only the version stamp advances for them) while audio changes:
   already indexed, fingerprinting only the misses).
 - CLI `doctor` command: a deps health check that reports the Python and
   `fingerprint-engine` versions and, for each optional extra
-  (image/audio/pdf/redis/postgres/service), whether its dependency imports
-  and which handlers/backends are therefore available. Pure introspection;
+  (image/audio/pdf/video/embeddings/redis/postgres/service), which of its
+  required vs. optional dependencies import and which handlers/backends/encoders
+  are therefore available (the embedding handler's precomputed-vector path is
+  numpy-only, so it is reported under core; `audio` is available with scipy/WAV
+  alone, with pydub/MP3 reported as an optional capability). Pure introspection;
   always exits 0.
 - Stateless FastAPI service (`fingerprint_engine.service`) behind the `service`
   extra, reusing the engine verbatim (no scoring/ranking reimplemented).
