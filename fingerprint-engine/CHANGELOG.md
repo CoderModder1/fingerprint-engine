@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-01
+
 Tier-1 through Tier-5 hardening: correctness, durability, reliability,
 performance, and the product/operability layer. With ONE exception called out
 below (the v2 fingerprint format, which changes audio derivation), none of this
@@ -62,6 +64,10 @@ before it is frozen at 1.0:
 
 ### Tests / CI
 
+- CLI exit-code coverage for the two previously-untested codes: usage errors
+  (argparse) exit `2`, and operational failures exit `4` — including
+  `prune --backend redis` (the backend declines with `NotImplementedError`) and
+  a corrupt index snapshot on `search`.
 - The "all four backends rank identically" guarantee is now proven for Postgres
   in CI: the workflow runs a live Postgres 16 service container with
   `FINGERPRINT_TEST_PG_DSN` set and `psycopg` installed (via the `[dev]`/`[all]`
@@ -114,7 +120,14 @@ before it is frozen at 1.0:
   with finite defaults that bound the OOM/DoS vector; see `SECURITY.md`.
 - Fast, deterministic accuracy harness (`benchmarks/accuracy.py` +
   `tests/test_accuracy.py`) and a large-corpus throughput/footprint/latency
-  benchmark suite.
+  benchmark suite. A recorded accuracy baseline (`benchmarks/accuracy-baseline.json`,
+  seed-pinned) is committed and referenced from `benchmarks/RESULTS.md`.
+- Full CLI reference in the README: all seven subcommands (`fingerprint`, `add`,
+  `search`, `prune`, `list`, `dedup`, `doctor`), their global and per-command
+  flags with defaults, the `0`/`1`/`2`/`3`/`4` exit-code table, and each
+  command's JSON output keys.
+- `py.typed` marker (PEP 561), so downstream type checkers consume the package's
+  inline type annotations.
 - Apache License 2.0 (`LICENSE` + `NOTICE`), declared via the PEP 639 SPDX
   `license = "Apache-2.0"` expression and `license-files`, plus trove
   classifiers in `pyproject.toml`.
@@ -271,3 +284,6 @@ Baseline release.
   configurable resolution and backend selection.
 - Benchmark harness covering fingerprinting throughput, per-backend build rate
   and footprint, query latency, scaling, and accuracy at scale.
+
+[Unreleased]: https://github.com/CoderModder1/fingerprint-engine/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/CoderModder1/fingerprint-engine/releases/tag/v0.2.0

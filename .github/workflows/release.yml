@@ -1,0 +1,77 @@
+name: Release
+
+# Publish to PyPI on a version tag (e.g. v0.2.0) via OIDC "trusted publishing"
+# -- no API token stored in the repo. The push of the tag ALSO triggers ci.yml
+# (its `on: push` matches tags), so the full test matrix runs against the exact
+# tagged commit alongside this build.
+#
+# One-time setup on PyPI (account owner only): create a pending publisher under
+# the project's Publishing settings with
+#   Owner:        CoderModder1
+#   Repository:   fingerprint-engine
+#   Workflow:     release.yml
+#   Environment:  pypi
+# matching the `environment:` of the publish job below.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+defaults:
+  run:
+    working-directory: fingerprint-engine
+
+jobs:
+  build:
+    name: Build & check distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify the tag matches the package version
+        # Fail fast if v<X.Y.Z> does not equal pyproject's version, so a
+        # mistagged commit can never publish a mismatched artifact.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          echo "tag=$tag pyproject=$pkg"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match pyproject version $pkg"
+            exit 1
+          fi
+
+      - name: Build sdist + wheel and check
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: fingerprint-engine/dist/
+
+  publish:
+    name: Publish to PyPI (trusted publishing)
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fingerprint-engine
+    permissions:
+      # OIDC token for trusted publishing; this is the only privileged scope.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          # Resolves to $GITHUB_WORKSPACE/dist, where the publish action looks
+          # by default (this job has no working-directory effect on `uses:`).
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

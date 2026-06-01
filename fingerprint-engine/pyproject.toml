@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fingerprint-engine"
-version = "0.1.0"
+version = "0.2.0"
 description = "Universal file fingerprinting engine (Shazam-style) with pluggable index backends"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -92,6 +92,11 @@ fingerprint-engine = "fingerprint_engine.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["fingerprint_engine*"]
+
+# Ship the PEP 561 marker so downstream type checkers use the inline annotations
+# (a non-.py data file is not picked up by packages.find on its own).
+[tool.setuptools.package-data]
+fingerprint_engine = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
